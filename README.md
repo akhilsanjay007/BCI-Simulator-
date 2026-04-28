@@ -31,7 +31,7 @@ Open [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) for the interactiv
 ## WebSocket stream
 
 - **URL:** `ws://localhost:8000/ws/bci-stream`
-- **Payload:** JSON objects with `timestamp`, `fs`, `channels`, `lfp` (2D list of samples × channels), and `spikes` (binary events).
+- **Payload:** JSON objects with `timestamp_ms`, `fs`, `channels`, `lfp` (2D list of samples × channels), and `spikes` (binary events).
 
 ## Sample client
 
