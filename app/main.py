@@ -10,7 +10,10 @@ app = FastAPI(title="Neuralink BCI Signal Simulator")
 
 class SignalPacket(BaseModel):
     """Typed packet sent over WebSocket — exactly what a real decoder expects."""
-    timestamp: float = Field(..., description="Unix timestamp (ms precision)")
+    timestamp_ms: float = Field(
+        ...,
+        description="Unix timestamp in milliseconds since 1970-01-01 UTC (cross-platform epoch time)",
+    )
     fs: int = Field(..., description="Sampling rate Hz")
     channels: int = Field(..., description="Number of channels")
     lfp: list[list[float]] = Field(..., description="LFP data [batch_size, channels]")
@@ -43,7 +46,7 @@ class NeuralSignalGenerator:
             spikes = (self.rng.random((batch_size, self.num_channels)) < prob).astype(int).tolist()
 
             packet = SignalPacket(
-                timestamp=time.time(),
+                timestamp_ms=time.time() * 1000,
                 fs=self.fs,
                 channels=self.num_channels,
                 lfp=lfp,

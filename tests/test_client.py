@@ -11,7 +11,7 @@ async def test():
             data = await ws.recv()
             packet = json.loads(data)
             print(
-                f"Received packet @ {packet['timestamp']:.3f} | "
+                f"Received packet @ {packet['timestamp_ms']:.0f} ms | "
                 f"{len(packet['lfp'])} samples × {packet['channels']} channels"
             )
             await asyncio.sleep(0.1)
