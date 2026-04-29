@@ -6,6 +6,7 @@ Synthetic neural-style signals over a WebSocket: LFP-style traces and sparse spi
 
 - Python 3.10 or newer (3.13 is fine)
 - A virtual environment (recommended)
+- Dependencies in `requirements.txt` (includes `websockets` for the sample clients)
 
 ## Setup
 
@@ -56,7 +57,7 @@ With the server running, in another terminal from the same root:
 python tests/test_client.py
 ```
 
-This connects with `websockets`, receives a handful of packets, and prints a short summary per packet.
+This connects with `websockets`, receives a handful of packets, and prints a short summary per packet (installed via `requirements.txt`).
 
 ## Decoder sample client
 
