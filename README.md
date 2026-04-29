@@ -33,6 +33,21 @@ Open [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) for the interactiv
 - **URL:** `ws://localhost:8000/ws/bci-stream`
 - **Payload:** JSON objects with `timestamp_ms`, `fs`, `channels`, `lfp` (2D list of samples × channels), and `spikes` (binary events).
 
+## Intent control
+
+Set the global simulator intent (used to bias spike probabilities):
+
+```powershell
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/set-intent -ContentType "application/json" -Body '{\"intent\":\"up\"}'
+```
+
+Valid intents: `left`, `right`, `up`, `down`.
+
+## Decoder stream
+
+- **URL:** `ws://localhost:8000/ws/decoder`
+- **Payload:** JSON objects with `timestamp_ms`, `predicted_intent`, `confidence`, `latency_ms`, `accuracy`.
+
 ## Sample client
 
 With the server running, in another terminal from the same root:
@@ -42,6 +57,14 @@ python tests/test_client.py
 ```
 
 This connects with `websockets`, receives a handful of packets, and prints a short summary per packet.
+
+## Decoder sample client
+
+With the server running, in another terminal from the same root:
+
+```powershell
+python tests/test_decoder_client.py
+```
 
 ## Project layout
 

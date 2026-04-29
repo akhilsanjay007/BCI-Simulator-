@@ -1,12 +1,16 @@
 import asyncio
 import time
-import json
-from typing import Dict, Any
+from typing import Any, Dict
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
+from app.decoder import BciDecoder, Intent, make_bootstrap_training_set
+
 app = FastAPI(title="Neuralink BCI Signal Simulator")
+
+# Global intent state (Phase 2)
+current_intent: Intent = "right"
 
 class SignalPacket(BaseModel):
     """Typed packet sent over WebSocket — exactly what a real decoder expects."""
@@ -42,7 +46,22 @@ class NeuralSignalGenerator:
             lfp = (noise + modulation).tolist()
 
             # Spikes: inhomogeneous Poisson process (realistic firing)
-            prob = self.base_spike_rate * self.dt
+            base_prob = self.base_spike_rate * self.dt
+
+            # Intent-aware spike bias (Phase 2).
+            # Channel groups: 0-7=right, 8-15=left, 16-24=up, 25-31=down
+            multipliers = np.ones((self.num_channels,), dtype=np.float32)
+            intent = current_intent
+            if intent == "right":
+                multipliers[0:8] *= 3.0
+            elif intent == "left":
+                multipliers[8:16] *= 3.0
+            elif intent == "up":
+                multipliers[16:25] *= 3.0
+            elif intent == "down":
+                multipliers[25:32] *= 3.0
+
+            prob = np.clip(base_prob * multipliers, 0.0, 0.95)
             spikes = (self.rng.random((batch_size, self.num_channels)) < prob).astype(int).tolist()
 
             packet = SignalPacket(
@@ -61,6 +80,28 @@ class NeuralSignalGenerator:
 # Global generator (singleton for MVP)
 generator = NeuralSignalGenerator(num_channels=32, fs=1000)
 
+# Decoder (Phase 2): bootstrap-train so /ws/decoder is runnable immediately.
+decoder = BciDecoder(fs=generator.fs, channels=generator.num_channels, window_ms=200)
+try:
+    X_train, y_train = make_bootstrap_training_set(
+        fs=generator.fs, channels=generator.num_channels, window_ms=200, n_per_intent=300, seed=42
+    )
+    decoder.train(X_train, y_train)
+except Exception as e:
+    # If training fails for any reason, keep server runnable with heuristic fallback.
+    print(f"⚠️ Decoder bootstrap training failed; using heuristic fallback. Error: {e}")
+
+
+class SetIntentRequest(BaseModel):
+    intent: Intent
+
+
+@app.post("/set-intent")
+async def set_intent(body: SetIntentRequest) -> dict[str, str]:
+    global current_intent
+    current_intent = body.intent
+    return {"intent": current_intent}
+
 @app.websocket("/ws/bci-stream")
 async def bci_stream(websocket: WebSocket):
     """Production WebSocket endpoint — low latency, graceful disconnects."""
@@ -73,6 +114,31 @@ async def bci_stream(websocket: WebSocket):
         print("Client disconnected")
     except Exception as e:
         print(f"Error: {e}")
+        await websocket.close()
+
+
+@app.websocket("/ws/decoder")
+async def decoder_stream(websocket: WebSocket):
+    """
+    WebSocket endpoint that streams live decoder outputs.
+
+    Re-uses the simulator stream, runs decoder prediction per packet, and emits DecoderPacket JSON.
+    """
+    await websocket.accept()
+    print("✅ Client connected — decoder stream live")
+    try:
+        async for packet in generator.stream():
+            # Keep /ws/bci-stream unchanged; decoder uses spikes only.
+            decoded = decoder.predict(packet["spikes"], true_intent=current_intent)
+            print(
+                f"pred={decoded.predicted_intent} conf={decoded.confidence:.2f} "
+                f"lat={decoded.latency_ms:.1f}ms acc={decoded.accuracy:.2f} intent={current_intent}"
+            )
+            await websocket.send_json(decoded.model_dump())
+    except WebSocketDisconnect:
+        print("Decoder client disconnected")
+    except Exception as e:
+        print(f"Decoder error: {e}")
         await websocket.close()
 
 if __name__ == "__main__":
