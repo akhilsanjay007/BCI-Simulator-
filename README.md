@@ -6,7 +6,7 @@ Synthetic neural-style signals over a WebSocket: LFP-style traces and sparse spi
 
 - Python 3.10 or newer (3.13 is fine)
 - A virtual environment (recommended)
-- Dependencies in `requirements.txt` (includes `websockets` for the sample clients)
+- Dependencies in `requirements.txt`
 
 ## Setup
 
@@ -21,10 +21,16 @@ On macOS or Linux, activate with `source venv/bin/activate`.
 
 ## Run the server
 
-From the **repository root** (the folder that contains `app/`):
+From the **project root** (the folder that contains `app/`):
 
 ```powershell
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+You can also run it directly:
+
+```powershell
+python -m app.main
 ```
 
 Open [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) for the interactive OpenAPI UI.
@@ -32,14 +38,19 @@ Open [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) for the interactiv
 ## WebSocket stream
 
 - **URL:** `ws://localhost:8000/ws/bci-stream`
-- **Payload:** JSON objects with `timestamp_ms`, `fs`, `channels`, `lfp` (2D list of samples × channels), and `spikes` (binary events).
+- **Payload:** JSON objects with:
+  - `timestamp_ms` (float): epoch ms
+  - `fs` (int): sampling rate in Hz
+  - `channels` (int): number of channels
+  - `lfp` (`list[list[float]]`): shape `(batch_samples, channels)`
+  - `spikes` (`list[list[int]]`): shape `(batch_samples, channels)` with 0/1 events
 
 ## Intent control
 
 Set the global simulator intent (used to bias spike probabilities):
 
 ```powershell
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/set-intent -ContentType "application/json" -Body '{\"intent\":\"up\"}'
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/set-intent -ContentType "application/json" -Body '{"intent":"up"}'
 ```
 
 Valid intents: `left`, `right`, `up`, `down`.
@@ -48,6 +59,7 @@ Valid intents: `left`, `right`, `up`, `down`.
 
 - **URL:** `ws://localhost:8000/ws/decoder`
 - **Payload:** JSON objects with `timestamp_ms`, `predicted_intent`, `confidence`, `latency_ms`, `accuracy`.
+- **Notes:** this endpoint reuses the simulator stream and decodes from `spikes` (LFP is generated but not used by the decoder).
 
 ## Sample client
 
@@ -73,10 +85,12 @@ python tests/test_decoder_client.py
 neuralink-bci-sim/
 ├── app/
 │   ├── __init__.py
-│   └── main.py          # FastAPI app + generator + /ws/bci-stream
+│   ├── decoder.py       # minimal sliding-window decoder + bootstrap trainer
+│   └── main.py          # FastAPI app + generator + /ws/bci-stream + /ws/decoder
 ├── tests/
 │   ├── __init__.py
-│   └── test_client.py   # optional manual WebSocket smoke test
+│   ├── test_client.py   # optional manual WebSocket smoke test
+│   └── test_decoder_client.py  # optional manual decoder stream smoke test
 ├── requirements.txt
 └── README.md
 ```
