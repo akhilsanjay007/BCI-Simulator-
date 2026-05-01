@@ -40,3 +40,7 @@ Thumbs.db
 # Logs and local tooling
 *.log
 .scrapy/
+
+# Frontend (Vite / npm)
+frontend/node_modules/
+frontend/dist/

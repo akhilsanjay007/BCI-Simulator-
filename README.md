@@ -2,11 +2,12 @@
 
 Synthetic neural-style signals over a WebSocket: LFP-style traces and sparse spike events, typed with Pydantic and streamed from a small **FastAPI** service. Useful for prototyping decoders, dashboards, or BCI pipelines without hardware.
 
+The repo also includes an optional **React + Vite** dashboard under `frontend/` that connects to `ws://localhost:8000/ws/decoder` and shows live decoder output.
+
 ## Requirements
 
-- Python 3.10 or newer (3.13 is fine)
-- A virtual environment (recommended)
-- Dependencies in `requirements.txt`
+- **Backend:** Python 3.10 or newer (3.13 is fine), a virtual environment (recommended), and dependencies in `requirements.txt`
+- **Dashboard (optional):** [Node.js](https://nodejs.org/) 20+ and npm (for `frontend/`)
 
 ## Setup
 
@@ -34,6 +35,20 @@ python -m app.main
 ```
 
 Open [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs) for the interactive OpenAPI UI.
+
+## Dashboard (optional)
+
+With the API running on port 8000, in another terminal:
+
+```powershell
+cd neuralink-bci-sim\frontend
+npm install
+npm run dev
+```
+
+Open [http://127.0.0.1:5173](http://127.0.0.1:5173). The UI expects the decoder WebSocket at `ws://localhost:8000/ws/decoder` (start the backend first).
+
+For Vite/React-specific details, see `frontend/README.md`.
 
 ## WebSocket stream
 
@@ -87,6 +102,10 @@ neuralink-bci-sim/
 │   ├── __init__.py
 │   ├── decoder.py       # minimal sliding-window decoder + bootstrap trainer
 │   └── main.py          # FastAPI app + generator + /ws/bci-stream + /ws/decoder
+├── frontend/            # React + Vite + Tailwind dashboard (optional)
+│   ├── src/
+│   ├── package.json
+│   └── ...
 ├── tests/
 │   ├── __init__.py
 │   ├── test_client.py   # optional manual WebSocket smoke test
@@ -95,4 +114,4 @@ neuralink-bci-sim/
 └── README.md
 ```
 
-The `venv/` directory is created locally and is listed in `.gitignore`; it should not be committed.
+The Python `venv/` directory and the frontend’s `node_modules/` / `dist/` are listed in `.gitignore`; they should not be committed.
