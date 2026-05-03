@@ -6,6 +6,9 @@ interface DecoderPacket {
   confidence: number;
   latency_ms: number;
   accuracy: number;
+  /** Normalized [0,1] from server-integrated 2D cursor */
+  cursor_x?: number;
+  cursor_y?: number;
 }
 
 function App() {
@@ -83,11 +86,35 @@ function App() {
           {/* Main Cursor Area */}
           <div className="col-span-8 bg-neutral-900/70 backdrop-blur-xl rounded-3xl p-8 border border-neutral-800">
             <h2 className="text-2xl font-semibold mb-6">Cursor Control Demo</h2>
-            <div className="h-[460px] bg-black rounded-2xl border border-neutral-800 flex items-center justify-center relative overflow-hidden">
-              <div className="text-neutral-500 font-mono text-center">
-                Cursor Area<br />
-                <span className="text-sm">(Will move based on decoder prediction)</span>
-              </div>
+            <div className="h-[460px] bg-black rounded-2xl border border-neutral-800 relative overflow-hidden">
+              <div className="absolute inset-0 opacity-30 pointer-events-none"
+                style={{
+                  backgroundImage: `
+                    linear-gradient(to right, rgb(38 38 38) 1px, transparent 1px),
+                    linear-gradient(to bottom, rgb(38 38 38) 1px, transparent 1px)
+                  `,
+                  backgroundSize: "40px 40px",
+                }}
+              />
+              <div className="absolute left-1/2 top-1/2 w-2 h-2 -ml-1 -mt-1 rounded-full bg-neutral-600" aria-hidden />
+              {decoderData && (
+                <div
+                  className="absolute w-4 h-4 rounded-full bg-neuralink-accent shadow-[0_0_20px_rgba(0,255,170,0.5)] border-2 border-white/90 z-10 transition-all duration-75 ease-linear"
+                  style={{
+                    left: `${(decoderData.cursor_x ?? 0.5) * 100}%`,
+                    top: `${(decoderData.cursor_y ?? 0.5) * 100}%`,
+                    transform: "translate(-50%, -50%)",
+                  }}
+                  title="Decoded cursor"
+                />
+              )}
+              {!decoderData && (
+                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                  <p className="text-neutral-500 font-mono text-center text-sm">
+                    Waiting for decoder stream…
+                  </p>
+                </div>
+              )}
             </div>
           </div>
 

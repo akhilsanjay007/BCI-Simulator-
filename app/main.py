@@ -1,86 +1,41 @@
 import asyncio
-import time
-from typing import Any, Dict
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 
 from app.decoder import BciDecoder, Intent, make_bootstrap_training_set
+from app.simulator import generator
 
 app = FastAPI(title="Neuralink BCI Signal Simulator")
 
-# Global intent state (Phase 2)
+# 2D cursor: normalized units per second at full "speed" for one axis
+CURSOR_SPEED_PER_S = 0.85
+
+
+def _step_cursor(
+    x: float,
+    y: float,
+    intent: str,
+    *,
+    batch_samples: int,
+    fs: int,
+) -> tuple[float, float]:
+    dt_s = batch_samples / float(fs)
+    step = CURSOR_SPEED_PER_S * dt_s
+    if intent == "right":
+        x += step
+    elif intent == "left":
+        x -= step
+    elif intent == "up":
+        y -= step
+    elif intent == "down":
+        y += step
+    return float(np.clip(x, 0.0, 1.0)), float(np.clip(y, 0.0, 1.0))
+
+# Global intent state 
 current_intent: Intent = "right"
 
-class SignalPacket(BaseModel):
-    """Typed packet sent over WebSocket — exactly what a real decoder expects."""
-    timestamp_ms: float = Field(
-        ...,
-        description="Unix timestamp in milliseconds since 1970-01-01 UTC (cross-platform epoch time)",
-    )
-    fs: int = Field(..., description="Sampling rate Hz")
-    channels: int = Field(..., description="Number of channels")
-    lfp: list[list[float]] = Field(..., description="LFP data [batch_size, channels]")
-    spikes: list[list[int]] = Field(..., description="Binary spike events [batch_size, channels]")
-
-class NeuralSignalGenerator:
-    """Realistic Neuralink-style synthetic generator (learn-by-building signal processing)."""
-    def __init__(self, num_channels: int = 32, fs: int = 1000, base_spike_rate_hz: float = 15.0):
-        self.num_channels = num_channels
-        self.fs = fs
-        self.dt = 1.0 / fs
-        self.base_spike_rate = base_spike_rate_hz
-        self.rng = np.random.default_rng(seed=42)  # reproducible for demos
-        # Per-channel low-frequency modulation (real neurons aren't pure noise)
-        self.freqs = self.rng.uniform(1, 30, num_channels)  # Hz
-
-    async def stream(self) -> Dict[str, Any]:
-        """Async generator that yields realistic 20 ms batches forever."""
-        batch_size = self.fs // 50  # 20 ms batches → smooth real-time feel
-        t = 0.0
-
-        while True:
-            # LFP: 1/f-like noise + sinusoidal modulation per channel
-            noise = self.rng.normal(0, 1.0, size=(batch_size, self.num_channels))
-            modulation = 0.3 * np.sin(2 * np.pi * self.freqs * t)  # vectorized
-            lfp = (noise + modulation).tolist()
-
-            # Spikes: inhomogeneous Poisson process (realistic firing)
-            base_prob = self.base_spike_rate * self.dt
-
-            # Intent-aware spike bias (Phase 2).
-            # Channel groups: 0-7=right, 8-15=left, 16-24=up, 25-31=down
-            multipliers = np.ones((self.num_channels,), dtype=np.float32)
-            intent = current_intent
-            if intent == "right":
-                multipliers[0:8] *= 3.0
-            elif intent == "left":
-                multipliers[8:16] *= 3.0
-            elif intent == "up":
-                multipliers[16:25] *= 3.0
-            elif intent == "down":
-                multipliers[25:32] *= 3.0
-
-            prob = np.clip(base_prob * multipliers, 0.0, 0.95)
-            spikes = (self.rng.random((batch_size, self.num_channels)) < prob).astype(int).tolist()
-
-            packet = SignalPacket(
-                timestamp_ms=time.time() * 1000,
-                fs=self.fs,
-                channels=self.num_channels,
-                lfp=lfp,
-                spikes=spikes,
-            )
-
-            yield packet.model_dump()  # Pydantic → dict for JSON
-
-            t += batch_size * self.dt
-            await asyncio.sleep(batch_size * self.dt)  # real-time timing
-
-# Global generator (singleton for MVP)
-generator = NeuralSignalGenerator(num_channels=32, fs=1000)
-
-# Decoder (Phase 2): bootstrap-train so /ws/decoder is runnable immediately.
+# Bootstrap-train decoder so /ws/decoder is runnable immediately.
 decoder = BciDecoder(fs=generator.fs, channels=generator.num_channels, window_ms=200)
 try:
     X_train, y_train = make_bootstrap_training_set(
@@ -126,15 +81,27 @@ async def decoder_stream(websocket: WebSocket):
     """
     await websocket.accept()
     print("✅ Client connected — decoder stream live")
+    cursor_x, cursor_y = 0.5, 0.5
     try:
         async for packet in generator.stream():
             # Keep /ws/bci-stream unchanged; decoder uses spikes only.
-            decoded = decoder.predict(packet["spikes"], true_intent=current_intent)
-            print(
-                f"pred={decoded.predicted_intent} conf={decoded.confidence:.2f} "
-                f"lat={decoded.latency_ms:.1f}ms acc={decoded.accuracy:.2f} intent={current_intent}"
+            decoded = decoder.predict(packet["spikes"], true_intent=generator.current_stream_intent)
+            spikes = packet["spikes"]
+            batch_samples = len(spikes) if spikes else 0
+            cursor_x, cursor_y = _step_cursor(
+                cursor_x,
+                cursor_y,
+                decoded.predicted_intent,
+                batch_samples=batch_samples,
+                fs=int(packet.get("fs", generator.fs)),
             )
-            await websocket.send_json(decoded.model_dump())
+            out = decoded.model_copy(update={"cursor_x": cursor_x, "cursor_y": cursor_y})
+            print(
+                f"pred={out.predicted_intent} conf={out.confidence:.2f} "
+                f"lat={out.latency_ms:.1f}ms acc={out.accuracy:.2f} intent={generator.current_stream_intent} "
+                f"cursor=({out.cursor_x:.2f},{out.cursor_y:.2f})"
+            )
+            await websocket.send_json(out.model_dump())
     except WebSocketDisconnect:
         print("Decoder client disconnected")
     except Exception as e:

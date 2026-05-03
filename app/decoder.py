@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 
-Intent = Literal["left", "right", "up", "down"]
+Intent = Literal["left", "right", "up", "down", "rest"]
 
 
 class DecoderPacket(BaseModel):
@@ -20,6 +20,18 @@ class DecoderPacket(BaseModel):
     confidence: float = Field(..., ge=0.0, le=1.0)
     latency_ms: float = Field(..., ge=0.0)
     accuracy: float = Field(..., ge=0.0, le=1.0)
+    cursor_x: float = Field(
+        0.5,
+        ge=0.0,
+        le=1.0,
+        description="Normalized horizontal cursor position [0,1] in the 2D control plane; server integrates intent.",
+    )
+    cursor_y: float = Field(
+        0.5,
+        ge=0.0,
+        le=1.0,
+        description="Normalized vertical cursor position [0,1] in the 2D control plane; server integrates intent.",
+    )
 
 
 @dataclass(frozen=True)
@@ -46,7 +58,9 @@ class BciDecoder:
     - reports latency and rolling accuracy
     """
 
-    def __init__(self, *, fs: int, channels: int, window_ms: int = 200) -> None:
+    def __init__(
+        self, *, fs: int, channels: int, window_ms: int = 200, exploration_prob: float = 0.08
+    ) -> None:
         if fs <= 0:
             raise ValueError("fs must be positive")
         if channels <= 0:
@@ -67,6 +81,8 @@ class BciDecoder:
 
         # Rolling accuracy over last 50 predictions
         self._recent_correct: Deque[int] = deque(maxlen=50)
+        self._explore_rng = np.random.default_rng(seed=123)
+        self._explore_prob = exploration_prob
 
     @property
     def is_trained(self) -> bool:
@@ -137,6 +153,11 @@ class BciDecoder:
             "down": spike_rates[25:32],
         }
         means = {k: float(v.mean()) for k, v in groups.items()}
+        vals = list(means.values())
+        spread = max(vals) - min(vals)
+        mean_rate = float(np.mean(vals))
+        if spread < max(0.15 * mean_rate, 1e-3):
+            return "rest", 0.55  # type: ignore[return-value]
         ranked = sorted(means.items(), key=lambda kv: kv[1], reverse=True)
         best_intent = ranked[0][0]  # type: ignore[assignment]
         best = ranked[0][1]
@@ -163,8 +184,17 @@ class BciDecoder:
         else:
             predicted, confidence = self._heuristic_predict(feats[0])
 
+        if self._explore_rng.random() < self._explore_prob:
+            if self._is_trained:
+                pool = [str(c) for c in self._label_encoder.classes_ if str(c) != predicted]
+            else:
+                pool = [i for i in ("left", "right", "up", "down", "rest") if i != predicted]
+            if pool:
+                predicted = str(self._explore_rng.choice(pool))
+                confidence = float(self._explore_rng.uniform(0.12, 0.42))
+
         # rolling accuracy
-        if true_intent in ("left", "right", "up", "down"):
+        if true_intent in ("left", "right", "up", "down", "rest"):
             self._recent_correct.append(1 if predicted == true_intent else 0)
         accuracy = float(np.mean(self._recent_correct)) if self._recent_correct else 0.0
 
@@ -175,7 +205,15 @@ class BciDecoder:
             confidence=float(np.clip(confidence, 0.0, 1.0)),
             latency_ms=latency_ms,
             accuracy=accuracy,
+            cursor_x=0.5,
+            cursor_y=0.5,
         )
+
+    def reset_state(self) -> None:
+        """Clear sliding-window and rolling-accuracy state for offline runs or reconnect semantics."""
+        self._spike_window.clear()
+        self._window_count = 0
+        self._recent_correct.clear()
 
 
 def make_bootstrap_training_set(
@@ -199,11 +237,13 @@ def make_bootstrap_training_set(
             m[8:16] *= 3.0
         elif intent == "up":
             m[16:25] *= 3.0
-        else:  # down
+        elif intent == "down":
             m[25:32] *= 3.0
+        else:  # rest — uniform baseline, no directional boost
+            pass
         return m
 
-    intents: list[Intent] = ["left", "right", "up", "down"]
+    intents: list[Intent] = ["left", "right", "up", "down", "rest"]
     X_list: list[np.ndarray] = []
     y_list: list[str] = []
 
