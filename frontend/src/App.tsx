@@ -2,18 +2,25 @@ import { useState, useEffect, useRef } from "react";
 
 interface DecoderPacket {
   timestamp_ms: number;
-  predicted_intent: "left" | "right" | "up" | "down";
+  predicted_intent: "left" | "right" | "up" | "down" | "rest";
   confidence: number;
   latency_ms: number;
+  /** Rolling accuracy, last 20 predictions */
   accuracy: number;
+  /** Session accuracy since connect or last reset */
+  session_accuracy: number;
   /** Normalized [0,1] from server-integrated 2D cursor */
   cursor_x?: number;
   cursor_y?: number;
 }
 
+/** Display-side EMA to soften stepped server cursor (main integrates per batch). */
+const CURSOR_DISPLAY_ALPHA = 0.24;
+
 function App() {
   const [status, setStatus] = useState<"connected" | "disconnected">("disconnected");
   const [decoderData, setDecoderData] = useState<DecoderPacket | null>(null);
+  const [cursorDisplay, setCursorDisplay] = useState({ x: 0.5, y: 0.5 });
   const wsRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
@@ -30,6 +37,12 @@ function App() {
       try {
         const data: DecoderPacket = JSON.parse(event.data);
         setDecoderData(data);
+        const tx = data.cursor_x ?? 0.5;
+        const ty = data.cursor_y ?? 0.5;
+        setCursorDisplay((prev) => ({
+          x: CURSOR_DISPLAY_ALPHA * tx + (1 - CURSOR_DISPLAY_ALPHA) * prev.x,
+          y: CURSOR_DISPLAY_ALPHA * ty + (1 - CURSOR_DISPLAY_ALPHA) * prev.y,
+        }));
       } catch (error) {
         console.error("Error parsing decoder data:", error);
       }
@@ -51,12 +64,21 @@ function App() {
     };
   }, []);
 
+  const resetDecoderState = async () => {
+    try {
+      await fetch("http://localhost:8000/decoder/reset", { method: "POST" });
+    } catch (e) {
+      console.error("Decoder reset failed:", e);
+    }
+  };
+
   const getIntentColor = (intent: string) => {
     switch (intent) {
       case "left": return "text-blue-400";
       case "right": return "text-red-400";
       case "up": return "text-green-400";
       case "down": return "text-yellow-400";
+      case "rest": return "text-cyan-400/90";
       default: return "text-neutral-400";
     }
   };
@@ -99,13 +121,13 @@ function App() {
               <div className="absolute left-1/2 top-1/2 w-2 h-2 -ml-1 -mt-1 rounded-full bg-neutral-600" aria-hidden />
               {decoderData && (
                 <div
-                  className="absolute w-4 h-4 rounded-full bg-neuralink-accent shadow-[0_0_20px_rgba(0,255,170,0.5)] border-2 border-white/90 z-10 transition-all duration-75 ease-linear"
+                  className="absolute w-4 h-4 rounded-full bg-neuralink-accent shadow-[0_0_20px_rgba(0,255,170,0.45)] border-2 border-white/90 z-10 transition-[left,top] duration-150 ease-out will-change-[left,top]"
                   style={{
-                    left: `${(decoderData.cursor_x ?? 0.5) * 100}%`,
-                    top: `${(decoderData.cursor_y ?? 0.5) * 100}%`,
+                    left: `${cursorDisplay.x * 100}%`,
+                    top: `${cursorDisplay.y * 100}%`,
                     transform: "translate(-50%, -50%)",
                   }}
-                  title="Decoded cursor"
+                  title="Decoded cursor (display-smoothed)"
                 />
               )}
               {!decoderData && (
@@ -145,11 +167,27 @@ function App() {
                   </span>
                 </div>
                 <div className="flex justify-between items-center">
-                  <span className="text-neutral-400">Accuracy</span>
+                  <span className="text-neutral-400">Accuracy (last 20)</span>
                   <span className="font-mono text-lg font-medium text-green-400">
                     {decoderData ? `${(decoderData.accuracy * 100).toFixed(1)}%` : "—"}
                   </span>
                 </div>
+                <div className="flex justify-between items-center">
+                  <span className="text-neutral-400">Accuracy (session)</span>
+                  <span className="font-mono text-lg font-medium text-emerald-300/90">
+                    {decoderData
+                      ? `${(decoderData.session_accuracy * 100).toFixed(1)}%`
+                      : "—"}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={resetDecoderState}
+                  className="w-full mt-2 py-2.5 rounded-xl border border-neutral-600 text-neutral-200 text-sm font-medium
+                    hover:bg-neutral-800/80 transition-colors"
+                >
+                  Reset decoder state
+                </button>
               </div>
             </div>
           </div>

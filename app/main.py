@@ -1,12 +1,25 @@
 import asyncio
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from app.decoder import BciDecoder, Intent, make_bootstrap_training_set
 from app.simulator import generator
 
 app = FastAPI(title="Neuralink BCI Signal Simulator")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # 2D cursor: normalized units per second at full "speed" for one axis
 CURSOR_SPEED_PER_S = 0.85
@@ -36,7 +49,12 @@ def _step_cursor(
 current_intent: Intent = "right"
 
 # Bootstrap-train decoder so /ws/decoder is runnable immediately.
-decoder = BciDecoder(fs=generator.fs, channels=generator.num_channels, window_ms=200)
+decoder = BciDecoder(
+    fs=generator.fs,
+    channels=generator.num_channels,
+    window_ms=200,
+    exploration_prob=0.0,
+)
 try:
     X_train, y_train = make_bootstrap_training_set(
         fs=generator.fs, channels=generator.num_channels, window_ms=200, n_per_intent=300, seed=42
@@ -56,6 +74,12 @@ async def set_intent(body: SetIntentRequest) -> dict[str, str]:
     global current_intent
     current_intent = body.intent
     return {"intent": current_intent}
+
+
+@app.post("/decoder/reset")
+async def reset_decoder() -> dict[str, str]:
+    decoder.reset_state()
+    return {"status": "ok"}
 
 @app.websocket("/ws/bci-stream")
 async def bci_stream(websocket: WebSocket):
@@ -98,7 +122,8 @@ async def decoder_stream(websocket: WebSocket):
             out = decoded.model_copy(update={"cursor_x": cursor_x, "cursor_y": cursor_y})
             print(
                 f"pred={out.predicted_intent} conf={out.confidence:.2f} "
-                f"lat={out.latency_ms:.1f}ms acc={out.accuracy:.2f} intent={generator.current_stream_intent} "
+                f"lat={out.latency_ms:.1f}ms roll20={out.accuracy:.2f} sess={out.session_accuracy:.2f} "
+                f"intent={generator.current_stream_intent} "
                 f"cursor=({out.cursor_x:.2f},{out.cursor_y:.2f})"
             )
             await websocket.send_json(out.model_dump())

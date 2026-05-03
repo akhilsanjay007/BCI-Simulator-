@@ -14,6 +14,10 @@ from app.decoder import Intent
 
 _STREAM_INTENTS: tuple[Intent, ...] = ("left", "right", "up", "down", "rest")
 
+# Hold each intent for many consecutive batches so the decoder window (~200 ms) matches
+# offline_eval: homogeneous spikes per label. Switching intent every batch mixes labels in one window (~chance accuracy).
+_INTENT_HOLD_BATCHES = 50  # 50 × 20 ms = 1.0 s per intent at fs=1000, batch_size=fs//50
+
 
 class SignalPacket(BaseModel):
     """Typed packet sent over WebSocket — exactly what a real decoder expects."""
@@ -41,6 +45,8 @@ class NeuralSignalGenerator:
         self._stream_step = 0
         self._intent_ring: Deque[str] = deque(maxlen=200)
         self.current_stream_intent: Intent = "rest"
+        self._intent_block_remaining = 0
+        self._intent_cycle_index = 0
 
     async def stream(self) -> Dict[str, Any]:
         """Async generator that yields realistic 20 ms batches forever."""
@@ -54,9 +60,15 @@ class NeuralSignalGenerator:
 
             base_prob = self.base_spike_rate * self.dt
 
-            intent = _STREAM_INTENTS[self._stream_step % len(_STREAM_INTENTS)]
+            if self._intent_block_remaining <= 0:
+                self.current_stream_intent = _STREAM_INTENTS[
+                    self._intent_cycle_index % len(_STREAM_INTENTS)
+                ]
+                self._intent_cycle_index += 1
+                self._intent_block_remaining = _INTENT_HOLD_BATCHES
+            self._intent_block_remaining -= 1
+            intent = self.current_stream_intent
             self._stream_step += 1
-            self.current_stream_intent = intent
             self._intent_ring.append(intent)
 
             multipliers = np.ones((self.num_channels,), dtype=np.float32)
