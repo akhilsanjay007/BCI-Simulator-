@@ -2,12 +2,12 @@
 
 Synthetic neural-style signals over a WebSocket: LFP-style traces and sparse spike events, typed with Pydantic and streamed from a small **FastAPI** service. The live signal path is implemented in `app/simulator.py` (`NeuralSignalGenerator`) and consumed by `app/main.py`. Useful for prototyping decoders, dashboards, or BCI pipelines without hardware.
 
-The repo also includes an optional **React + Vite** dashboard under `frontend/` that connects to `ws://localhost:8000/ws/decoder` and shows live decoder output.
+The repo includes an optional **React + Vite + Tailwind** dashboard under `frontend/` that connects to the decoder WebSocket, shows a 2D cursor, rolling decoder metrics, and a multi-channel spike raster + population firing-rate chart driven by the simulator channel count.
 
 ## Requirements
 
-- **Backend:** Python 3.10 or newer (3.13 is fine), a virtual environment (recommended), and dependencies in `requirements.txt`
-- **Dashboard (optional):** [Node.js](https://nodejs.org/) 20+ and npm (for `frontend/`)
+- **Backend:** Python **3.10+** (3.13 is fine), a virtual environment (recommended), and packages listed in **`requirements.txt`**
+- **Dashboard (optional):** **Node.js 20+** and npm (for `frontend/`)
 
 ## Setup
 
@@ -46,9 +46,18 @@ npm install
 npm run dev
 ```
 
-Open [http://127.0.0.1:5173](http://127.0.0.1:5173). The UI expects the decoder WebSocket at `ws://localhost:8000/ws/decoder` (start the backend first). The dashboard calls **`POST http://localhost:8000/decoder/reset`** (with CORS enabled for local Vite ports) to clear decoder buffers and session accuracy counts via **`decoder.reset_state()`**.
+Open [http://127.0.0.1:5173](http://127.0.0.1:5173). Start the backend first.
 
-For Vite/React-specific details, see `frontend/README.md`.
+The UI uses:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `ws://localhost:8000/ws/decoder` | Live decoder packets (`predicted_intent`, cursor, metrics, **`num_channels`**, etc.) |
+| `GET http://localhost:8000/simulator/config` | **`num_channels`** and **`fs`** (same as the generator singleton; used to size the spike raster) |
+| `POST http://localhost:8000/decoder/reset` | Clears decoder buffers, cursor, and session accuracy (`decoder.reset_state()`) |
+| `POST http://localhost:8000/manual-neural-burst` | Manual mode: JSON body `{ "intent", "duration_ms" }` — aligns a short cortical burst with the D-pad |
+
+CORS allows local Vite ports (`5173`, `3000`). Layout is a fixed viewport: **cursor** (primary), compact **Manual / Decoder** strip, **Raw Neural Signals** (spike raster + mean rate). For React/Vite specifics, see `frontend/README.md`.
 
 ## WebSocket stream
 
@@ -77,7 +86,12 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/decoder/reset
 ## Decoder stream
 
 - **URL:** `ws://localhost:8000/ws/decoder`
-- **Payload:** JSON objects with `timestamp_ms`, `predicted_intent`, `confidence`, `latency_ms`, **`accuracy`** (rolling over the **last 20** predictions vs ground truth), **`session_accuracy`** (fraction correct since WebSocket connect or last **`decoder.reset_state()`**), plus **`cursor_x` / `cursor_y`** in \([0,1]\) for normalized 2D cursor position (integrated per connection from predicted intent in `app/main.py`; does not change `/ws/bci-stream`). Predictions may include `rest` when the model infers a neutral pattern.
+- **Payload:** JSON objects with:
+  - `timestamp_ms`, `predicted_intent`, `confidence`, `latency_ms`
+  - **`accuracy`** — rolling over the **last 20** predictions vs ground truth
+  - **`session_accuracy`** — fraction correct since WebSocket connect or last **`decoder.reset_state()`**
+  - **`cursor_x` / `cursor_y`** — normalized \([0,1]\) 2D cursor (integrated from predicted intent)
+  - **`num_channels`** — electrode count for the simulator/decoder configuration (dashboard raster uses `min(64, num_channels)` visible rows)
 - **Reset:** `POST /decoder/reset` clears the decoder’s spike window, cursor, rolling buffer, and session accuracy counters.
 - **Notes:** this endpoint reuses the simulator stream and decodes from `spikes` (LFP is generated but not used by the decoder). The FastAPI app constructs `BciDecoder` with **`exploration_prob=0`** so live accuracy is comparable to **`offline_eval`** (which also uses `0`). For experiments, you can raise `exploration_prob` in `app/main.py`. For debugging, `BciDecoder.predict` **prints** feature summaries and `predicted` vs `true` intent every **50** steps to the server console.
 
@@ -120,10 +134,10 @@ python tests/test_decoder_client.py
 neuralink-bci-sim/
 ├── app/
 │   ├── __init__.py
-│   ├── decoder.py       # minimal sliding-window decoder + bootstrap trainer
+│   ├── decoder.py       # sliding-window decoder + bootstrap trainer + DecoderPacket
 │   ├── offline_eval.py  # offline metrics on synthetic spikes (no WebSocket)
 │   ├── simulator.py     # NeuralSignalGenerator + shared singleton `generator`
-│   └── main.py          # FastAPI app + /ws/bci-stream + /ws/decoder
+│   └── main.py          # FastAPI: /ws/bci-stream, /ws/decoder, /simulator/config, etc.
 ├── frontend/            # React + Vite + Tailwind dashboard (optional)
 │   ├── src/
 │   ├── package.json
@@ -138,4 +152,4 @@ neuralink-bci-sim/
 └── README.md
 ```
 
-The Python `venv/` directory and the frontend’s `node_modules/` / `dist/` are listed in `.gitignore`; they should not be committed.
+The Python `venv/` directory and the frontend’s `node_modules/` / `dist/` are listed in **`.gitignore`**; they should not be committed.

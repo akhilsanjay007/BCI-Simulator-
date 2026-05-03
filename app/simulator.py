@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import Counter, deque
-from typing import Any, Deque, Dict
+from typing import Any, Deque, Dict, Optional
 
 import numpy as np
 from pydantic import BaseModel, Field
@@ -48,6 +48,53 @@ class NeuralSignalGenerator:
         self._intent_block_remaining = 0
         self._intent_cycle_index = 0
 
+        # Short-lived burst from dashboard Manual mode (additive spike probability on intent channels).
+        self._manual_burst_until_ms: float = 0.0
+        self._manual_burst_start_ms: float = 0.0
+        self._manual_burst_duration_ms: float = 1.0
+        self._manual_burst_intent: Optional[Intent] = None
+
+    def trigger_manual_burst(self, intent: Intent, duration_ms: float) -> None:
+        """Temporary neural burst overlay for Manual UI (does not change current_stream_intent)."""
+        if intent == "rest":
+            self._manual_burst_intent = None
+            self._manual_burst_until_ms = 0.0
+            return
+        now_ms = time.time() * 1000.0
+        duration_ms = float(max(50.0, min(duration_ms, 1200.0)))
+        self._manual_burst_until_ms = now_ms + duration_ms
+        self._manual_burst_start_ms = now_ms
+        self._manual_burst_duration_ms = duration_ms
+        self._manual_burst_intent = intent
+
+    def _manual_burst_envelope(self) -> float:
+        """Smooth decay 1 → 0 over the burst window."""
+        now_ms = time.time() * 1000.0
+        if self._manual_burst_intent is None or now_ms >= self._manual_burst_until_ms:
+            return 0.0
+        elapsed = now_ms - self._manual_burst_start_ms
+        dur = max(self._manual_burst_duration_ms, 1e-6)
+        t = min(1.0, elapsed / dur)
+        return float(max(0.0, (1.0 - t) ** 1.28))
+
+    def _manual_burst_extra_probability(self) -> np.ndarray:
+        """Extra per-sample spike probability on cortical-channel groups (aligned with decoder layout)."""
+        env = self._manual_burst_envelope()
+        extra = np.zeros((self.num_channels,), dtype=np.float32)
+        if env <= 0.0 or self._manual_burst_intent is None:
+            return extra
+        peak = env * 0.052
+        intent = self._manual_burst_intent
+        if intent == "right":
+            extra[0:8] = peak
+        elif intent == "left":
+            extra[8:16] = peak
+        elif intent == "up":
+            extra[16:25] = peak
+        elif intent == "down":
+            extra[25:32] = peak
+        return extra
+
     async def stream(self) -> Dict[str, Any]:
         """Async generator that yields realistic 20 ms batches forever."""
         batch_size = self.fs // 50  # 20 ms batches → smooth real-time feel
@@ -82,7 +129,8 @@ class NeuralSignalGenerator:
                 multipliers[25:32] *= 3.0
             # rest: leave multipliers at 1.0
 
-            prob = np.clip(base_prob * multipliers, 0.0, 0.95)
+            burst_extra = self._manual_burst_extra_probability()
+            prob = np.clip(base_prob * multipliers + burst_extra, 0.0, 0.95)
             spikes = (self.rng.random((batch_size, self.num_channels)) < prob).astype(int).tolist()
 
             if self._stream_step % 50 == 0 and self._intent_ring:

@@ -1,3 +1,4 @@
+# neuralink-bci-sim — FastAPI service, NumPy/scikit-learn decoder, pytest (offline tests + optional smoke scripts)
 fastapi==0.115.0
 uvicorn[standard]==0.32.0
 numpy==2.1.2

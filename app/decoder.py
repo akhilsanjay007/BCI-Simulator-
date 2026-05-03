@@ -10,8 +10,16 @@ from sklearn.preprocessing import LabelEncoder
 
 Intent = Literal["left", "right", "up", "down", "rest"]
 
-# Must match app.main._step_cursor integration so off-line cursor matches live semantics.
-CURSOR_SPEED_PER_S = 0.85
+# Velocity-based cursor: max axis speed (normalized [0,1] plane per second) at full confidence.
+CURSOR_MAX_SPEED_PER_S = 0.85
+# How quickly actual velocity tracks the commanded velocity (higher = snappier direction changes).
+CURSOR_VEL_TRACKING_PER_S = 14.0
+# Baseline exponential damping on velocity each step (friction).
+CURSOR_VEL_DAMPING_PER_S = 2.0
+# Extra damping when predicted intent is "rest" so the cursor coasts to a stop.
+CURSOR_REST_EXTRA_DAMPING_PER_S = 5.0
+# Extra damping scaled by (1 - confidence) so weak directional predictions bleed off speed.
+CURSOR_WEAK_INTENT_DAMPING_PER_S = 4.0
 
 # When max class probability or top-1 vs top-2 margin is too small, treat as "rest"
 # (suppress twitchy direction picks on ambiguous windows).
@@ -53,6 +61,11 @@ class DecoderPacket(BaseModel):
         ge=0.0,
         le=1.0,
         description="Normalized vertical cursor position [0,1] in the 2D control plane; server integrates intent.",
+    )
+    num_channels: int = Field(
+        ...,
+        ge=1,
+        description="Number of neural recording channels in the simulator/decoder configuration.",
     )
 
 
@@ -104,10 +117,9 @@ class BciDecoder:
     Exploration (~8% default) keeps the policy from freezing; optional uncertainty gating
     maps ambiguous windows to "rest".
 
-    Cursor: integrates predicted intent with the same speed as app.main, then applies
-    exponential smoothing on cursor_x/cursor_y. Note: the live /ws/decoder path may still
-    overwrite cursor fields in main.py — smoothing remains correct for offline use and API
-    consumers that forward DecoderPacket unchanged.
+    Cursor: velocity-based integration from predicted intent and confidence, with damping
+    on weak/rest predictions and exponential smoothing on the cursor_x/cursor_y emitted
+    in DecoderPacket.
     """
 
     def __init__(
@@ -117,7 +129,7 @@ class BciDecoder:
         channels: int,
         window_ms: int = 200,
         exploration_prob: float = 0.08,
-        cursor_smooth_alpha: float = 0.35,
+        cursor_smooth_alpha: float = 0.22,
     ) -> None:
         if fs <= 0:
             raise ValueError("fs must be positive")
@@ -152,9 +164,12 @@ class BciDecoder:
         self._explore_rng = np.random.default_rng(seed=123)
         self._explore_prob = exploration_prob
 
-        # Raw + exponentially smoothed cursor (normalized [0,1]).
+        # Integrated position (pre-EMA) and velocities in normalized coords / second.
         self._cursor_x_raw = 0.5
         self._cursor_y_raw = 0.5
+        self._cursor_vx = 0.0
+        self._cursor_vy = 0.0
+        # Exponential moving average of displayed cursor (DecoderPacket cursor_x / cursor_y).
         self._cursor_x_s = 0.5
         self._cursor_y_s = 0.5
         self._cursor_smooth_alpha = float(np.clip(cursor_smooth_alpha, 0.01, 1.0))
@@ -277,8 +292,28 @@ class BciDecoder:
         confidence = float(1.0 / (1.0 + np.exp(-0.35 * margin)))
         return best_intent, confidence  # type: ignore[return-value]
 
-    def _step_cursor(self, intent: str, batch_samples: int) -> tuple[float, float, float, float]:
-        """Integrate intent into raw cursor, then update exponentially smoothed positions."""
+    @staticmethod
+    def _intent_velocity_direction(intent: str) -> tuple[float, float]:
+        """Unit-scale direction in cursor axes (y grows downward in normalized plane)."""
+        if intent == "right":
+            return 1.0, 0.0
+        if intent == "left":
+            return -1.0, 0.0
+        if intent == "up":
+            return 0.0, -1.0
+        if intent == "down":
+            return 0.0, 1.0
+        return 0.0, 0.0
+
+    def _step_cursor(
+        self, intent: str, confidence: float, batch_samples: int
+    ) -> tuple[float, float, float, float]:
+        """
+        Velocity-based motion: each batch pushes commanded velocity toward a target derived
+        from intent (direction) and confidence (magnitude). Damping removes speed when the
+        model favors rest or is uncertain. Position is integrated from velocity; DecoderPacket
+        fields use an additional exponential smooth on that position for a fluid trace.
+        """
         if batch_samples <= 0:
             return (
                 float(self._cursor_x_s),
@@ -288,23 +323,49 @@ class BciDecoder:
             )
 
         dt_s = batch_samples / float(self._cfg.fs)
-        step = CURSOR_SPEED_PER_S * dt_s
-        x, y = self._cursor_x_raw, self._cursor_y_raw
+        conf = float(np.clip(confidence, 0.0, 1.0))
 
-        if intent == "right":
-            x += step
-        elif intent == "left":
-            x -= step
-        elif intent == "up":
-            y -= step
-        elif intent == "down":
-            y += step
-        # rest: hold position (still smoothed toward that hold).
+        dir_x, dir_y = self._intent_velocity_direction(intent)
+        if intent == "rest":
+            target_vx = 0.0
+            target_vy = 0.0
+            drive = 0.0
+        else:
+            # Slightly compress low-end so hesitant predictions barely move the cursor.
+            gain = float(conf**0.88)
+            target_vx = dir_x * CURSOR_MAX_SPEED_PER_S * gain
+            target_vy = dir_y * CURSOR_MAX_SPEED_PER_S * gain
+            drive = conf
 
-        x = float(np.clip(x, 0.0, 1.0))
-        y = float(np.clip(y, 0.0, 1.0))
+        # Smooth velocity toward command (critically damped feel vs. teleport steps).
+        k = CURSOR_VEL_TRACKING_PER_S
+        self._cursor_vx += k * (target_vx - self._cursor_vx) * dt_s
+        self._cursor_vy += k * (target_vy - self._cursor_vy) * dt_s
+
+        # Friction + intent-aware damping: stronger when resting or when confidence is low.
+        damp_total = CURSOR_VEL_DAMPING_PER_S
+        if intent == "rest":
+            damp_total += CURSOR_REST_EXTRA_DAMPING_PER_S
+        else:
+            damp_total += CURSOR_WEAK_INTENT_DAMPING_PER_S * float(1.0 - drive)
+        damp_factor = float(np.exp(-damp_total * dt_s))
+        self._cursor_vx *= damp_factor
+        self._cursor_vy *= damp_factor
+
+        # Integrate position; clamp and kill velocity into hard edges to avoid integral windup.
+        x = float(np.clip(self._cursor_x_raw + self._cursor_vx * dt_s, 0.0, 1.0))
+        y = float(np.clip(self._cursor_y_raw + self._cursor_vy * dt_s, 0.0, 1.0))
+        if x <= 0.0 and self._cursor_vx < 0.0:
+            self._cursor_vx = 0.0
+        if x >= 1.0 and self._cursor_vx > 0.0:
+            self._cursor_vx = 0.0
+        if y <= 0.0 and self._cursor_vy < 0.0:
+            self._cursor_vy = 0.0
+        if y >= 1.0 and self._cursor_vy > 0.0:
+            self._cursor_vy = 0.0
         self._cursor_x_raw, self._cursor_y_raw = x, y
 
+        # Final exponential smoothing on the delivered cursor (continuous path on the client).
         a = self._cursor_smooth_alpha
         self._cursor_x_s = a * x + (1.0 - a) * self._cursor_x_s
         self._cursor_y_s = a * y + (1.0 - a) * self._cursor_y_s
@@ -357,7 +418,7 @@ class BciDecoder:
             )
 
         batch_samples = len(spikes_batch)
-        cx, cy, _, _ = self._step_cursor(predicted, batch_samples)
+        cx, cy, _, _ = self._step_cursor(predicted, confidence, batch_samples)
 
         latency_ms = (time.perf_counter() - start) * 1000.0
         return DecoderPacket(
@@ -369,6 +430,7 @@ class BciDecoder:
             session_accuracy=session_accuracy,
             cursor_x=cx,
             cursor_y=cy,
+            num_channels=self._channels,
         )
 
     def reset_state(self) -> None:
@@ -381,6 +443,8 @@ class BciDecoder:
         self._predict_step = 0
         self._cursor_x_raw = 0.5
         self._cursor_y_raw = 0.5
+        self._cursor_vx = 0.0
+        self._cursor_vy = 0.0
         self._cursor_x_s = 0.5
         self._cursor_y_s = 0.5
 

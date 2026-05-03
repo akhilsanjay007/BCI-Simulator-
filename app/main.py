@@ -1,5 +1,4 @@
 import asyncio
-import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -20,30 +19,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# 2D cursor: normalized units per second at full "speed" for one axis
-CURSOR_SPEED_PER_S = 0.85
-
-
-def _step_cursor(
-    x: float,
-    y: float,
-    intent: str,
-    *,
-    batch_samples: int,
-    fs: int,
-) -> tuple[float, float]:
-    dt_s = batch_samples / float(fs)
-    step = CURSOR_SPEED_PER_S * dt_s
-    if intent == "right":
-        x += step
-    elif intent == "left":
-        x -= step
-    elif intent == "up":
-        y -= step
-    elif intent == "down":
-        y += step
-    return float(np.clip(x, 0.0, 1.0)), float(np.clip(y, 0.0, 1.0))
 
 # Global intent state 
 current_intent: Intent = "right"
@@ -69,6 +44,19 @@ class SetIntentRequest(BaseModel):
     intent: Intent
 
 
+class ManualBurstRequest(BaseModel):
+    """Dashboard Manual mode: triggers a short additive spike burst on simulator channels."""
+
+    intent: Intent
+    duration_ms: float = Field(450.0, ge=50.0, le=1200.0)
+
+
+@app.post("/manual-neural-burst")
+async def manual_neural_burst(body: ManualBurstRequest) -> dict[str, str]:
+    generator.trigger_manual_burst(body.intent, body.duration_ms)
+    return {"status": "ok", "intent": body.intent}
+
+
 @app.post("/set-intent")
 async def set_intent(body: SetIntentRequest) -> dict[str, str]:
     global current_intent
@@ -80,6 +68,12 @@ async def set_intent(body: SetIntentRequest) -> dict[str, str]:
 async def reset_decoder() -> dict[str, str]:
     decoder.reset_state()
     return {"status": "ok"}
+
+
+@app.get("/simulator/config")
+async def simulator_config() -> dict[str, int]:
+    """Implements the same channel count as the live generator / decoder (for dashboard bootstrap)."""
+    return {"num_channels": generator.num_channels, "fs": generator.fs}
 
 @app.websocket("/ws/bci-stream")
 async def bci_stream(websocket: WebSocket):
@@ -105,21 +99,11 @@ async def decoder_stream(websocket: WebSocket):
     """
     await websocket.accept()
     print("✅ Client connected — decoder stream live")
-    cursor_x, cursor_y = 0.5, 0.5
     try:
         async for packet in generator.stream():
-            # Keep /ws/bci-stream unchanged; decoder uses spikes only.
+            # Cursor position is integrated inside BciDecoder (velocity + damping + EMA).
             decoded = decoder.predict(packet["spikes"], true_intent=generator.current_stream_intent)
-            spikes = packet["spikes"]
-            batch_samples = len(spikes) if spikes else 0
-            cursor_x, cursor_y = _step_cursor(
-                cursor_x,
-                cursor_y,
-                decoded.predicted_intent,
-                batch_samples=batch_samples,
-                fs=int(packet.get("fs", generator.fs)),
-            )
-            out = decoded.model_copy(update={"cursor_x": cursor_x, "cursor_y": cursor_y})
+            out = decoded
             print(
                 f"pred={out.predicted_intent} conf={out.confidence:.2f} "
                 f"lat={out.latency_ms:.1f}ms roll20={out.accuracy:.2f} sess={out.session_accuracy:.2f} "
