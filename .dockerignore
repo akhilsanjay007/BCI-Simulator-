@@ -1,0 +1,41 @@
+# Version control
+.git
+.github
+
+# Python caches and envs
+__pycache__
+*.py[cod]
+*$py.class
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.venv
+venv
+env
+
+# Coverage / test artifacts
+.coverage
+coverage.xml
+htmlcov
+
+# Secrets (never bake into images)
+.env
+.env.*
+
+# Frontend belongs to its own image
+frontend/node_modules
+frontend/dist
+frontend/.vite
+
+# Tests and CI-only files are not copied into the backend image
+tests
+
+# Editor / OS noise
+.idea
+.vscode
+*.swp
+.DS_Store
+Thumbs.db
+
+# Documentation (smaller build context)
+*.md

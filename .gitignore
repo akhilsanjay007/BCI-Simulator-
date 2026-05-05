@@ -53,3 +53,9 @@ frontend/.env.*
 
 # TypeScript incremental / Vite
 *.tsbuildinfo
+
+# Docker Compose: local overrides (secrets, published ports, bind mounts)
+docker-compose.override.yml
+
+# Optional local tooling
+.envrc

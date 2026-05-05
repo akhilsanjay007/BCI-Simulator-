@@ -140,10 +140,14 @@ export function NeuralSignalCharts({
   const lastStepRef = useRef(0);
 
   const propsRef = useRef({ controlMode, manualBurst, displayCount });
-  propsRef.current = { controlMode, manualBurst, displayCount };
+  useLayoutEffect(() => {
+    propsRef.current = { controlMode, manualBurst, displayCount };
+  }, [controlMode, manualBurst, displayCount]);
 
   const displayCountRef = useRef(displayCount);
-  displayCountRef.current = displayCount;
+  useLayoutEffect(() => {
+    displayCountRef.current = displayCount;
+  }, [displayCount]);
 
   const [tooltip, setTooltip] = useState<{
     clientX: number;

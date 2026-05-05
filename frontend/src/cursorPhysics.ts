@@ -66,9 +66,9 @@ export function stepCursorMotion(
   const conf = Math.min(1, Math.max(0, confidence));
   const [dirX, dirY] = intentVelocityDirection(intent);
 
-  let targetVx = 0;
-  let targetVy = 0;
-  let drive = 0;
+  let targetVx: number;
+  let targetVy: number;
+  let drive: number;
   if (intent === "rest") {
     targetVx = 0;
     targetVy = 0;
@@ -93,8 +93,8 @@ export function stepCursorMotion(
   vx *= dampFactor;
   vy *= dampFactor;
 
-  let x = Math.min(1, Math.max(0, s.xRaw + vx * dt_s));
-  let y = Math.min(1, Math.max(0, s.yRaw + vy * dt_s));
+  const x = Math.min(1, Math.max(0, s.xRaw + vx * dt_s));
+  const y = Math.min(1, Math.max(0, s.yRaw + vy * dt_s));
 
   if (x <= 0 && vx < 0) vx = 0;
   if (x >= 1 && vx > 0) vx = 0;

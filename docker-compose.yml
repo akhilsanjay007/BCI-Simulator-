@@ -1,0 +1,33 @@
+# Local full stack: FastAPI (8000) + static SPA (3000).
+# Usage: docker compose up --build
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Browser calls this origin for REST + WebSocket (host port mapping keeps default valid).
+        VITE_API_ORIGIN: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # Future: session store, rate limiting, or job queue sidecar.
+  # redis:
+  #   image: redis:7-alpine
+  #   ports:
+  #     - "6379:6379"
+  #   restart: unless-stopped
+  #   profiles:
+  #     - optional

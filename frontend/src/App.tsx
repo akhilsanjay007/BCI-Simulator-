@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useLayoutEffect, useRef, useCallback } from "react";
 import {
   stepCursorMotion,
   seedCursorMotion,
@@ -6,6 +6,12 @@ import {
   type ManualIntent,
 } from "./cursorPhysics";
 import { NeuralSignalCharts, type ManualNeuralBurstPayload } from "./NeuralSignalCharts";
+
+/** HTTP API origin (override at build time via VITE_API_ORIGIN for non-local deployments). */
+const API_ORIGIN =
+  (import.meta.env.VITE_API_ORIGIN as string | undefined)?.replace(/\/$/, "") ??
+  "http://localhost:8000";
+const WS_ORIGIN = API_ORIGIN.replace(/^http/, "ws");
 
 interface DecoderPacket {
   timestamp_ms: number;
@@ -93,8 +99,10 @@ function App() {
   /** 1 = fresh spike, decays toward 0 — multiplies confidence for a brief velocity boost. */
   const spikePulseEnvelopeRef = useRef(0);
 
-  controlModeRef.current = controlMode;
-  cursorDisplayRef.current = cursorDisplay;
+  useLayoutEffect(() => {
+    controlModeRef.current = controlMode;
+    cursorDisplayRef.current = cursorDisplay;
+  }, [controlMode, cursorDisplay]);
 
   const syncManualIntentFromHeld = useCallback(() => {
     const intent = pickHeldDirection(manualDirectionsHeldRef.current);
@@ -110,7 +118,7 @@ function App() {
     const duration = 300 + Math.random() * 300;
     const start = Date.now();
     setManualNeuralBurst({ startMs: start, endMs: start + duration, intent: intentDir });
-    void fetch("http://localhost:8000/manual-neural-burst", {
+    void fetch(`${API_ORIGIN}/manual-neural-burst`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ intent: intentDir, duration_ms: duration }),
@@ -166,7 +174,7 @@ function App() {
 
   // Match simulator channel count before / between WebSocket frames (same source as `num_channels` in packets).
   useEffect(() => {
-    void fetch("http://localhost:8000/simulator/config")
+    void fetch(`${API_ORIGIN}/simulator/config`)
       .then((r) => (r.ok ? r.json() : null))
       .then((j: { num_channels?: number } | null) => {
         if (j && typeof j.num_channels === "number" && j.num_channels >= 1) {
@@ -177,7 +185,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const ws = new WebSocket("ws://localhost:8000/ws/decoder");
+    const ws = new WebSocket(`${WS_ORIGIN}/ws/decoder`);
     wsRef.current = ws;
 
     ws.onopen = () => {
@@ -314,7 +322,7 @@ function App() {
 
   const resetDecoderState = async () => {
     try {
-      await fetch("http://localhost:8000/decoder/reset", { method: "POST" });
+      await fetch(`${API_ORIGIN}/decoder/reset`, { method: "POST" });
       if (controlMode === "automatic") {
         setCursorDisplay({ x: 0.5, y: 0.5 });
       } else {
