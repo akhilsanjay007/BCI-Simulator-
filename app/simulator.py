@@ -11,6 +11,7 @@ import numpy as np
 from pydantic import BaseModel, Field
 
 from app.decoder import Intent
+from app.redis_client import get_redis_client
 
 _STREAM_INTENTS: tuple[Intent, ...] = ("left", "right", "up", "down", "rest")
 
@@ -99,6 +100,7 @@ class NeuralSignalGenerator:
         """Async generator that yields realistic 20 ms batches forever."""
         batch_size = self.fs // 50  # 20 ms batches → smooth real-time feel
         t = 0.0
+        redis_client = get_redis_client()
 
         while True:
             noise = self.rng.normal(0, 1.0, size=(batch_size, self.num_channels))
@@ -147,7 +149,10 @@ class NeuralSignalGenerator:
                 spikes=spikes,
             )
 
-            yield packet.model_dump()
+            dumped = packet.model_dump()
+            if redis_client is not None:
+                await redis_client.publish_signal_packet(dumped)
+            yield dumped
 
             t += batch_size * self.dt
             await asyncio.sleep(batch_size * self.dt)

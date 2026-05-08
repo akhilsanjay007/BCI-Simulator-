@@ -100,7 +100,20 @@ The browser talks to the API at **`http://localhost:8000`** by default in local 
 
 
 
-`docker-compose.yml` includes a commented **Redis** service stub for future use.
+### Redis Streams buffering (enabled by default in Docker)
+
+The simulator publishes every raw signal packet to **Redis Streams** for low-latency buffering and multi-consumer fan-out.
+
+- **Stream**: `bci:signals`
+- **Retention**: last **20 seconds** (time-trimmed via `XTRIM ... MINID`)
+- **Health**: `GET http://127.0.0.1:8000/health/redis`
+
+Configuration (backend env vars):
+
+- `REDIS_URL` (default in compose): `redis://redis:6379/0`
+- `REDIS_STREAM_SIGNALS` (default): `bci:signals`
+- `REDIS_STREAM_RETENTION_SECONDS` (default): `20`
+- `REDIS_MAX_CONNECTIONS` (default): `50`
 
 
 
@@ -143,6 +156,7 @@ The UI uses:
 | `POST http://localhost:8000/decoder/reset` | Clears decoder buffers, cursor, and session accuracy (`decoder.reset_state()`) |
 
 | `POST http://localhost:8000/manual-neural-burst` | Manual mode: JSON body `{ "intent", "duration_ms" }` — aligns a short cortical burst with the D-pad |
+| `GET http://localhost:8000/health/redis` | Redis connectivity + stream status (or `disabled` when Redis not configured) |
 
 
 
@@ -372,7 +386,7 @@ neuralink-bci-sim/
 
 ├── Dockerfile           # production backend image (uvicorn, multi-worker)
 
-├── docker-compose.yml    # backend + frontend (+ optional Redis stub)
+├── docker-compose.yml    # backend + frontend + redis (Streams buffer)
 
 ├── requirements.txt
 

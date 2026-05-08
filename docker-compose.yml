@@ -8,6 +8,15 @@ services:
       dockerfile: Dockerfile
     ports:
       - "8000:8000"
+    environment:
+      # Async Redis client (Streams buffering). Overridable for prod.
+      REDIS_URL: redis://redis:6379/0
+      REDIS_STREAM_SIGNALS: bci:signals
+      REDIS_STREAM_RETENTION_SECONDS: "20"
+      REDIS_MAX_CONNECTIONS: "50"
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: unless-stopped
 
   frontend:
@@ -23,11 +32,14 @@ services:
       - backend
     restart: unless-stopped
 
-  # Future: session store, rate limiting, or job queue sidecar.
-  # redis:
-  #   image: redis:7-alpine
-  #   ports:
-  #     - "6379:6379"
-  #   restart: unless-stopped
-  #   profiles:
-  #     - optional
+  redis:
+    image: redis:7.2-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 1s
+      retries: 25
+    restart: unless-stopped

@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from app.decoder import BciDecoder, Intent, make_bootstrap_training_set
+from app.redis_client import get_redis_client
 from app.simulator import generator
 
 ENV = os.getenv("ENV", "development").lower()
@@ -75,6 +76,9 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "Accept", "Origin", "User-Agent", "Cache-Control", "X-Requested-With"],
 )
 
+# Optional Redis Streams client (enabled when REDIS_URL is set).
+redis_client = get_redis_client()
+
 # Global intent state 
 current_intent: Intent = "right"
 
@@ -116,6 +120,14 @@ async def health() -> dict[str, object]:
         "num_channels": generator.num_channels,
         "fs": generator.fs,
     }
+
+
+@app.get("/health/redis")
+async def health_redis() -> dict[str, object]:
+    if redis_client is None:
+        return {"status": "disabled"}
+    ok = await redis_client.ping()
+    return {"status": "ok" if ok else "error", "stream": redis_client.stream_signals}
 
 
 @app.post("/manual-neural-burst")
@@ -185,6 +197,12 @@ async def decoder_stream(websocket: WebSocket):
     except Exception as e:
         print(f"Decoder error: {e}")
         await websocket.close()
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    if redis_client is not None:
+        await redis_client.close()
 
 if __name__ == "__main__":
     import uvicorn
