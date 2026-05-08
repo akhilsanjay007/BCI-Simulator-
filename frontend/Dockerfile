@@ -12,9 +12,9 @@ RUN npm ci
 
 COPY . .
 
-# API origin is baked in at build time (Vite); override via compose/build-arg for other hosts.
-ARG VITE_API_ORIGIN=http://localhost:8000
-ENV VITE_API_ORIGIN=${VITE_API_ORIGIN}
+# Backend origin is baked in at build time (Vite); Railway sets this for the frontend service.
+ARG VITE_BACKEND_URL=http://localhost:8000
+ENV VITE_BACKEND_URL=${VITE_BACKEND_URL}
 
 RUN npm run build
 
@@ -29,9 +29,9 @@ COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=builder /src/dist /usr/share/nginx/html
 
 # nginx master runs as root; workers drop privileges — standard pattern for this image.
-EXPOSE 3000
+EXPOSE 80
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD wget -qO- http://127.0.0.1:3000/ >/dev/null || exit 1
+  CMD wget -qO- http://127.0.0.1/ >/dev/null || exit 1
 
 CMD ["nginx", "-g", "daemon off;"]

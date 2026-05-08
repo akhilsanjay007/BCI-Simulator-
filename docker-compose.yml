@@ -16,9 +16,9 @@ services:
       dockerfile: Dockerfile
       args:
         # Browser calls this origin for REST + WebSocket (host port mapping keeps default valid).
-        VITE_API_ORIGIN: http://localhost:8000
+        VITE_BACKEND_URL: http://localhost:8000
     ports:
-      - "3000:3000"
+      - "3000:80"
     depends_on:
       - backend
     restart: unless-stopped

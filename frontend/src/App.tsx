@@ -7,11 +7,35 @@ import {
 } from "./cursorPhysics";
 import { NeuralSignalCharts, type ManualNeuralBurstPayload } from "./NeuralSignalCharts";
 
-/** HTTP API origin (override at build time via VITE_API_ORIGIN for non-local deployments). */
-const API_ORIGIN =
-  (import.meta.env.VITE_API_ORIGIN as string | undefined)?.replace(/\/$/, "") ??
-  "http://localhost:8000";
-const WS_ORIGIN = API_ORIGIN.replace(/^http/, "ws");
+function resolveBackendUrl(): string {
+  const configured = (import.meta.env.VITE_BACKEND_URL as string | undefined)?.trim();
+  if (configured) {
+    return configured.replace(/\/$/, "");
+  }
+
+  if (import.meta.env.DEV) {
+    return "http://localhost:8000";
+  }
+
+  throw new Error("VITE_BACKEND_URL must be set for production builds.");
+}
+
+function toWebSocketOrigin(httpOrigin: string): string {
+  const url = new URL(httpOrigin);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  return url.toString().replace(/\/$/, "");
+}
+
+const BACKEND_HTTP_ORIGIN = resolveBackendUrl();
+const BACKEND_WS_ORIGIN = toWebSocketOrigin(BACKEND_HTTP_ORIGIN);
+
+const BACKEND_ENDPOINTS = {
+  manualNeuralBurst: `${BACKEND_HTTP_ORIGIN}/manual-neural-burst`,
+  simulatorConfig: `${BACKEND_HTTP_ORIGIN}/simulator/config`,
+  decoderReset: `${BACKEND_HTTP_ORIGIN}/decoder/reset`,
+  bciStreamWs: `${BACKEND_WS_ORIGIN}/ws/bci-stream`,
+  decoderWs: `${BACKEND_WS_ORIGIN}/ws/decoder`,
+} as const;
 
 interface DecoderPacket {
   timestamp_ms: number;
@@ -118,7 +142,7 @@ function App() {
     const duration = 300 + Math.random() * 300;
     const start = Date.now();
     setManualNeuralBurst({ startMs: start, endMs: start + duration, intent: intentDir });
-    void fetch(`${API_ORIGIN}/manual-neural-burst`, {
+    void fetch(BACKEND_ENDPOINTS.manualNeuralBurst, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ intent: intentDir, duration_ms: duration }),
@@ -174,7 +198,7 @@ function App() {
 
   // Match simulator channel count before / between WebSocket frames (same source as `num_channels` in packets).
   useEffect(() => {
-    void fetch(`${API_ORIGIN}/simulator/config`)
+    void fetch(BACKEND_ENDPOINTS.simulatorConfig)
       .then((r) => (r.ok ? r.json() : null))
       .then((j: { num_channels?: number } | null) => {
         if (j && typeof j.num_channels === "number" && j.num_channels >= 1) {
@@ -185,7 +209,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    const ws = new WebSocket(`${WS_ORIGIN}/ws/decoder`);
+    const ws = new WebSocket(BACKEND_ENDPOINTS.decoderWs);
     wsRef.current = ws;
 
     ws.onopen = () => {
@@ -322,7 +346,7 @@ function App() {
 
   const resetDecoderState = async () => {
     try {
-      await fetch(`${API_ORIGIN}/decoder/reset`, { method: "POST" });
+      await fetch(BACKEND_ENDPOINTS.decoderReset, { method: "POST" });
       if (controlMode === "automatic") {
         setCursorDisplay({ x: 0.5, y: 0.5 });
       } else {

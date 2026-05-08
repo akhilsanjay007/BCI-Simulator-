@@ -96,7 +96,7 @@ docker compose up --build
 
 
 
-The browser talks to the API at **`http://localhost:8000`** by default. To point the built UI at another origin (e.g. a remote API), set the **`VITE_API_ORIGIN`** build argument when building the frontend image or override it in `docker-compose.yml` under `frontend.build.args`.
+The browser talks to the API at **`http://localhost:8000`** by default in local development. To point the built UI at another origin (e.g. the Railway backend service), set the **`VITE_BACKEND_URL`** build argument when building the frontend image or override it in `docker-compose.yml` under `frontend.build.args`.
 
 
 

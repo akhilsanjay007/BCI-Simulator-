@@ -121,7 +121,7 @@ jobs:
           file: ./frontend/Dockerfile
           push: true
           build-args: |
-            VITE_API_ORIGIN=http://localhost:8000
+            VITE_BACKEND_URL=http://localhost:8000
           tags: |
             ghcr.io/${{ steps.img.outputs.prefix }}/frontend:latest
             ghcr.io/${{ steps.img.outputs.prefix }}/frontend:${{ github.sha }}

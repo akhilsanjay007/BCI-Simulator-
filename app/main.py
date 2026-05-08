@@ -1,4 +1,6 @@
 import asyncio
+import os
+import re
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -6,18 +8,71 @@ from pydantic import BaseModel, Field
 from app.decoder import BciDecoder, Intent, make_bootstrap_training_set
 from app.simulator import generator
 
+ENV = os.getenv("ENV", "development").lower()
+IS_PRODUCTION = ENV == "production"
+
+LOCAL_FRONTEND_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
+# Railway assigns public domains per service. This allows generated Railway
+# frontend domains without opening CORS to every origin in production.
+RAILWAY_FRONTEND_ORIGIN_RE = re.compile(r"^https://[a-z0-9][a-z0-9-]*\.up\.railway\.app$")
+
+
+def _normalize_origin(origin: str) -> str:
+    return origin.strip().rstrip("/")
+
+
+def _configured_frontend_origins() -> list[str]:
+    raw_values = [
+        os.getenv("FRONTEND_URL", ""),
+        os.getenv("FRONTEND_ORIGIN", ""),
+        os.getenv("CORS_ALLOWED_ORIGINS", ""),
+    ]
+    origins: list[str] = []
+    for raw in raw_values:
+        for value in raw.split(","):
+            origin = _normalize_origin(value)
+            if origin:
+                origins.append(origin)
+    return origins
+
+
+ALLOWED_FRONTEND_ORIGINS = [
+    *([] if IS_PRODUCTION else LOCAL_FRONTEND_ORIGINS),
+    *_configured_frontend_origins(),
+]
+
+
+def is_allowed_origin(origin: str | None) -> bool:
+    if not origin:
+        return not IS_PRODUCTION
+
+    normalized = _normalize_origin(origin)
+    return normalized in ALLOWED_FRONTEND_ORIGINS or bool(RAILWAY_FRONTEND_ORIGIN_RE.fullmatch(normalized))
+
+
+async def accept_allowed_websocket(websocket: WebSocket) -> bool:
+    if is_allowed_origin(websocket.headers.get("origin")):
+        await websocket.accept()
+        return True
+
+    await websocket.close(code=1008)
+    return False
+
+
 app = FastAPI(title="Neuralink BCI Signal Simulator")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=ALLOWED_FRONTEND_ORIGINS,
+    allow_origin_regex=RAILWAY_FRONTEND_ORIGIN_RE.pattern,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "Origin", "User-Agent", "Cache-Control", "X-Requested-With"],
 )
 
 # Global intent state 
@@ -51,6 +106,18 @@ class ManualBurstRequest(BaseModel):
     duration_ms: float = Field(450.0, ge=50.0, le=1200.0)
 
 
+@app.get("/health")
+async def health() -> dict[str, object]:
+    return {
+        "status": "ok",
+        "service": "neuralink-bci-sim-backend",
+        "env": ENV,
+        "decoder_trained": decoder.is_trained,
+        "num_channels": generator.num_channels,
+        "fs": generator.fs,
+    }
+
+
 @app.post("/manual-neural-burst")
 async def manual_neural_burst(body: ManualBurstRequest) -> dict[str, str]:
     generator.trigger_manual_burst(body.intent, body.duration_ms)
@@ -78,7 +145,8 @@ async def simulator_config() -> dict[str, int]:
 @app.websocket("/ws/bci-stream")
 async def bci_stream(websocket: WebSocket):
     """Production WebSocket endpoint — low latency, graceful disconnects."""
-    await websocket.accept()
+    if not await accept_allowed_websocket(websocket):
+        return
     print(f"✅ Client connected — streaming {generator.num_channels} channels @ {generator.fs} Hz")
     try:
         async for packet in generator.stream():
@@ -97,7 +165,8 @@ async def decoder_stream(websocket: WebSocket):
 
     Re-uses the simulator stream, runs decoder prediction per packet, and emits DecoderPacket JSON.
     """
-    await websocket.accept()
+    if not await accept_allowed_websocket(websocket):
+        return
     print("✅ Client connected — decoder stream live")
     try:
         async for packet in generator.stream():
