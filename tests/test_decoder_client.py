@@ -11,7 +11,7 @@ async def test() -> None:
             data = await ws.recv()
             pred = json.loads(data)
             print(
-                f"pred={pred['predicted_intent']} conf={pred['confidence']:.2f} "
+                f"v=({pred['vx']:+.2f},{pred['vy']:+.2f}) pen={pred['pen_down']} conf={pred['confidence']:.2f} "
                 f"lat={pred['latency_ms']:.1f}ms acc={pred['accuracy']:.1%} "
                 f"t={int(pred['timestamp_ms'])}ms"
             )
