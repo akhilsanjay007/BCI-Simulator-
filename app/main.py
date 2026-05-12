@@ -1,11 +1,11 @@
-import asyncio
 import os
 import re
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from app.decoder import BciDecoder, Intent, make_bootstrap_training_set
+from app.decoder import BciDecoder, DecoderMode, generate_training_data
 from app.redis_client import get_redis_client
 from app.simulator import generator
 
@@ -79,19 +79,21 @@ app.add_middleware(
 # Optional Redis Streams client (enabled when REDIS_URL is set).
 redis_client = get_redis_client()
 
-# Global intent state 
-current_intent: Intent = "right"
-
 # Bootstrap-train decoder so /ws/decoder is runnable immediately.
 decoder = BciDecoder(
     fs=generator.fs,
     channels=generator.num_channels,
     window_ms=200,
     exploration_prob=0.0,
+    output_mode="cursor",
 )
 try:
-    X_train, y_train = make_bootstrap_training_set(
-        fs=generator.fs, channels=generator.num_channels, window_ms=200, n_per_intent=300, seed=42
+    X_train, y_train = generate_training_data(
+        fs=generator.fs,
+        channels=generator.num_channels,
+        window_ms=200,
+        n_samples=1800,
+        seed=42,
     )
     decoder.train(X_train, y_train)
 except Exception as e:
@@ -99,15 +101,18 @@ except Exception as e:
     print(f"⚠️ Decoder bootstrap training failed; using heuristic fallback. Error: {e}")
 
 
-class SetIntentRequest(BaseModel):
-    intent: Intent
-
-
 class ManualBurstRequest(BaseModel):
-    """Dashboard Manual mode: triggers a short additive spike burst on simulator channels."""
+    """Dashboard Manual mode: short additive spike burst shaped by ``(vx, vy)``."""
 
-    intent: Intent
+    vx: float = Field(..., ge=-1.0, le=1.0, description="Horizontal velocity hint [-1, 1].")
+    vy: float = Field(..., ge=-1.0, le=1.0, description="Vertical velocity hint [-1, 1] (+y down).")
     duration_ms: float = Field(450.0, ge=50.0, le=1200.0)
+
+
+class SetDecoderModeRequest(BaseModel):
+    """Switch decoder output semantics (cursor vs handwriting pen lift)."""
+
+    mode: DecoderMode
 
 
 @app.get("/health")
@@ -117,8 +122,25 @@ async def health() -> dict[str, object]:
         "service": "neuralink-bci-sim-backend",
         "env": ENV,
         "decoder_trained": decoder.is_trained,
+        "decoder_mode": decoder.output_mode,
         "num_channels": generator.num_channels,
         "fs": generator.fs,
+    }
+
+
+@app.get("/api/decoder/info")
+async def decoder_info() -> dict[str, object]:
+    """Decoder configuration and model type (for dashboards / ops)."""
+    return {
+        "decoder_mode": decoder.output_mode,
+        "model_type": "RandomForestRegressor",
+        "target_outputs": ["vx", "vy"],
+        "velocity_range": {"vx": [-1.0, 1.0], "vy": [-1.0, 1.0]},
+        "is_trained": decoder.is_trained,
+        "n_features": decoder.n_features,
+        "fs_hz": generator.fs,
+        "num_channels": generator.num_channels,
+        "window_ms": decoder.window_ms,
     }
 
 
@@ -132,15 +154,15 @@ async def health_redis() -> dict[str, object]:
 
 @app.post("/manual-neural-burst")
 async def manual_neural_burst(body: ManualBurstRequest) -> dict[str, str]:
-    generator.trigger_manual_burst(body.intent, body.duration_ms)
-    return {"status": "ok", "intent": body.intent}
+    generator.trigger_manual_burst(body.vx, body.vy, body.duration_ms)
+    return {"status": "ok", "vx": str(body.vx), "vy": str(body.vy)}
 
 
-@app.post("/set-intent")
-async def set_intent(body: SetIntentRequest) -> dict[str, str]:
-    global current_intent
-    current_intent = body.intent
-    return {"intent": current_intent}
+@app.post("/decoder/mode")
+async def set_decoder_mode(body: SetDecoderModeRequest) -> dict[str, str]:
+    """Runtime switch for handwriting vs cursor semantics (pen_down gating)."""
+    decoder.set_output_mode(body.mode)
+    return {"status": "ok", "mode": body.mode}
 
 
 @app.post("/decoder/reset")
@@ -153,6 +175,7 @@ async def reset_decoder() -> dict[str, str]:
 async def simulator_config() -> dict[str, int]:
     """Implements the same channel count as the live generator / decoder (for dashboard bootstrap)."""
     return {"num_channels": generator.num_channels, "fs": generator.fs}
+
 
 @app.websocket("/ws/bci-stream")
 async def bci_stream(websocket: WebSocket):
@@ -180,17 +203,24 @@ async def decoder_stream(websocket: WebSocket):
     if not await accept_allowed_websocket(websocket):
         return
     print("✅ Client connected — decoder stream live")
+    _log_i = 0
     try:
         async for packet in generator.stream():
-            # Cursor position is integrated inside BciDecoder (velocity + damping + EMA).
-            decoded = decoder.predict(packet["spikes"], true_intent=generator.current_stream_intent)
-            out = decoded
-            print(
-                f"pred={out.predicted_intent} conf={out.confidence:.2f} "
-                f"lat={out.latency_ms:.1f}ms roll20={out.accuracy:.2f} sess={out.session_accuracy:.2f} "
-                f"intent={generator.current_stream_intent} "
-                f"cursor=({out.cursor_x:.2f},{out.cursor_y:.2f})"
+            decoded = decoder.predict(
+                packet["spikes"],
+                true_vx=generator.current_target_vx,
+                true_vy=generator.current_target_vy,
+                true_pen_down=generator.current_stream_pen_down,
             )
+            out = decoded
+            _log_i += 1
+            if _log_i % 50 == 0:
+                print(
+                    f"[ws/decoder] v=({out.vx:+.2f},{out.vy:+.2f}) pen={out.pen_down} conf={out.confidence:.2f} "
+                    f"lat={out.latency_ms:.1f}ms roll20={out.accuracy:.2f} sess={out.session_accuracy:.2f} "
+                    f"true=({generator.current_target_vx:+.2f},{generator.current_target_vy:+.2f}) "
+                    f"cursor=({out.cursor_x:.2f},{out.cursor_y:.2f})"
+                )
             await websocket.send_json(out.model_dump())
     except WebSocketDisconnect:
         print("Decoder client disconnected")
@@ -204,6 +234,8 @@ async def _shutdown() -> None:
     if redis_client is not None:
         await redis_client.close()
 
+
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)

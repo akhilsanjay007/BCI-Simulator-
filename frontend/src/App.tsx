@@ -1,10 +1,5 @@
 import { useState, useEffect, useLayoutEffect, useRef, useCallback } from "react";
-import {
-  stepCursorMotion,
-  seedCursorMotion,
-  type CursorMotionState,
-  type ManualIntent,
-} from "./cursorPhysics";
+import { stepCursorMotion, seedCursorMotion, type CursorMotionState } from "./cursorPhysics";
 import { NeuralSignalCharts, type ManualNeuralBurstPayload } from "./NeuralSignalCharts";
 
 function resolveBackendUrl(): string {
@@ -39,12 +34,15 @@ const BACKEND_ENDPOINTS = {
 
 interface DecoderPacket {
   timestamp_ms: number;
-  predicted_intent: "left" | "right" | "up" | "down" | "rest";
+  vx: number;
+  vy: number;
+  pen_down: boolean;
   confidence: number;
+  mode: "cursor" | "handwriting";
   latency_ms: number;
-  /** Rolling accuracy, last 20 predictions */
+  /** Rolling velocity-alignment score, last 20 batches */
   accuracy: number;
-  /** Session accuracy since connect or last reset */
+  /** Session mean score since connect or last reset */
   session_accuracy: number;
   /** Normalized [0,1] from server-integrated 2D cursor */
   cursor_x?: number;
@@ -56,22 +54,42 @@ interface DecoderPacket {
 /** Interpolation between WebSocket samples (~20 ms); server applies velocity + EMA smoothing. */
 const CURSOR_CSS_TRANSITION_MS = 280;
 
+function formatDecoderVelocity(vx: number, vy: number): string {
+  const mag = Math.hypot(vx, vy);
+  return `vx ${vx >= 0 ? "+" : ""}${vx.toFixed(2)} · vy ${vy >= 0 ? "+" : ""}${vy.toFixed(2)} · |v| ${mag.toFixed(2)}`;
+}
+
+function velocityHueClass(vx: number, vy: number): string {
+  const mag = Math.hypot(vx, vy);
+  if (mag < 0.06) return "text-cyan-400/90";
+  const ang = (Math.atan2(vy, vx) * 180) / Math.PI;
+  if (ang >= -45 && ang < 45) return "text-red-400";
+  if (ang >= 45 && ang < 135) return "text-yellow-400";
+  if (ang >= -135 && ang < -45) return "text-green-400";
+  return "text-blue-400";
+}
+
 type ControlMode = "automatic" | "manual";
 
-const DIR_ORDER: ManualIntent[] = ["left", "right", "up", "down"];
+type DirectionKey = "left" | "right" | "up" | "down";
 
-const KEY_TO_DIR: Record<string, ManualIntent> = {
+const KEY_TO_DIR: Record<string, DirectionKey> = {
   ArrowLeft: "left",
   ArrowRight: "right",
   ArrowUp: "up",
   ArrowDown: "down",
 };
 
-function pickHeldDirection(held: Set<ManualIntent>): ManualIntent {
-  for (const d of DIR_ORDER) {
-    if (held.has(d)) return d;
-  }
-  return "rest";
+function netVelocityFromHeld(held: Set<DirectionKey>): { vx: number; vy: number } {
+  let vx = 0;
+  let vy = 0;
+  if (held.has("left")) vx -= 1;
+  if (held.has("right")) vx += 1;
+  if (held.has("up")) vy -= 1;
+  if (held.has("down")) vy += 1;
+  const n = Math.hypot(vx, vy);
+  if (n < 1e-6) return { vx: 0, vy: 0 };
+  return { vx: vx / n, vy: vy / n };
 }
 
 function formatSessionClock(totalSeconds: number): string {
@@ -84,7 +102,7 @@ function formatSessionClock(totalSeconds: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-/** Random synaptic weight per discrete manual input (direction key / pad press). */
+/** Random synaptic weight per manual velocity spike (keyboard / pad). */
 const SPIKE_CONFIDENCE_MIN = 0.75;
 const SPIKE_CONFIDENCE_MAX = 0.99;
 /** Exponential decay of the velocity boost envelope (1 → 0) after each spike. */
@@ -101,7 +119,8 @@ function App() {
   const [decoderData, setDecoderData] = useState<DecoderPacket | null>(null);
   const [cursorDisplay, setCursorDisplay] = useState({ x: 0.5, y: 0.5 });
   const [controlMode, setControlMode] = useState<ControlMode>("manual");
-  const [manualIntentLabel, setManualIntentLabel] = useState<ManualIntent>("rest");
+  const [manualVelocityLabel, setManualVelocityLabel] = useState("rest");
+  const [manualCmd, setManualCmd] = useState({ vx: 0, vy: 0 });
   /** Wall-clock session length for Manual metrics (seconds since load). */
   const [sessionElapsedSec, setSessionElapsedSec] = useState(0);
   /** Confidence sampled on the latest directional input (null after Rest / no spike yet). */
@@ -114,10 +133,10 @@ function App() {
   const wsRef = useRef<WebSocket | null>(null);
   const controlModeRef = useRef<ControlMode>("manual");
   const cursorDisplayRef = useRef(cursorDisplay);
-  const manualIntentRef = useRef<ManualIntent>("rest");
+  const manualVelocityRef = useRef({ vx: 0, vy: 0 });
   const manualPhysicsRef = useRef<CursorMotionState>(seedCursorMotion(0.5, 0.5));
-  /** Directions currently held via keyboard or on-screen buttons (not rest). */
-  const manualDirectionsHeldRef = useRef<Set<ManualIntent>>(new Set());
+  /** Arrow keys / pad currently held (empty ⇒ rest). */
+  const manualDirectionsHeldRef = useRef<Set<DirectionKey>>(new Set());
   /** Confidence drawn for the current directional spike burst (drives physics + UI number). */
   const latestSpikeConfidenceRef = useRef<number | null>(null);
   /** 1 = fresh spike, decays toward 0 — multiplies confidence for a brief velocity boost. */
@@ -128,50 +147,54 @@ function App() {
     cursorDisplayRef.current = cursorDisplay;
   }, [controlMode, cursorDisplay]);
 
-  const syncManualIntentFromHeld = useCallback(() => {
-    const intent = pickHeldDirection(manualDirectionsHeldRef.current);
-    manualIntentRef.current = intent;
-    setManualIntentLabel(intent);
+  const syncManualVelocityFromHeld = useCallback(() => {
+    const v = netVelocityFromHeld(manualDirectionsHeldRef.current);
+    manualVelocityRef.current = v;
+    const n = Math.hypot(v.vx, v.vy);
+    setManualCmd(v);
+    setManualVelocityLabel(n < 1e-6 ? "rest" : formatDecoderVelocity(v.vx, v.vy));
   }, []);
 
-  const fireManualDirectionSpike = useCallback((intentDir: ManualIntent) => {
+  const fireManualVelocitySpike = useCallback((vx: number, vy: number) => {
     const c = sampleSpikeConfidence();
     latestSpikeConfidenceRef.current = c;
     spikePulseEnvelopeRef.current = 1;
     setLatestSpikeCommandConfidence(c);
     const duration = 300 + Math.random() * 300;
     const start = Date.now();
-    setManualNeuralBurst({ startMs: start, endMs: start + duration, intent: intentDir });
+    setManualNeuralBurst({ startMs: start, endMs: start + duration, vx, vy });
     void fetch(BACKEND_ENDPOINTS.manualNeuralBurst, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ intent: intentDir, duration_ms: duration }),
+      body: JSON.stringify({ vx, vy, duration_ms: duration }),
     }).catch(() => {});
   }, []);
 
   const applyManualDirectionDown = useCallback(
-    (dir: ManualIntent) => {
-      if (dir === "rest") return;
-      fireManualDirectionSpike(dir);
+    (dir: DirectionKey) => {
       manualDirectionsHeldRef.current.add(dir);
-      syncManualIntentFromHeld();
+      syncManualVelocityFromHeld();
+      const v = netVelocityFromHeld(manualDirectionsHeldRef.current);
+      if (Math.hypot(v.vx, v.vy) > 1e-6) {
+        fireManualVelocitySpike(v.vx, v.vy);
+      }
     },
-    [syncManualIntentFromHeld, fireManualDirectionSpike],
+    [syncManualVelocityFromHeld, fireManualVelocitySpike],
   );
 
   const applyManualDirectionUp = useCallback(
-    (dir: ManualIntent) => {
-      if (dir === "rest") return;
+    (dir: DirectionKey) => {
       manualDirectionsHeldRef.current.delete(dir);
-      syncManualIntentFromHeld();
+      syncManualVelocityFromHeld();
     },
-    [syncManualIntentFromHeld],
+    [syncManualVelocityFromHeld],
   );
 
   const applyManualRest = useCallback(() => {
     manualDirectionsHeldRef.current.clear();
-    manualIntentRef.current = "rest";
-    setManualIntentLabel("rest");
+    manualVelocityRef.current = { vx: 0, vy: 0 };
+    setManualCmd({ vx: 0, vy: 0 });
+    setManualVelocityLabel("rest");
     latestSpikeConfidenceRef.current = null;
     spikePulseEnvelopeRef.current = 0;
     setLatestSpikeCommandConfidence(null);
@@ -284,15 +307,16 @@ function App() {
         spikePulseEnvelopeRef.current = 0;
       }
 
-      const intent = manualIntentRef.current;
+      const { vx: cmdVx, vy: cmdVy } = manualVelocityRef.current;
       let effectiveConfidence = 0;
-      if (intent !== "rest" && latestSpikeConfidenceRef.current != null) {
+      if (Math.hypot(cmdVx, cmdVy) > 1e-6 && latestSpikeConfidenceRef.current != null) {
         effectiveConfidence = latestSpikeConfidenceRef.current * spikePulseEnvelopeRef.current;
       }
 
       manualPhysicsRef.current = stepCursorMotion(
         manualPhysicsRef.current,
-        intent,
+        cmdVx,
+        cmdVy,
         effectiveConfidence,
         dt,
       );
@@ -300,7 +324,7 @@ function App() {
       setCursorDisplay({ x: xSmooth, y: ySmooth });
 
       let strengthVisual = 0;
-      if (intent !== "rest" && latestSpikeConfidenceRef.current != null) {
+      if (Math.hypot(cmdVx, cmdVy) > 1e-6 && latestSpikeConfidenceRef.current != null) {
         strengthVisual = latestSpikeConfidenceRef.current * spikePulseEnvelopeRef.current;
       }
       setSpikeStrength(strengthVisual);
@@ -358,32 +382,15 @@ function App() {
     }
   };
 
-  const getIntentColor = (intent: string) => {
-    switch (intent) {
-      case "left":
-        return "text-blue-400";
-      case "right":
-        return "text-red-400";
-      case "up":
-        return "text-green-400";
-      case "down":
-        return "text-yellow-400";
-      case "rest":
-        return "text-cyan-400/90";
-      default:
-        return "text-neutral-400";
-    }
-  };
-
   const showCursor = controlMode === "manual" || decoderData !== null;
 
   const footerIntent =
     controlMode === "automatic"
-      ? decoderData?.predicted_intent
-        ? `${decoderData.predicted_intent.toUpperCase()} (${(decoderData.confidence * 100).toFixed(0)}%)`
+      ? decoderData
+        ? `${formatDecoderVelocity(decoderData.vx, decoderData.vy)} · ${(decoderData.confidence * 100).toFixed(0)}%`
         : "—"
-      : manualIntentLabel && manualIntentLabel !== "rest"
-        ? `${manualIntentLabel.toUpperCase()} · synth`
+      : manualVelocityLabel !== "rest"
+        ? `${manualVelocityLabel} · synth`
         : "REST";
 
   const footerLatency =
@@ -524,11 +531,13 @@ function App() {
                 </div>
                 <div className="grid grid-cols-[1fr_auto] gap-x-2 gap-y-1 items-center">
                   <div
-                    className={`text-2xl font-bold leading-none tracking-tight ${
-                      manualIntentLabel ? getIntentColor(manualIntentLabel) : "text-neutral-500"
+                    className={`text-lg font-bold font-mono leading-snug tracking-tight ${
+                      manualVelocityLabel !== "rest"
+                        ? velocityHueClass(manualCmd.vx, manualCmd.vy)
+                        : "text-cyan-400/90"
                     }`}
                   >
-                    {manualIntentLabel ? manualIntentLabel.toUpperCase() : "—"}
+                    {manualVelocityLabel !== "rest" ? manualVelocityLabel : "REST"}
                   </div>
                   <div className="text-[9px] font-mono text-right text-neutral-400 space-y-0.5">
                     <div>
@@ -607,15 +616,23 @@ function App() {
                 </div>
                 <div className="grid grid-cols-[1fr_1fr] gap-x-2 items-start">
                   <div
-                    className={`text-2xl font-bold leading-none tracking-tight ${
-                      decoderData?.predicted_intent
-                        ? getIntentColor(decoderData.predicted_intent)
-                        : "text-neutral-500"
+                    className={`text-sm font-bold font-mono leading-snug tracking-tight ${
+                      decoderData ? velocityHueClass(decoderData.vx, decoderData.vy) : "text-neutral-500"
                     }`}
                   >
-                    {decoderData?.predicted_intent ? decoderData.predicted_intent.toUpperCase() : "—"}
+                    {decoderData ? formatDecoderVelocity(decoderData.vx, decoderData.vy) : "—"}
                   </div>
                   <dl className="grid grid-cols-2 gap-x-2 gap-y-0.5 text-[9px] font-mono leading-tight">
+                    <div className="flex justify-between gap-1 col-span-2 border-b border-white/[0.05] pb-0.5">
+                      <dt className="text-neutral-500">Mode</dt>
+                      <dd className="text-neutral-200 tabular-nums uppercase">
+                        {decoderData ? decoderData.mode : "—"}
+                      </dd>
+                    </div>
+                    <div className="flex justify-between gap-1 col-span-2 border-b border-white/[0.05] pb-0.5">
+                      <dt className="text-neutral-500">Pen</dt>
+                      <dd className="text-neutral-200 tabular-nums">{decoderData ? (decoderData.pen_down ? "down" : "up") : "—"}</dd>
+                    </div>
                     <div className="flex justify-between gap-1 col-span-2 border-b border-white/[0.05] pb-0.5">
                       <dt className="text-neutral-500">Conf</dt>
                       <dd className="text-neutral-100 tabular-nums">
@@ -668,7 +685,7 @@ function App() {
       <footer className="shrink-0 border-t border-neutral-800/90 bg-black/40 px-3 py-1">
         <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-0.5 text-[10px] font-mono text-neutral-500">
           <span>
-            <span className="text-neutral-600">Intent distribution</span>{" "}
+            <span className="text-neutral-600">Velocity / decoder</span>{" "}
             <span className="text-neutral-300">{footerIntent}</span>
           </span>
           <span className="text-neutral-700 hidden sm:inline" aria-hidden>

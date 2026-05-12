@@ -28,10 +28,10 @@
                      ▼
         ┌──────────────────────────┐
         │       BciDecoder         │   app/decoder.py
-        │  features → sklearn clf  │
-        │  → predicted_intent,     │
-        │    confidence, cursor    │
-        │  → DecoderPacket         │
+        │  features → sklearn RFR │
+        │  → vx, vy, pen_down,    │
+        │    confidence, cursor   │
+        │  → DecoderPacket        │
         └────────────┬─────────────┘
                      │  JSON DecoderPacket
                      │  per batch (~50 Hz)
@@ -64,28 +64,31 @@ section as design intent, not as code-in-place.
 
 ## 2. Data Flow (Step by Step)
 
-1. **Generation** — `NeuralSignalGenerator.next_batch()` returns:
-   - `lfp`: `np.ndarray` shape `(batch_samples, channels)`
-   - `spikes`: `np.ndarray[int8]` shape `(batch_samples, channels)`, values `{0, 1}`
-   - Ground-truth intent is **cycled** in fixed order (`left → right → up → down → rest`) and
-     held for `_INTENT_HOLD_BATCHES` so the decoder's window mostly sees one label at a time.
+1. **Generation** — `NeuralSignalGenerator.stream()` yields batches with:
+   - `lfp`: `list[list[float]]` shape `(batch_samples, channels)`
+   - `spikes`: binary events `(batch_samples, channels)`, values `{0, 1}`
+   - Ground-truth **continuous velocity** `(current_target_vx, current_target_vy)` in `[-1, 1]`
+     and `current_stream_pen_down` is held for `_VELOCITY_HOLD_BATCHES` so the decoder window
+     mostly sees one target at a time.
 
 2. **Transport (current)** — `app/main.py` has two WebSocket endpoints:
    - `/ws/bci-stream` — raw signal packets (`timestamp_ms`, `fs`, `channels`, `lfp`, `spikes`).
    - `/ws/decoder` — decoded packets (`DecoderPacket`).
 
 3. **Decoding** — `BciDecoder` maintains a sliding spike window (~200 ms), extracts features
-   per channel, runs a scikit-learn classifier, and emits a `DecoderPacket`:
+   per channel, runs a **RandomForestRegressor** on `(vx, vy)`, applies EMA smoothing and
+   inter-tree agreement → `confidence`, integrates cursor, and emits a `DecoderPacket`:
    ```
    {
-     timestamp_ms, predicted_intent, confidence, latency_ms,
-     accuracy,            # rolling over last 20 predictions vs ground truth
-     session_accuracy,    # since connect or last /decoder/reset
-     cursor_x, cursor_y,  # ∈ [0, 1], integrated from predicted intent
-     num_channels         # for raster sizing
+     timestamp_ms, vx, vy, pen_down, confidence, mode,
+     latency_ms, accuracy, session_accuracy,
+     cursor_x, cursor_y,
+     num_channels
    }
    ```
-   `exploration_prob=0` in production WS path so live numbers are comparable to `offline_eval`.
+   `accuracy` / `session_accuracy` are velocity-alignment scores in `[0, 1]` vs simulator
+   ground truth. `exploration_prob=0` in production WS path so live numbers are comparable to
+   `offline_eval`.
 
 4. **Frontend** — `App.tsx` opens both WebSockets, throttles render updates, and drives:
    - 2D cursor (`cursorPhysics.ts`) — primary surface
@@ -115,16 +118,21 @@ type BciStreamPacket = {
 ```ts
 type DecoderPacket = {
   timestamp_ms: number;
-  predicted_intent: "left" | "right" | "up" | "down" | "rest";
-  confidence: number;       // [0, 1]
-  latency_ms: number;       // end-to-end decode latency
-  accuracy: number;         // rolling, last 20
+  vx: number;              // [-1, 1] horizontal velocity intent
+  vy: number;              // [-1, 1] vertical (+y down)
+  pen_down: boolean;
+  confidence: number;      // [0, 1]
+  mode: "cursor" | "handwriting";
+  latency_ms: number;      // end-to-end decode latency
+  accuracy: number;        // rolling velocity score, last 20
   session_accuracy: number; // since reset/connect
-  cursor_x: number;         // [0, 1]
-  cursor_y: number;         // [0, 1]
+  cursor_x: number;        // [0, 1]
+  cursor_y: number;        // [0, 1]
   num_channels: number;
 };
 ```
+
+**REST:** `GET /api/decoder/info` returns model type, `decoder_mode`, `fs_hz`, `n_features`, etc.
 
 **These shapes are part of the public surface.** Any change requires:
 - Backend Pydantic model update
@@ -216,4 +224,10 @@ These are explicit, intentional next steps. Build new code so they're cheap to a
 
 ## 8. Changelog (append on every contract change)
 
-- _(empty — initial baseline established with current `DecoderPacket` shape)_
+- **2026-05-11** — Replaced discrete `predicted_intent` with continuous velocity regression:
+  `vx`, `vy`, `pen_down`, `mode`; decoder model is `RandomForestRegressor`; added
+  `GET /api/decoder/info` and `POST /decoder/mode`.
+- **2026-05-11 (handwriting branch)** — Simulator uses ring population coding + linearly
+  interpolated velocity segments; `POST /manual-neural-burst` body is `{ vx, vy, duration_ms }`
+  (removed `/set-intent` and discrete 5-class labels). `predict_velocity` returns only
+  `(vx, vy)`; training entry point is `generate_training_data()`.

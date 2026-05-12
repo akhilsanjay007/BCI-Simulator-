@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import type { ManualIntent } from "./cursorPhysics";
 
 /** Max rows shown in the UI raster (first N channels of the implant). */
 const MAX_DISPLAY_CHANNELS = 64;
@@ -20,19 +19,33 @@ const GRID = "rgba(64, 64, 64, 0.45)";
 
 export type ChartControlMode = "automatic" | "manual";
 
-/** Partitions the first N displayed channels into four groups (motor directions). */
-function intentBoostChannelIndices(intent: ManualIntent, numDisplayChannels: number): Set<number> {
+/** Channels whose preferred direction (ring layout) aligns with ``(vx, vy)`` — matches backend coding. */
+function velocityBoostChannelIndices(
+  vx: number,
+  vy: number,
+  numDisplayChannels: number,
+  ringChannels: number,
+): Set<number> {
   const cap = Math.max(0, Math.floor(numDisplayChannels));
-  if (cap === 0) return new Set();
-  const per = Math.max(1, Math.floor(cap / 4));
+  const cRing = Math.max(2, Math.floor(ringChannels));
+  const speed = Math.hypot(vx, vy);
+  if (cap === 0 || speed < 1e-6) return new Set();
+  const ux = vx / speed;
+  const uy = vy / speed;
+  const scored: { a: number; i: number }[] = [];
+  for (let ch = 0; ch < cap; ch++) {
+    const ang = (2 * Math.PI * ch) / cRing;
+    const ax = Math.cos(ang);
+    const ay = Math.sin(ang);
+    const align = ax * ux + ay * uy;
+    scored.push({ a: align, i: ch });
+  }
+  scored.sort((x, y) => y.a - x.a);
+  const k = Math.max(4, Math.ceil(cap * 0.28));
   const s = new Set<number>();
-  const addRange = (start: number) => {
-    for (let i = 0; i < per && start + i < cap; i++) s.add(start + i);
-  };
-  if (intent === "right") addRange(0);
-  else if (intent === "left") addRange(per);
-  else if (intent === "up") addRange(2 * per);
-  else if (intent === "down") addRange(3 * per);
+  for (let j = 0; j < Math.min(k, scored.length); j++) {
+    if (scored[j].a > 0.08) s.add(scored[j].i);
+  }
   return s;
 }
 
@@ -43,12 +56,13 @@ function clamp(n: number, lo: number, hi: number): number {
 export interface ManualNeuralBurstPayload {
   startMs: number;
   endMs: number;
-  intent: ManualIntent;
+  vx: number;
+  vy: number;
 }
 
 interface NeuralSignalChartsProps {
   controlMode: ChartControlMode;
-  /** Manual-only: cortical burst window from latest directional input. */
+  /** Manual-only: cortical burst window from latest velocity command. */
   manualBurst: ManualNeuralBurstPayload | null;
   /** Implant / decoder channel count (from WebSocket or default). */
   totalChannels: number;
@@ -71,14 +85,16 @@ function buildColumnManual(
   nowMs: number,
   burst: ManualNeuralBurstPayload | null,
   nCh: number,
+  ringChannels: number,
 ): boolean[] {
   let envelope = 0;
   let boosted = new Set<number>();
-  if (burst && nowMs < burst.endMs && burst.intent !== "rest") {
+  const burstSpeed = burst ? Math.hypot(burst.vx, burst.vy) : 0;
+  if (burst && nowMs < burst.endMs && burstSpeed > 1e-6) {
     const elapsed = nowMs - burst.startMs;
     const dur = Math.max(1, burst.endMs - burst.startMs);
     envelope = Math.max(0, Math.pow(1 - Math.min(1, elapsed / dur), 1.35));
-    boosted = intentBoostChannelIndices(burst.intent, nCh);
+    boosted = velocityBoostChannelIndices(burst.vx, burst.vy, nCh, ringChannels);
   }
 
   return Array.from({ length: nCh }, (_, ch) => {
@@ -118,7 +134,7 @@ function computeRasterCanvasHeight(nCh: number, compact: boolean): number {
 
 /**
  * Educational demo: synthetic multi-channel spike trains + population firing rate.
- * Manual mode: sparse rest + short intent-aligned bursts. Automatic: original roaming rates.
+ * Manual mode: sparse rest + short velocity-aligned bursts. Automatic: original roaming rates.
  */
 export function NeuralSignalCharts({
   controlMode,
@@ -139,10 +155,10 @@ export function NeuralSignalCharts({
   const columnsRef = useRef<boolean[][]>([]);
   const lastStepRef = useRef(0);
 
-  const propsRef = useRef({ controlMode, manualBurst, displayCount });
+  const propsRef = useRef({ controlMode, manualBurst, displayCount, totalChannels: total });
   useLayoutEffect(() => {
-    propsRef.current = { controlMode, manualBurst, displayCount };
-  }, [controlMode, manualBurst, displayCount]);
+    propsRef.current = { controlMode, manualBurst, displayCount, totalChannels: total };
+  }, [controlMode, manualBurst, displayCount, total]);
 
   const displayCountRef = useRef(displayCount);
   useLayoutEffect(() => {
@@ -366,11 +382,12 @@ export function NeuralSignalCharts({
     const step = (now: number) => {
       if (now - lastStepRef.current >= STEP_MS) {
         lastStepRef.current = now;
-        const { controlMode: mode, manualBurst: burst, displayCount: n } = propsRef.current;
+        const { controlMode: mode, manualBurst: burst, displayCount: n, totalChannels: t } =
+          propsRef.current;
         const cols = columnsRef.current;
         const col =
           mode === "manual"
-            ? buildColumnManual(Date.now(), burst, n)
+            ? buildColumnManual(Date.now(), burst, n, t)
             : buildColumnAutomatic(now / 1000, n);
         cols.push(col);
         cols.shift();
@@ -447,8 +464,8 @@ export function NeuralSignalCharts({
             <p className="mt-2 text-[11px] font-mono text-neutral-500">{channelSummary}</p>
             {controlMode === "manual" && (
               <p className="mt-3 text-xs text-amber-500/85 font-mono leading-relaxed max-w-3xl">
-                Manual mode: low-rate “rest” baseline · each directional input triggers a ~300–600 ms burst on
-                matching channel groups (like motor cortical patches), then fades back.
+                Manual mode: low-rate “rest” baseline · each velocity command triggers a ~300–600 ms burst on
+                ring-aligned channel subsets (population coding), then fades back.
               </p>
             )}
           </>
