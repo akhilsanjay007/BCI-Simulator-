@@ -1,5 +1,6 @@
 import { useState, useEffect, useLayoutEffect, useRef, useCallback } from "react";
 import { stepCursorMotion, seedCursorMotion, type CursorMotionState } from "./cursorPhysics";
+import { BCITrackpad, type TrackpadSurfaceMode } from "./BCITrackpad";
 import { NeuralSignalCharts, type ManualNeuralBurstPayload } from "./NeuralSignalCharts";
 
 function resolveBackendUrl(): string {
@@ -50,9 +51,6 @@ interface DecoderPacket {
   /** Implant / decoder channel count (simulator config) */
   num_channels?: number;
 }
-
-/** Interpolation between WebSocket samples (~20 ms); server applies velocity + EMA smoothing. */
-const CURSOR_CSS_TRANSITION_MS = 280;
 
 function formatDecoderVelocity(vx: number, vy: number): string {
   const mag = Math.hypot(vx, vy);
@@ -129,14 +127,18 @@ function App() {
   const [spikeStrength, setSpikeStrength] = useState(0);
   /** Manual neural charts: cortical burst window aligned with directional input. */
   const [manualNeuralBurst, setManualNeuralBurst] = useState<ManualNeuralBurstPayload | null>(null);
+  const [trackpadSurfaceMode, setTrackpadSurfaceMode] = useState<TrackpadSurfaceMode>("cursor");
+  const [manualPenDown, setManualPenDown] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const controlModeRef = useRef<ControlMode>("manual");
   const cursorDisplayRef = useRef(cursorDisplay);
   const manualVelocityRef = useRef({ vx: 0, vy: 0 });
   const manualPhysicsRef = useRef<CursorMotionState>(seedCursorMotion(0.5, 0.5));
-  /** Arrow keys / pad currently held (empty ⇒ rest). */
+  /** Arrow keys currently held (empty ⇒ rest). */
   const manualDirectionsHeldRef = useRef<Set<DirectionKey>>(new Set());
+  const lastManualPadSpeedRef = useRef(0);
+  const lastSpikeFireAtRef = useRef(0);
   /** Confidence drawn for the current directional spike burst (drives physics + UI number). */
   const latestSpikeConfidenceRef = useRef<number | null>(null);
   /** 1 = fresh spike, decays toward 0 — multiplies confidence for a brief velocity boost. */
@@ -195,12 +197,34 @@ function App() {
     manualVelocityRef.current = { vx: 0, vy: 0 };
     setManualCmd({ vx: 0, vy: 0 });
     setManualVelocityLabel("rest");
+    setManualPenDown(false);
     latestSpikeConfidenceRef.current = null;
     spikePulseEnvelopeRef.current = 0;
     setLatestSpikeCommandConfidence(null);
     setSpikeStrength(0);
     setManualNeuralBurst(null);
+    lastManualPadSpeedRef.current = 0;
   }, []);
+
+  const onManualPadSample = useCallback(
+    (sample: { vx: number; vy: number; penDown: boolean }) => {
+      manualVelocityRef.current = { vx: sample.vx, vy: sample.vy };
+      setManualCmd({ vx: sample.vx, vy: sample.vy });
+      setManualPenDown(sample.penDown);
+      const n = Math.hypot(sample.vx, sample.vy);
+      setManualVelocityLabel(n < 1e-6 ? "rest" : formatDecoderVelocity(sample.vx, sample.vy));
+
+      const now = performance.now();
+      const crossed = n > 0.14 && lastManualPadSpeedRef.current <= 0.14;
+      const cooled = now - lastSpikeFireAtRef.current > 420;
+      if (n > 0.14 && (crossed || cooled)) {
+        fireManualVelocitySpike(sample.vx, sample.vy);
+        lastSpikeFireAtRef.current = now;
+      }
+      lastManualPadSpeedRef.current = n;
+    },
+    [fireManualVelocitySpike],
+  );
 
   /**
    * Switches control mode and updates the ref synchronously so WebSocket handlers
@@ -382,8 +406,6 @@ function App() {
     }
   };
 
-  const showCursor = controlMode === "manual" || decoderData !== null;
-
   const footerIntent =
     controlMode === "automatic"
       ? decoderData
@@ -463,10 +485,9 @@ function App() {
 
       {/* 2. Main: cursor (hero) | controls + neural signals (raster is second visual priority) */}
       <div className="flex-1 min-h-0 flex flex-col md:flex-row gap-2 p-2">
-        {/* LEFT — cursor (primary) */}
+        {/* LEFT — trackpad + handwriting canvas (primary) */}
         <section className="flex-[7] min-h-0 min-w-0 flex flex-col rounded-xl border border-neutral-800 bg-neutral-900/60 px-2 pt-2 pb-2">
-          <div className="flex items-center justify-between gap-2 mb-1.5 shrink-0">
-            <h2 className="text-xs font-semibold uppercase tracking-wider text-neutral-400">Cursor</h2>
+          <div className="flex items-center justify-between gap-2 mb-1 shrink-0">
             <span
               className={`text-[10px] font-mono uppercase tracking-wider rounded px-2 py-0.5 border ${
                 controlMode === "manual"
@@ -477,41 +498,26 @@ function App() {
               {controlMode === "manual" ? "Manual" : "Decoder"}
             </span>
           </div>
-          <div className="flex-1 min-h-[12rem] bg-black rounded-lg border border-neutral-800/90 relative overflow-hidden">
-            <div
-              className="absolute inset-0 opacity-[0.22] pointer-events-none"
-              style={{
-                backgroundImage: `
-                  linear-gradient(to right, rgb(55 55 55) 1px, transparent 1px),
-                  linear-gradient(to bottom, rgb(55 55 55) 1px, transparent 1px)
-                `,
-                backgroundSize: "32px 32px",
-              }}
+          <div className="flex-1 min-h-0 flex flex-col">
+            <BCITrackpad
+              className="min-h-0 flex-1"
+              controlMode={controlMode}
+              cursorNorm={cursorDisplay}
+              vx={controlMode === "manual" ? manualCmd.vx : (decoderData?.vx ?? 0)}
+              vy={controlMode === "manual" ? manualCmd.vy : (decoderData?.vy ?? 0)}
+              penDown={
+                controlMode === "manual"
+                  ? manualPenDown
+                  : (decoderData?.pen_down ?? false)
+              }
+              surfaceMode={trackpadSurfaceMode}
+              onSurfaceModeChange={setTrackpadSurfaceMode}
+              onManualPadSample={onManualPadSample}
             />
-            <div
-              className="absolute left-1/2 top-1/2 w-1.5 h-1.5 -ml-[3px] -mt-[3px] rounded-full bg-neutral-500 ring-1 ring-neutral-700"
-              aria-hidden
-            />
-            {showCursor && (
-              <div
-                className="absolute w-3.5 h-3.5 rounded-full bg-neuralink-accent shadow-[0_0_18px_rgba(0,255,170,0.5)] border border-white/90 z-10 will-change-[left,top]"
-                style={{
-                  left: `${cursorDisplay.x * 100}%`,
-                  top: `${cursorDisplay.y * 100}%`,
-                  transform: "translate(-50%, -50%)",
-                  transition: `left ${CURSOR_CSS_TRANSITION_MS}ms cubic-bezier(0.25, 0.06, 0.22, 1), top ${CURSOR_CSS_TRANSITION_MS}ms cubic-bezier(0.25, 0.06, 0.22, 1)`,
-                }}
-                title={
-                  controlMode === "manual"
-                    ? "Manual cursor (client physics, matches decoder smoothing)"
-                    : "Decoded cursor (velocity-smoothed from server)"
-                }
-              />
-            )}
-            {!showCursor && (
-              <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                <p className="text-neutral-500 font-mono text-center text-xs">Waiting for decoder stream…</p>
-              </div>
+            {controlMode === "automatic" && !decoderData && (
+              <p className="text-center text-[10px] font-mono text-neutral-500 -mt-1 pb-1">
+                Waiting for decoder stream…
+              </p>
             )}
           </div>
         </section>
@@ -572,37 +578,9 @@ function App() {
                     Y <span className="text-neutral-200 tabular-nums">{cursorDisplay.y.toFixed(3)}</span>
                   </div>
                 </div>
-                <div className="select-none">
-                  <div className="flex flex-col items-center gap-0.5">
-                    <ManualPadButton
-                      label="Up"
-                      compact
-                      onDown={() => applyManualDirectionDown("up")}
-                      onUp={() => applyManualDirectionUp("up")}
-                    />
-                    <div className="flex gap-0.5">
-                      <ManualPadButton
-                        label="L"
-                        compact
-                        onDown={() => applyManualDirectionDown("left")}
-                        onUp={() => applyManualDirectionUp("left")}
-                      />
-                      <ManualPadButton label="RST" isRest compact onDown={applyManualRest} onUp={() => {}} />
-                      <ManualPadButton
-                        label="R"
-                        compact
-                        onDown={() => applyManualDirectionDown("right")}
-                        onUp={() => applyManualDirectionUp("right")}
-                      />
-                    </div>
-                    <ManualPadButton
-                      label="Dn"
-                      compact
-                      onDown={() => applyManualDirectionDown("down")}
-                      onUp={() => applyManualDirectionUp("down")}
-                    />
-                  </div>
-                </div>
+                <p className="text-[9px] font-mono text-neutral-500 leading-snug border border-amber-900/20 rounded px-1.5 py-1 bg-black/30">
+                  Trackpad: drag to steer · handwriting + click-drag to ink · Space = rest · arrows still work
+                </p>
               </div>
             ) : (
               <div className="space-y-1">
@@ -705,48 +683,6 @@ function App() {
         </div>
       </footer>
     </div>
-  );
-}
-
-/** Large touch-friendly pad button with pointer capture for reliable hold/release. */
-function ManualPadButton(props: {
-  label: string;
-  isRest?: boolean;
-  compact?: boolean;
-  onDown: () => void;
-  onUp: () => void;
-}) {
-  const { label, isRest, compact, onDown, onUp } = props;
-
-  return (
-    <button
-      type="button"
-      className={`rounded-lg border font-semibold tracking-wide transition-colors active:scale-[0.98] ${
-        compact
-          ? "min-w-[4.25rem] min-h-[2.35rem] px-2.5 text-xs"
-          : "min-w-[5.5rem] min-h-[3.25rem] px-4 text-sm"
-      } ${
-        isRest
-          ? "border-cyan-500/40 bg-cyan-950/40 text-cyan-200 hover:bg-cyan-900/50"
-          : "border-neutral-600 bg-neutral-800/80 text-neutral-100 hover:bg-neutral-700/90 hover:border-neutral-500"
-      }`}
-      onPointerDown={(e) => {
-        e.currentTarget.setPointerCapture(e.pointerId);
-        onDown();
-      }}
-      onPointerUp={(e) => {
-        e.currentTarget.releasePointerCapture(e.pointerId);
-        onUp();
-      }}
-      onPointerCancel={() => {
-        onUp();
-      }}
-      onPointerLeave={(e) => {
-        if (e.buttons === 0) onUp();
-      }}
-    >
-      {label}
-    </button>
   );
 }
 
