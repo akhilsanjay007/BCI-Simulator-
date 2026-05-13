@@ -10,7 +10,7 @@
 A **real-time Brain–Computer Interface (BCI) Signal Simulator + ML Decoder Dashboard**.
 
 - Backend streams synthetic neural signals (LFP + spike events) over WebSocket.
-- A sliding-window decoder predicts user intent (`left`, `right`, `up`, `down`, `rest`) and drives a 2D cursor.
+- A sliding-window decoder predicts continuous **velocity** `(vx, vy)` (and pen contact in handwriting mode) and drives a 2D cursor.
 - A React dashboard visualizes raw signals, decoder output, and live metrics (accuracy, latency, throughput).
 - Everything runs locally via `uvicorn` + `npm run dev`, or as a full stack via `docker compose up`.
 

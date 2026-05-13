@@ -38,6 +38,68 @@ pip install -r requirements.txt
 
 
 
+### Git LFS and the velocity decoder model
+
+
+
+The trained weights at **`models/velocity_decoder.pkl`** (~2 GB) are tracked with **Git LFS** so the Git object database stays small. After cloning or pulling new commits, materialize blobs on disk before running the API, tests that load the artifact, or **`docker build`** (otherwise you may only have an LFS *pointer* file and startup will fail with a clear error).
+
+
+
+**Install Git LFS** (once per machine):
+
+
+
+- **Windows (Chocolatey):** `choco install git-lfs -y` then `git lfs install`
+
+- **macOS (Homebrew):** `brew install git-lfs` then `git lfs install`
+
+- **Debian/Ubuntu:** `sudo apt-get install git-lfs` then `git lfs install`
+
+
+
+**Pull LFS objects** from the repo root:
+
+
+
+```powershell
+
+git lfs install
+
+git lfs pull
+
+```
+
+
+
+**Retrain and write the default artifact** (from repo root, venv activated):
+
+
+
+```powershell
+
+python -m app.offline_eval --retrain --artifact models/velocity_decoder.pkl
+
+```
+
+
+
+Then add and push the updated pickle (Git will store it in LFS per `.gitattributes`):
+
+
+
+```powershell
+
+git add models/velocity_decoder.pkl .gitattributes
+
+git commit -m "Update velocity decoder weights"
+
+git push
+
+```
+
+
+
 On macOS or Linux, activate with `source venv/bin/activate`.
 
 
@@ -117,6 +179,54 @@ Configuration (backend env vars):
 
 
 
+## Trained velocity decoder (Docker / Railway)
+
+
+
+The API loads a pickled **velocity decoder** at startup when the file exists. Default path (repo root, same in the container with `WORKDIR /app`): **`models/velocity_decoder.pkl`** (see **`MODEL_PATH`** in `app/decoder.py`). The root `Dockerfile` copies the whole **`models/`** directory into the image. Weights are stored in **Git LFS** (see **Setup → Git LFS and the velocity decoder model**): run **`git lfs pull`** before building images locally so `COPY models/` receives the real file, not a pointer stub. CI checkouts use **`lfs: true`** so published GHCR backend images include weights.
+
+
+
+**Train and write the default artifact** (from repo root, `PYTHONPATH` set to `.` if needed):
+
+
+
+```powershell
+
+python -m app.offline_eval --retrain --artifact models/velocity_decoder.pkl
+
+```
+
+
+
+Commit **`models/velocity_decoder.pkl`** via Git LFS for production deploys so the image includes weights. The repo keeps **`models/.gitkeep`** so the directory exists before the first export.
+
+
+
+**Environment variables** (backend):
+
+
+
+| Variable | Purpose |
+
+|----------|---------|
+
+| `ENV` | Set to **`production`** so a missing artifact fails fast (no silent bootstrap/heuristic fallback). |
+
+| `MODEL_PATH` | Optional override for the pickle path (**takes precedence** over `DECODER_MODEL_PATH`). Absolute path, or relative to the process **current working directory** (container cwd should be the app root, e.g. `/app`). |
+
+| `DECODER_MODEL_PATH` | Same as `MODEL_PATH` if `MODEL_PATH` is unset (legacy name). |
+
+| `DECODER_REGRESSOR` | `ensemble` (default), `rf`, or `hgb` — must match how the artifact was trained. |
+
+| `DECODER_TRAIN_SAMPLES` | Only used for **local** bootstrap training when `ENV` is not production and the default pickle is absent. |
+
+
+
+**Railway:** [`railway.toml`](railway.toml) pins the **Dockerfile** builder and `/health` deploy checks. Service variables such as **`ENV=production`** and optional **`MODEL_PATH`** are set in the Railway dashboard (**Variables**); Railway config-as-code does not define arbitrary env vars in `railway.toml`.
+
+
+
 ## Dashboard (optional, local dev)
 
 
@@ -149,7 +259,11 @@ The UI uses:
 
 |----------|---------|
 
-| `ws://localhost:8000/ws/decoder` | Live decoder packets (`predicted_intent`, cursor, metrics, **`num_channels`**, etc.) |
+| `ws://localhost:8000/ws/decoder` | Live decoder packets (`vx`, `vy`, `pen_down`, `mode`, cursor, metrics, **`num_channels`**, etc.) |
+
+| `GET http://localhost:8000/api/decoder/info` | Decoder mode, model type, `fs_hz`, `n_features`, training status |
+
+| `POST http://localhost:8000/decoder/mode` | JSON `{ "mode": "cursor" \| "handwriting" }` — toggles pen-down semantics |
 
 | `GET http://localhost:8000/simulator/config` | **`num_channels`** and **`fs`** (same as the generator singleton; used to size the spike raster) |
 
@@ -202,15 +316,15 @@ On **push to `main`** only, it also builds and pushes **backend** and **frontend
 
 
 
-## Intent control
+## Velocity control (simulator ground truth)
 
 
 
-The simulator **cycles** the ground-truth intent in a fixed order: `left` → `right` → `up` → `down` → `rest`. Each intent is held for **many consecutive batches** (~20 ms per batch at default `fs=1000`; see `_INTENT_HOLD_BATCHES` in `app/simulator.py`) so that the decoder’s sliding spike window (~200 ms) mostly sees **one** label at a time—matching `offline_eval`, which evaluates long runs per intent. `rest` uses no directional channel boost. Every 50 batches the server prints a histogram of the last 200 intents to the console.
+The simulator **samples continuous targets** `(vx, vy)` in `[-1, 1]` plus a **pen-down** flag and holds each target for **many consecutive batches** (~20 ms per batch at default `fs=1000`; see `_VELOCITY_HOLD_BATCHES` in `app/simulator.py`) so the decoder’s sliding spike window (~200 ms) mostly sees **one** velocity at a time—matching `offline_eval`. Channel populations are direction- and speed-tuned (see `velocity_spike_multipliers` in `app/decoder.py`). Every 50 batches the server prints a coarse histogram of recent targets to the console.
 
 
 
-`POST /set-intent` still updates a stored `current_intent` value (valid labels: `left`, `right`, `up`, `down`, `rest`), but **live spike generation follows the cycled stream**, not this endpoint—use `/set-intent` only if you extend the app to read `current_intent` elsewhere.
+`POST /set-intent` still updates a stored `current_intent` value (valid labels: `left`, `right`, `up`, `down`, `rest`), but **live spike generation follows the internal velocity stream**, not this endpoint—use `/set-intent` only if you extend the app to read `current_intent` elsewhere.
 
 
 
@@ -238,19 +352,19 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/decoder/reset
 
 - **Payload:** JSON objects with:
 
-  - `timestamp_ms`, `predicted_intent`, `confidence`, `latency_ms`
+  - `timestamp_ms`, `vx`, `vy`, `pen_down`, `confidence`, `mode`, `latency_ms`
 
-  - **`accuracy`** — rolling over the **last 20** predictions vs ground truth
+  - **`accuracy`** — rolling velocity-alignment score over the **last 20** batches vs ground truth
 
-  - **`session_accuracy`** — fraction correct since WebSocket connect or last **`decoder.reset_state()`**
+  - **`session_accuracy`** — mean score since WebSocket connect or last **`decoder.reset_state()`**
 
-  - **`cursor_x` / `cursor_y`** — normalized \([0,1]\) 2D cursor (integrated from predicted intent)
+  - **`cursor_x` / `cursor_y`** — normalized \([0,1]\) 2D cursor (integrated from decoded velocity)
 
   - **`num_channels`** — electrode count for the simulator/decoder configuration (dashboard raster uses `min(64, num_channels)` visible rows)
 
 - **Reset:** `POST /decoder/reset` clears the decoder’s spike window, cursor, rolling buffer, and session accuracy counters.
 
-- **Notes:** this endpoint reuses the simulator stream and decodes from `spikes` (LFP is generated but not used by the decoder). The FastAPI app constructs `BciDecoder` with **`exploration_prob=0`** so live accuracy is comparable to **`offline_eval`** (which also uses `0`). For experiments, you can raise `exploration_prob` in `app/main.py`. For debugging, `BciDecoder.predict` **prints** feature summaries and `predicted` vs `true` intent every **50** steps to the server console.
+- **Notes:** this endpoint reuses the simulator stream and decodes from `spikes` (LFP is generated but not used by the decoder). The FastAPI app constructs `BciDecoder` with **`exploration_prob=0`** so live scores are comparable to **`offline_eval`** (which also uses `0`). For experiments, you can raise `exploration_prob` in `app/main.py`. For debugging, `BciDecoder.predict` **prints** feature summaries and decoded vs true velocity every **50** steps to the server console. **Weights:** at startup the server loads **`models/velocity_decoder.pkl`** by default (or **`MODEL_PATH`** / **`DECODER_MODEL_PATH`**); see **Trained velocity decoder (Docker / Railway)**.
 
 
 
@@ -294,7 +408,7 @@ Or only offline metrics: `python -m pytest tests/test_offline_eval.py -v`. Manua
 
 
 
-The tests exercise `app/offline_eval.py`: bootstrap training, synthetic spike batches aligned with the simulator, accuracy and confusion checks.
+The tests exercise `app/offline_eval.py`: bootstrap training, synthetic spike batches aligned with the simulator, and velocity-alignment metrics. With **`--retrain`**, weights are written to **`models/velocity_decoder.pkl`** by default (override with **`--artifact`**).
 
 
 
@@ -384,9 +498,13 @@ neuralink-bci-sim/
 
 │       └── ci-cd.yml    # pytest + coverage; frontend lint/build; GHCR images on main
 
-├── Dockerfile           # production backend image (uvicorn, multi-worker)
+├── Dockerfile           # production backend image (uvicorn, multi-worker; copies app/ + models/)
+
+├── railway.toml         # Railway: Dockerfile build + /health deploy settings
 
 ├── docker-compose.yml    # backend + frontend + redis (Streams buffer)
+
+├── models/              # trained `velocity_decoder.pkl` (optional; see “Trained velocity decoder”)
 
 ├── requirements.txt
 

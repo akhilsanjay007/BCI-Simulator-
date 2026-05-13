@@ -1,6 +1,11 @@
-# Version control
-.git
+# Version control — keep .github out of the image; .git must stay in the *build context*
+# so the Dockerfile can run `git lfs pull` and materialize models/*.pkl (Railway, compose).
 .github
+
+# models/ must remain in context; only allow pickles under models/ (no stray multi-GB dumps).
+*.pkl
+!models/*.pkl
+!models/
 
 # Python caches and envs
 __pycache__

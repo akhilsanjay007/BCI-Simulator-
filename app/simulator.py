@@ -156,7 +156,7 @@ class NeuralSignalGenerator:
                 self.current_target_vx, self.current_target_vy, pen, self.num_channels
             )
             speed = float(np.hypot(self.current_target_vx, self.current_target_vy))
-            multipliers = multipliers * float(1.0 + 0.22 * min(speed, 1.0))
+            multipliers = multipliers * float(1.0 + 0.28 * min(speed, 1.0))
 
             burst_extra = self._manual_burst_extra_probability()
             prob = np.clip(base_prob * multipliers + burst_extra, 0.0, 0.95)

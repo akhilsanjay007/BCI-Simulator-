@@ -1,11 +1,20 @@
 import os
 import re
+from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from app.decoder import BciDecoder, DecoderMode, generate_training_data
+from app.decoder import (
+    BciDecoder,
+    DecoderMode,
+    RegressorKind,
+    default_decoder_artifact_path,
+    generate_training_data,
+    load_decoder_artifact_into,
+    velocity_decoder_missing_help,
+)
 from app.redis_client import get_redis_client
 from app.simulator import generator
 
@@ -79,6 +88,15 @@ app.add_middleware(
 # Optional Redis Streams client (enabled when REDIS_URL is set).
 redis_client = get_redis_client()
 
+_reg_raw = os.getenv("DECODER_REGRESSOR", "ensemble").strip().lower()
+_decoder_reg: RegressorKind
+if _reg_raw == "rf":
+    _decoder_reg = "rf"
+elif _reg_raw == "hgb":
+    _decoder_reg = "hgb"
+else:
+    _decoder_reg = "ensemble"
+
 # Bootstrap-train decoder so /ws/decoder is runnable immediately.
 decoder = BciDecoder(
     fs=generator.fs,
@@ -86,19 +104,48 @@ decoder = BciDecoder(
     window_ms=200,
     exploration_prob=0.0,
     output_mode="cursor",
+    regressor=_decoder_reg,
 )
+_decoder_train_n = int(os.getenv("DECODER_TRAIN_SAMPLES", "25000"))
+
+
+def _decoder_artifact_path_from_env() -> tuple[Path, bool]:
+    """Return (resolved path, True if MODEL_PATH or DECODER_MODEL_PATH was set). MODEL_PATH wins."""
+    for key in ("MODEL_PATH", "DECODER_MODEL_PATH"):
+        raw = os.getenv(key, "").strip()
+        if raw:
+            p = Path(raw)
+            return (p.resolve() if p.is_absolute() else (Path.cwd() / p).resolve(), True)
+    return default_decoder_artifact_path().resolve(), False
+
+
+_artifact_path, _artifact_path_explicit = _decoder_artifact_path_from_env()
 try:
-    X_train, y_train = generate_training_data(
-        fs=generator.fs,
-        channels=generator.num_channels,
-        window_ms=200,
-        n_samples=1800,
-        seed=42,
-    )
-    decoder.train(X_train, y_train)
+    if _artifact_path.is_file():
+        load_decoder_artifact_into(decoder, _artifact_path)
+        print(f"Loaded decoder weights from {_artifact_path}")
+    elif IS_PRODUCTION or _artifact_path_explicit:
+        raise FileNotFoundError(velocity_decoder_missing_help(_artifact_path))
+    else:
+        try:
+            X_train, y_train = generate_training_data(
+                fs=generator.fs,
+                channels=generator.num_channels,
+                window_ms=200,
+                n_samples=max(1800, _decoder_train_n),
+                seed=42,
+            )
+            decoder.train(X_train, y_train)
+            print(f"Bootstrap-trained decoder on {len(X_train):,} synthetic windows")
+        except Exception as e:
+            # If training fails for any reason, keep server runnable with heuristic fallback.
+            print(f"⚠️ Decoder bootstrap training failed; using heuristic fallback. Error: {e}")
+except FileNotFoundError:
+    raise
 except Exception as e:
-    # If training fails for any reason, keep server runnable with heuristic fallback.
-    print(f"⚠️ Decoder bootstrap training failed; using heuristic fallback. Error: {e}")
+    if IS_PRODUCTION:
+        raise RuntimeError(f"Velocity decoder failed to load or train: {e}") from e
+    print(f"⚠️ Decoder load/bootstrap failed; using heuristic fallback. Error: {e}")
 
 
 class ManualBurstRequest(BaseModel):
@@ -131,9 +178,15 @@ async def health() -> dict[str, object]:
 @app.get("/api/decoder/info")
 async def decoder_info() -> dict[str, object]:
     """Decoder configuration and model type (for dashboards / ops)."""
+    _mt = {
+        "rf": "RandomForestRegressor",
+        "hgb": "HistGradientBoostingRegressor(dual vx/vy)",
+        "ensemble": "Ensemble(RandomForestRegressor + HistGradientBoostingRegressor)",
+    }[decoder.regressor_kind]
     return {
         "decoder_mode": decoder.output_mode,
-        "model_type": "RandomForestRegressor",
+        "regressor": decoder.regressor_kind,
+        "model_type": _mt,
         "target_outputs": ["vx", "vy"],
         "velocity_range": {"vx": [-1.0, 1.0], "vy": [-1.0, 1.0]},
         "is_trained": decoder.is_trained,
