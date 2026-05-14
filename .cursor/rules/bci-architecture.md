@@ -1,233 +1,149 @@
-# BCI Architecture
+# BCI architecture
 
-> Read after `project.md`. Defines the runtime data flow, real-time budgets, and the
-> contract every component must respect.
-
----
-
-## 1. High-Level Architecture (Text Diagram)
-
-### Current (in-process pipeline)
-
-```
-        ┌──────────────────────────┐
-        │  NeuralSignalGenerator   │   app/simulator.py
-        │  (LFP + spike events,    │   shared singleton `generator`
-        │   cycled ground-truth    │
-        │   intent every N batches)│
-        └────────────┬─────────────┘
-                     │  np.ndarray  (batch_samples, channels)
-                     │  ~20 ms per batch @ fs=1000 Hz
-                     ▼
-        ┌──────────────────────────┐
-        │   FastAPI WebSocket      │   app/main.py
-        │   /ws/bci-stream         │── raw signal consumers (debug, clients)
-        │   /ws/decoder            │
-        └────────────┬─────────────┘
-                     │  spikes window (~200 ms sliding)
-                     ▼
-        ┌──────────────────────────┐
-        │       BciDecoder         │   app/decoder.py
-        │  features → sklearn RFR │
-        │  → vx, vy, pen_down,    │
-        │    confidence, cursor   │
-        │  → DecoderPacket        │
-        └────────────┬─────────────┘
-                     │  JSON DecoderPacket
-                     │  per batch (~50 Hz)
-                     ▼
-        ┌──────────────────────────┐
-        │   React Dashboard        │   frontend/src/App.tsx
-        │   - Cursor (primary)     │   + NeuralSignalCharts.tsx
-        │   - Manual / Decoder bar │   + cursorPhysics.ts
-        │   - Spike raster + rate  │
-        └──────────────────────────┘
-```
-
-### Planned (broker-backed, multi-consumer)
-
-```
-   Simulator ──► Redis Streams (`bci.signal`)  ──► Decoder worker(s) ──► Redis Streams (`bci.decoder`)
-                                                                          │
-                                                                          ▼
-                                                                FastAPI WS fan-out  ──► Frontend(s)
-                                                                          │
-                                                                          ▼
-                                                                Optional metrics sink
-                                                                (Prometheus / Loki)
-```
-
-Redis is already stubbed in `docker-compose.yml`. It is **not yet wired in**. Treat the broker
-section as design intent, not as code-in-place.
+> Read after `project.md`. Runtime flow, contracts, latency budgets, and failure behavior.
 
 ---
 
-## 2. Data Flow (Step by Step)
+## 1. End-to-end flow (current)
 
-1. **Generation** — `NeuralSignalGenerator.stream()` yields batches with:
-   - `lfp`: `list[list[float]]` shape `(batch_samples, channels)`
-   - `spikes`: binary events `(batch_samples, channels)`, values `{0, 1}`
-   - Ground-truth **continuous velocity** `(current_target_vx, current_target_vy)` in `[-1, 1]`
-     and `current_stream_pen_down` is held for `_VELOCITY_HOLD_BATCHES` so the decoder window
-     mostly sees one target at a time.
+The live dashboard path is **in-process** from generator to decoder to WebSocket. **Redis** is an **optional parallel buffer** (enabled when `REDIS_URL` is set): same packets are appended to a Streams log with **time-based retention**, without changing the decoder’s read source today.
 
-2. **Transport (current)** — `app/main.py` has two WebSocket endpoints:
-   - `/ws/bci-stream` — raw signal packets (`timestamp_ms`, `fs`, `channels`, `lfp`, `spikes`).
-   - `/ws/decoder` — decoded packets (`DecoderPacket`).
+```
+┌─────────────────────────┐
+│ NeuralSignalGenerator   │  app/simulator.py — shared `generator`
+│ LFP + spikes + GT vel   │
+└────────────┬────────────┘
+             │ async batches (JSON-serializable dicts)
+             ├──────────────────────────────────────┐
+             │                                      │
+             ▼                                      ▼
+┌─────────────────────────┐            ┌──────────────────────────┐
+│ Redis Streams (opt.)    │            │ FastAPI WebSocket        │
+│ XADD `bci:signals` *    │            │ /ws/bci-stream (raw)       │
+│ XTRIM MINID ~ (retain)  │            │ /ws/decoder (DecoderPacket)│
+└─────────────────────────┘            └────────────┬─────────────┘
+                                                    │
+                                                    │ predict per batch
+                                                    ▼
+                                         ┌─────────────────────────┐
+                                         │ BciDecoder              │
+                                         │ window → vx, vy,        │
+                                         │ pen_down, confidence, │
+                                         │ cursor integrate        │
+                                         └────────────┬────────────┘
+                                                      │
+                                                      ▼
+                                         ┌─────────────────────────┐
+                                         │ React App               │
+                                         │ App.tsx + BCITrackpad   │
+                                         │ canvas (cursor / ink)   │
+                                         └─────────────────────────┘
+```
 
-3. **Decoding** — `BciDecoder` maintains a sliding spike window (~200 ms), extracts features
-   per channel, runs a **RandomForestRegressor** on `(vx, vy)`, applies EMA smoothing and
-   inter-tree agreement → `confidence`, integrates cursor, and emits a `DecoderPacket`:
-   ```
-   {
-     timestamp_ms, vx, vy, pen_down, confidence, mode,
-     latency_ms, accuracy, session_accuracy,
-     cursor_x, cursor_y,
-     num_channels
-   }
-   ```
-   `accuracy` / `session_accuracy` are velocity-alignment scores in `[0, 1]` vs simulator
-   ground truth. `exploration_prob=0` in production WS path so live numbers are comparable to
-   `offline_eval`.
+**Mental model for reviewers**
 
-4. **Frontend** — `App.tsx` opens both WebSockets, throttles render updates, and drives:
-   - 2D cursor (`cursorPhysics.ts`) — primary surface
-   - Manual / Decoder strip — confidence, accuracy, latency
-   - `NeuralSignalCharts.tsx` — spike raster (`min(64, num_channels)` rows) + mean firing rate
-
-5. **Reset** — `POST /decoder/reset` clears decoder buffers, cursor, rolling counters.
+- **Simulator → (optional Redis buffer) + WebSocket pipeline → continuous decoder → client**  
+- Decoder consumption is still **`async for packet in generator.stream()`** inside `/ws/decoder` (`app/main.py`). A future step is a **consumer group** reading the stream and feeding decode workers; design new code so that swap stays localized.
 
 ---
 
-## 3. WebSocket Contracts (Stable)
+## 2. Control modes
 
-### `/ws/bci-stream` — raw signal
+| Mode | Where | Behavior |
+| --- | --- | --- |
+| **Cursor** | Decoder `output_mode` + trackpad `surfaceMode: "cursor"` | Velocity drives 2D cursor; primary navigation surface. |
+| **Handwriting** | Decoder `output_mode` + trackpad `surfaceMode: "handwriting"` | `pen_down` gates contact; canvas accumulates ink in normalized space; decoder/simulator GT aligned for evaluation. |
+
+Runtime API: `POST /decoder/mode` with `{ "mode": "cursor" \| "handwriting" }` (`SetDecoderModeRequest`). Frontend should stay in sync with user-facing mode switches when testing end-to-end.
+
+**Dashboard control** — `App.tsx`: **Automatic** (decoder packets drive cursor + pen) vs **Manual** (local velocity from keyboard / trackpad pad, synthetic burst to backend via `POST /manual-neural-burst`).
+
+---
+
+## 3. Data flow (steps)
+
+1. **Generate** — Each batch: `timestamp_ms`, `fs`, `channels`, `lfp`, `spikes`; ground-truth velocity and pen state advance inside the generator for scoring.
+2. **Buffer (optional)** — If Redis configured: `publish_signal_packet` → `XADD` + approximate `XTRIM` by time (`REDIS_STREAM_RETENTION_SECONDS`).
+3. **Decode** — `BciDecoder.predict` on spike tensor; emits `DecoderPacket` with latency stamp, rolling/session accuracy vs GT, integrated `cursor_x` / `cursor_y`.
+4. **Deliver** — `send_json` per decoded batch on `/ws/decoder`; raw stream on `/ws/bci-stream`.
+5. **Render** — Client parses packets; **BCITrackpad** draws grid, cursor, strokes; charts use ring buffers / throttling — not full React tree per packet.
+
+---
+
+## 4. WebSocket contracts (stable surface)
+
+### `/ws/bci-stream`
 
 ```ts
 type BciStreamPacket = {
   timestamp_ms: number;
-  fs: number;             // Hz
+  fs: number;
   channels: number;
-  lfp: number[][];        // (batch_samples, channels)
-  spikes: number[][];     // (batch_samples, channels), 0|1
+  lfp: number[][];
+  spikes: number[][];
 };
 ```
 
-### `/ws/decoder` — decoder output (`DecoderPacket`)
+### `/ws/decoder` — `DecoderPacket`
 
 ```ts
 type DecoderPacket = {
   timestamp_ms: number;
-  vx: number;              // [-1, 1] horizontal velocity intent
-  vy: number;              // [-1, 1] vertical (+y down)
+  vx: number;
+  vy: number;
   pen_down: boolean;
-  confidence: number;      // [0, 1]
+  confidence: number;
   mode: "cursor" | "handwriting";
-  latency_ms: number;      // end-to-end decode latency
-  accuracy: number;        // rolling velocity score, last 20
-  session_accuracy: number; // since reset/connect
-  cursor_x: number;        // [0, 1]
-  cursor_y: number;        // [0, 1]
+  latency_ms: number;
+  accuracy: number;
+  session_accuracy: number;
+  cursor_x: number;
+  cursor_y: number;
   num_channels: number;
 };
 ```
 
-**REST:** `GET /api/decoder/info` returns model type, `decoder_mode`, `fs_hz`, `n_features`, etc.
+**REST** — `GET /api/decoder/info`, `GET /simulator/config`, `POST /decoder/reset`, `POST /decoder/mode`, `POST /manual-neural-burst`, `GET /health`, `GET /health/redis`.
 
-**These shapes are part of the public surface.** Any change requires:
-- Backend Pydantic model update
-- Frontend TypeScript type update
-- Test update
-- A note in this file's changelog section
+Any shape change → update Pydantic models, TS types in `App.tsx`, tests, and the changelog below.
 
 ---
 
-## 4. Real-Time Requirements & Latency Goals
+## 5. Real-time targets (measured at `/ws/decoder`)
 
-The system is **soft real-time**. Targets are measured at the `/ws/decoder` boundary.
+| Metric | p50 target | p95 target | Hard ceiling |
+| --- | --- | --- | --- |
+| `latency_ms` | ≤ 10 ms | ≤ 25 ms | 50 ms |
+| Decode packet rate | ≥ 50 Hz | — | — |
+| Generator batch work | ≤ 2 ms | ≤ 5 ms | 10 ms |
+| Trackpad / main UI frame | ≤ 16.7 ms | ≤ 33 ms | 50 ms |
 
-| Metric                                | Target (p50) | Target (p95) | Hard ceiling |
-| ------------------------------------- | ------------ | ------------ | ------------ |
-| End-to-end decode latency (`latency_ms`) | ≤ 10 ms      | ≤ 25 ms      | 50 ms        |
-| Decoder packet rate                   | ≥ 50 Hz      | —            | —            |
-| Per-batch generation cost             | ≤ 2 ms       | ≤ 5 ms       | 10 ms        |
-| Frontend render frame                 | ≤ 16.7 ms    | ≤ 33 ms      | 50 ms        |
-| WebSocket reconnect time              | ≤ 1 s        | ≤ 2 s        | 5 s          |
-
-If any of these regress, the PR must call it out and either fix it or document why it's acceptable.
-
-### Measurement
-
-- Backend stamps `timestamp_ms` at packet send and computes `latency_ms` from generation start.
-- Frontend can log inter-arrival jitter; a small "metrics strip" already shows latency live.
-- For perf PRs, use a 30-second steady-state window and report p50 / p95 / p99.
+Report p50/p95 over ~30 s steady state for perf-sensitive PRs.
 
 ---
 
-## 5. Buffering Strategy
+## 6. Buffering & backpressure
 
-- **Generator:** stateless per-call apart from intent cycling and RNG state. No queue inside.
-- **Decoder window:** fixed-size deque of recent spike batches (~200 ms worth). Bounded.
-- **WebSocket send:** one `await ws.send_json(...)` per produced packet. **No outbound queue** —
-  if the consumer is slow, FastAPI applies natural backpressure on `send_json`.
-- **Rolling accuracy buffer:** `collections.deque(maxlen=20)`. Bounded.
-- **Frontend chart buffers:** ring buffers (`useRef` arrays with a head index), capped at the
-  visible window size. Never grow unbounded.
-
-**Rule:** every long-lived buffer must have a `maxlen` or equivalent cap. Memory should be
-flat over a 1-hour session.
+- **Decoder window** — fixed-duration spike deque (bounded).
+- **Accuracy rolls** — bounded deque (e.g. last 20).
+- **WebSocket** — one `send_json` per packet; slow clients exert backpressure (do not add unbounded outbound queues).
+- **Redis stream** — retention by wall-clock via trim; stream is **not** unbounded growth.
+- **Frontend** — ring buffers for charts; canvas redraw driven by layout + animation frame, not naive `setState` per network message on the whole tree.
 
 ---
 
-## 6. Failure Modes & Recovery
+## 7. Failure & recovery
 
-| Failure                          | Behavior                                                                  |
-| -------------------------------- | ------------------------------------------------------------------------- |
-| Client disconnects mid-stream    | Server catches `WebSocketDisconnect`, logs once, releases task            |
-| Decoder raises during predict    | Log with packet index, send last-known intent w/ `confidence=0`, continue |
-| Slow consumer                    | Backpressure via `await send_json`; do **not** buffer unboundedly         |
-| Frontend tab backgrounded        | WS stays open; charts skip frames; on focus, snap to latest packet only   |
-| Server restart                   | Frontend retries WS with exponential backoff (cap 2 s)                    |
-
----
-
-## 7. Future Extensibility
-
-These are explicit, intentional next steps. Build new code so they're cheap to add later.
-
-1. **Closed-loop feedback** — frontend (or an env model) emits user actions back to the
-   simulator, which modulates the next batch's spike distributions. Reserve a `/ws/feedback`
-   endpoint name; do not collide with it.
-
-2. **Multi-channel scaling** — currently `num_channels` is small (tens). Generator and
-   decoder should remain `O(channels)` per batch and never iterate channels in pure Python.
-   Use vectorized NumPy throughout. Target: 256–1024 channels without code changes.
-
-3. **Redis-backed fan-out** — replace the in-process pipeline with Redis Streams so multiple
-   decoder workers and multiple frontends can subscribe. Stream names: `bci.signal`,
-   `bci.decoder`. Consumer groups per service.
-
-4. **Pluggable decoders** — abstract `BciDecoder` behind a `Decoder` protocol with
-   `predict(window) -> DecoderPacket`. Allow swapping in a PyTorch model without touching
-   `main.py`.
-
-5. **Persistent sessions** — record raw signal + decoder output to disk for replay and
-   offline evaluation. Reuse the existing `offline_eval.py` harness.
-
-6. **Observability stack** — Prometheus metrics endpoint (`/metrics`) for latency histograms,
-   packet rates, and decoder accuracy; Grafana dashboard mirroring the React UI.
-
-7. **Auth & multi-user** — token-protected WS, per-user simulator instances. Out of scope
-   for v1 but plan endpoint paths to be user-scoped (`/ws/decoder` → `/ws/users/{id}/decoder`).
+| Situation | Expected behavior |
+| --- | --- |
+| `WebSocketDisconnect` | Log once; task ends cleanly. |
+| Decode error | Log; optionally degrade packet (`confidence` low); avoid silent infinite spin. |
+| Redis unavailable | Non-fatal: publish errors throttled in logs; core WS path unchanged. |
+| Tab background | Skip heavy work where possible; reconnect with bounded backoff (frontend). |
 
 ---
 
-## 8. Changelog (append on every contract change)
+## 8. Changelog (contract / pipeline)
 
-- **2026-05-11** — Replaced discrete `predicted_intent` with continuous velocity regression:
-  `vx`, `vy`, `pen_down`, `mode`; decoder model is `RandomForestRegressor`; added
-  `GET /api/decoder/info` and `POST /decoder/mode`.
-- **2026-05-11 (handwriting branch)** — Simulator uses ring population coding + linearly
-  interpolated velocity segments; `POST /manual-neural-burst` body is `{ vx, vy, duration_ms }`
-  (removed `/set-intent` and discrete 5-class labels). `predict_velocity` returns only
-  `(vx, vy)`; training entry point is `generate_training_data()`.
+- **2026-05-13** — Rules refresh: document optional Redis side-buffer from simulator; React trackpad surface (`BCITrackpad`); clarify decoder still reads in-process `generator.stream()`.
+- **2026-05-11** — Continuous velocity regression (`vx`, `vy`), `pen_down`, `mode`; ensemble/RF/HGB regressors; `GET /api/decoder/info`, `POST /decoder/mode`; manual burst `{ vx, vy, duration_ms }`.
