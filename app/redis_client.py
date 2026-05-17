@@ -109,6 +109,18 @@ class BCIRedisClient:
             return True
         return False
 
+    async def clear_signal_stream(self) -> bool:
+        """Delete the signals stream so buffered packets do not survive a decoder reset."""
+        try:
+            deleted = await self._redis.delete(self._cfg.stream_signals)
+            print(f"[redis] clear_signal_stream: deleted {self._cfg.stream_signals} (removed={deleted})")
+            return True
+        except RedisError as e:
+            now_ms = time.time() * 1000.0
+            if self._should_log_error(now_ms=now_ms):
+                print(f"[redis] clear_signal_stream failed: {e}")
+            return False
+
     async def publish_signal_packet(self, packet: Mapping[str, Any]) -> None:
         """
         Publish one simulator packet to Redis Streams and keep only last N seconds.

@@ -13,7 +13,11 @@ healthcheckPath = "/health"
 healthcheckTimeout = 30
 restartPolicyType = "ON_FAILURE"
 
-# Set in the Railway dashboard (Variables), e.g.:
+# Backend service variables (Railway dashboard → Variables), e.g.:
 #   ENV=production
-# Optional: MODEL_PATH or DECODER_MODEL_PATH — absolute path or path relative to process cwd
-# (defaults to models/velocity_decoder.pkl under the app root when unset).
+#   REDIS_URL=redis://...          # Railway Redis plugin or external
+#   FRONTEND_URL=https://<frontend>.up.railway.app
+# Optional: MODEL_PATH / DECODER_MODEL_PATH (default models/velocity_decoder.pkl under /app)
+#
+# Frontend service: separate Dockerfile at frontend/Dockerfile with build arg:
+#   VITE_BACKEND_URL=https://<backend>.up.railway.app

@@ -1,79 +1,338 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useLayoutEffect,
+  useRef,
+  type MutableRefObject,
+} from "react";
 
-export type TrackpadSurfaceMode = "cursor" | "handwriting";
-
-const INK = "rgba(52, 211, 153, 0.92)";
-const INK_DIM = "rgba(52, 211, 153, 0.22)";
 const BG = "#050505";
-const GRID = "rgba(55, 65, 60, 0.35)";
-const CURSOR_CORE = "#00ffaa";
-const CURSOR_GLOW = "rgba(0, 255, 170, 0.45)";
+const INK_GLOW = "rgba(52, 211, 153, 0.48)";
+const INK_HALO = "rgba(0, 255, 170, 0.22)";
+/** Soft cyan grid — #22ffaa @ ~10% opacity */
+const GRID_STROKE = "rgba(34, 255, 170, 0.1)";
+const GRID_GLOW = "rgba(34, 255, 170, 0.06)";
+const CURSOR_CORE = "#c8fff0";
+const CURSOR_RING = "rgba(0, 255, 200, 0.85)";
 
 type NormPoint = { x: number; y: number };
 
-export interface BCITrackpadProps {
-  controlMode: "automatic" | "manual";
-  /** Normalized cursor [0,1]² — same source as dashboard physics / decoder. */
-  cursorNorm: NormPoint;
-  /** Velocity for HUD (decoder or manual). */
+/** Sample on the pad: position + speed magnitude for simulated pressure (line width). */
+export type StrokePoint = NormPoint & { v: number };
+
+/** Live tablet input — mutated by BCITrackpad on pointer events (read in parent rAF). */
+export type ManualTrackpadDrive = {
+  active: boolean;
+  nx: number;
+  ny: number;
   vx: number;
   vy: number;
-  /** Contact / ink gate from decoder (automatic) or pointer (manual handwriting). */
   penDown: boolean;
-  surfaceMode: TrackpadSurfaceMode;
-  onSurfaceModeChange: (mode: TrackpadSurfaceMode) => void;
-  /** Manual mode: continuous joystick + pen from the pad (center = rest). */
-  onManualPadSample: (sample: { vx: number; vy: number; penDown: boolean }) => void;
+};
+
+export function idleManualTrackpadDrive(): ManualTrackpadDrive {
+  return { active: false, nx: 0.5, ny: 0.5, vx: 0, vy: 0, penDown: false };
+}
+
+export interface BCITrackpadProps {
+  controlMode: "automatic" | "manual";
+  /** Normalized cursor [0,1]² — decoder or keyboard-smoothed physics. */
+  cursorNorm: NormPoint;
+  /** Velocity for HUD when not driving from tablet ref (decoder / keyboard). */
+  vx: number;
+  vy: number;
+  /** Pen / contact (decoder or lifted from tablet ref in manual). */
+  penDown: boolean;
+  /** Manual mode: absolute hover + click-drag ink; updated every pointer event. */
+  manualDriveRef: MutableRefObject<ManualTrackpadDrive>;
+  /** Appends one recognized character to the thought-to-text panel. */
+  onRecognizeLetter: (letter: string) => void;
+  /** Stroke too short or recognizer error (message only). */
+  onRecognizeError?: (message: string) => void;
+  /** Ink cleared — reset current-letter display in App (full sentence unchanged). */
+  onCanvasCleared?: () => void;
   className?: string;
 }
+
+export type BCITrackpadHandle = {
+  recognize: () => void;
+  clearCanvas: () => void;
+};
 
 function clamp(n: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, n));
 }
 
-function formatVel(vx: number, vy: number): string {
+const DEMO_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ ";
+
+/** Deterministic demo glyph from stroke geometry until backend recognizer is wired. */
+function demoLetterFromStrokes(strokes: StrokePoint[][]): string {
+  const pts = strokes.flat();
+  if (pts.length < 8) return "";
+  let hash = pts.length;
+  for (const p of pts) {
+    hash = (hash * 31 + Math.floor(p.x * 997) + Math.floor(p.y * 991)) >>> 0;
+  }
+  return DEMO_ALPHABET[hash % DEMO_ALPHABET.length];
+}
+
+/** Cell size that scales with canvas (~32 divisions on long edge). */
+function gridCellPx(plotW: number, plotH: number): number {
+  const long = Math.max(plotW, plotH);
+  const ideal = long / 32;
+  const steps = [16, 18, 20, 22, 24, 28, 32, 36, 40, 48];
+  return steps.reduce((best, s) => (Math.abs(s - ideal) < Math.abs(best - ideal) ? s : best));
+}
+
+function fillScopeBackground(ctx: CanvasRenderingContext2D, plotW: number, plotH: number): void {
+  ctx.fillStyle = BG;
+  ctx.fillRect(0, 0, plotW, plotH);
+}
+
+/** Single-level grid — minimal cyan lines with a faint glow. */
+function drawGrid(ctx: CanvasRenderingContext2D, plotW: number, plotH: number, dpr: number): void {
+  const cell = gridCellPx(plotW, plotH);
+  const cols = Math.ceil(plotW / cell);
+  const rows = Math.ceil(plotH / cell);
+  const lineW = dpr >= 2 ? 0.8 : 1;
+
+  ctx.save();
+  ctx.beginPath();
+  for (let i = 0; i <= cols; i++) {
+    const px = Math.floor(Math.min(plotW, i * cell)) + 0.5;
+    ctx.moveTo(px, 0);
+    ctx.lineTo(px, plotH);
+  }
+  for (let j = 0; j <= rows; j++) {
+    const py = Math.floor(Math.min(plotH, j * cell)) + 0.5;
+    ctx.moveTo(0, py);
+    ctx.lineTo(plotW, py);
+  }
+
+  ctx.lineCap = "butt";
+  ctx.strokeStyle = GRID_STROKE;
+  ctx.lineWidth = lineW;
+  ctx.shadowColor = GRID_GLOW;
+  ctx.shadowBlur = 2;
+  ctx.stroke();
+  ctx.restore();
+}
+
+function formatHud(vx: number, vy: number, pen: boolean): { line1: string; line2: string } {
   const mag = Math.hypot(vx, vy);
-  return `vx ${vx >= 0 ? "+" : ""}${vx.toFixed(2)} · vy ${vy >= 0 ? "+" : ""}${vy.toFixed(2)} · |v| ${mag.toFixed(2)}`;
+  const line1 = `vx ${vx >= 0 ? "+" : ""}${vx.toFixed(2)}  vy ${vy >= 0 ? "+" : ""}${vy.toFixed(2)}  |v| ${mag.toFixed(2)}`;
+  const line2 = `pen ${pen ? "DOWN" : "up"}`;
+  return { line1, line2 };
+}
+
+/** Faster motion ⇒ slightly thicker stroke (digital pen feel). */
+function strokeWidthFromSpeed(v: number): number {
+  const t = clamp(v / 1.15, 0, 1);
+  return 1.75 + t * 6.25;
+}
+
+function toPx(p: NormPoint, plotW: number, plotH: number): { x: number; y: number } {
+  return {
+    x: clamp(p.x, 0, 1) * plotW,
+    y: clamp(p.y, 0, 1) * plotH,
+  };
+}
+
+/** Densify sparse jumps so width + caps look continuous. */
+function densifyStroke(stroke: StrokePoint[], maxStepPx: number): StrokePoint[] {
+  if (stroke.length < 2) return stroke.slice();
+  const out: StrokePoint[] = [stroke[0]];
+  for (let i = 1; i < stroke.length; i++) {
+    const a = stroke[i - 1];
+    const b = stroke[i];
+    const ax = a.x;
+    const ay = a.y;
+    const bx = b.x;
+    const by = b.y;
+    const dx = bx - ax;
+    const dy = by - ay;
+    const dist = Math.hypot(dx, dy);
+    if (dist < 1e-8) continue;
+    const steps = Math.min(14, Math.max(0, Math.ceil(dist / maxStepPx) - 1));
+    for (let s = 1; s <= steps; s++) {
+      const t = s / (steps + 1);
+      out.push({
+        x: ax + dx * t,
+        y: ay + dy * t,
+        v: a.v * (1 - t) + b.v * t,
+      });
+    }
+    out.push(b);
+  }
+  return out;
+}
+
+/** Laplacian-style light smooth (2 passes) for ink preview — keeps endpoints fixed. */
+function lightSmoothStroke(stroke: StrokePoint[]): StrokePoint[] {
+  if (stroke.length < 3) return stroke;
+  const once = (pts: StrokePoint[]): StrokePoint[] => {
+    const o: StrokePoint[] = [pts[0]];
+    for (let i = 1; i < pts.length - 1; i++) {
+      const a = pts[i - 1];
+      const b = pts[i];
+      const c = pts[i + 1];
+      o.push({
+        x: 0.2 * a.x + 0.6 * b.x + 0.2 * c.x,
+        y: 0.2 * a.y + 0.6 * b.y + 0.2 * c.y,
+        v: (a.v + 2 * b.v + c.v) / 4,
+      });
+    }
+    o.push(pts[pts.length - 1]);
+    return o;
+  };
+  return once(once(stroke));
+}
+
+function strokeForRender(stroke: StrokePoint[]): StrokePoint[] {
+  if (stroke.length < 2) return stroke;
+  const smoothed = lightSmoothStroke(stroke);
+  return smoothed.length >= 2 ? smoothed : stroke;
+}
+
+/** Soft smooth silhouette (quadratic midpoints) under variable-width ink. */
+function drawSmoothQuadraticUnderlay(
+  ctx: CanvasRenderingContext2D,
+  stroke: StrokePoint[],
+  plotW: number,
+  plotH: number,
+): void {
+  if (stroke.length < 2) return;
+  const d = densifyStroke(stroke, 2.8);
+  const px = d.map((p) => toPx(p, plotW, plotH));
+  ctx.save();
+  ctx.strokeStyle = "rgba(52, 211, 153, 0.28)";
+  ctx.shadowColor = "rgba(0, 255, 170, 0.35)";
+  ctx.shadowBlur = 12;
+  ctx.lineWidth = 7;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.beginPath();
+  ctx.moveTo(px[0].x, px[0].y);
+  if (px.length === 2) {
+    ctx.lineTo(px[1].x, px[1].y);
+  } else {
+    for (let i = 1; i < px.length - 1; i++) {
+      const xc = (px[i].x + px[i + 1].x) / 2;
+      const yc = (px[i].y + px[i + 1].y) / 2;
+      ctx.quadraticCurveTo(px[i].x, px[i].y, xc, yc);
+    }
+    ctx.quadraticCurveTo(px[px.length - 2].x, px[px.length - 2].y, px[px.length - 1].x, px[px.length - 1].y);
+  }
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
+/** Variable-width ink along smoothed polyline (dense samples + round caps). */
+function drawPenStroke(
+  ctx: CanvasRenderingContext2D,
+  stroke: StrokePoint[],
+  plotW: number,
+  plotH: number,
+  alphaScale: number,
+): void {
+  if (stroke.length < 2) return;
+  const dense = densifyStroke(stroke, 2.4);
+  const px = dense.map((p) => toPx(p, plotW, plotH));
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  for (let i = 0; i < px.length - 1; i++) {
+    const w = strokeWidthFromSpeed((dense[i].v + dense[i + 1].v) / 2);
+    const a = alphaScale;
+    ctx.lineWidth = w + 3;
+    ctx.strokeStyle = `rgba(0, 255, 170, ${0.22 * a})`;
+    ctx.shadowColor = `rgba(52, 211, 153, ${0.65 * a})`;
+    ctx.shadowBlur = 14;
+    ctx.beginPath();
+    ctx.moveTo(px[i].x, px[i].y);
+    ctx.lineTo(px[i + 1].x, px[i + 1].y);
+    ctx.stroke();
+
+    ctx.shadowBlur = 8;
+    ctx.lineWidth = w;
+    ctx.strokeStyle = `rgba(110, 231, 183, ${0.92 * a})`;
+    ctx.beginPath();
+    ctx.moveTo(px[i].x, px[i].y);
+    ctx.lineTo(px[i + 1].x, px[i + 1].y);
+    ctx.stroke();
+
+    ctx.shadowBlur = 0;
+    ctx.lineWidth = Math.max(1.2, w * 0.45);
+    ctx.strokeStyle = `rgba(220, 255, 245, ${0.55 * a})`;
+    ctx.beginPath();
+    ctx.moveTo(px[i].x, px[i].y);
+    ctx.lineTo(px[i + 1].x, px[i + 1].y);
+    ctx.stroke();
+  }
+}
+
+function normFromClient(wrap: HTMLDivElement, clientX: number, clientY: number): NormPoint {
+  const r = wrap.getBoundingClientRect();
+  const nx = clamp((clientX - r.left) / Math.max(1, r.width), 0, 1);
+  const ny = clamp((clientY - r.top) / Math.max(1, r.height), 0, 1);
+  return { x: nx, y: ny };
 }
 
 /**
- * Large square canvas: live cursor, optional ink (handwriting + pen), mode + demo controls.
+ * Drawing surface: full pad rect in normalized coords; square frame from parent.
+ * rAF paint reads merged cursor/pen (tablet ref in Manual removes one frame of lag).
  */
-export function BCITrackpad({
-  controlMode,
-  cursorNorm,
-  vx,
-  vy,
-  penDown,
-  surfaceMode,
-  onSurfaceModeChange,
-  onManualPadSample,
-  className = "",
-}: BCITrackpadProps) {
+export const BCITrackpad = forwardRef<BCITrackpadHandle, BCITrackpadProps>(function BCITrackpad(
+  {
+    controlMode,
+    cursorNorm,
+    vx,
+    vy,
+    penDown,
+    manualDriveRef,
+    onRecognizeLetter,
+    onRecognizeError,
+    onCanvasCleared,
+    className = "",
+  },
+  ref,
+) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  /** Closed strokes + active stroke in normalized [0,1] coordinates. */
-  const strokesRef = useRef<NormPoint[][]>([]);
-  const activeStrokeRef = useRef<NormPoint[] | null>(null);
+  const strokesRef = useRef<StrokePoint[][]>([]);
+  const activeStrokeRef = useRef<StrokePoint[] | null>(null);
   const lastInkNormRef = useRef<NormPoint | null>(null);
-  const [recognized, setRecognized] = useState("Awaiting recognition…");
-  const [, bumpRedraw] = useState(0);
-  const pointerOnPadRef = useRef(false);
-  const pointerIdRef = useRef<number | null>(null);
+  const lastCanvasLayoutRef = useRef({ plotW: 0, plotH: 0, dpr: 0 });
 
-  const pushInkPoint = useCallback((p: NormPoint) => {
+  const velTrackRef = useRef({ nx: 0.5, ny: 0.5, t: performance.now() });
+
+  const liveRef = useRef({
+    cursorNorm,
+    vx,
+    vy,
+    penDown,
+    controlMode,
+  });
+
+  useLayoutEffect(() => {
+    liveRef.current = { cursorNorm, vx, vy, penDown, controlMode };
+  }, [cursorNorm, vx, vy, penDown, controlMode]);
+
+  const pushInkPoint = useCallback((p: StrokePoint) => {
     const last = lastInkNormRef.current;
     const dx = last ? p.x - last.x : 1;
     const dy = last ? p.y - last.y : 1;
-    if (last && dx * dx + dy * dy < 1.2e-6) return;
-    lastInkNormRef.current = p;
+    if (last && dx * dx + dy * dy < 8e-8) return;
+    lastInkNormRef.current = { x: p.x, y: p.y };
     let stroke = activeStrokeRef.current;
     if (!stroke) {
       stroke = [];
       activeStrokeRef.current = stroke;
       strokesRef.current.push(stroke);
     }
-    stroke.push({ x: p.x, y: p.y });
+    stroke.push({ ...p });
   }, []);
 
   const closeStroke = useCallback(() => {
@@ -81,166 +340,316 @@ export function BCITrackpad({
     lastInkNormRef.current = null;
   }, []);
 
-  const clearInk = useCallback(() => {
-    strokesRef.current = [];
-    activeStrokeRef.current = null;
-    lastInkNormRef.current = null;
-    setRecognized("Awaiting recognition…");
-    bumpRedraw((n) => n + 1);
-  }, []);
+  const mergedLive = useCallback(() => {
+    const L = liveRef.current;
+    const pad = manualDriveRef.current;
+    if (L.controlMode === "manual" && pad.active) {
+      return {
+        cursorNorm: { x: pad.nx, y: pad.ny },
+        vx: pad.vx,
+        vy: pad.vy,
+        penDown: pad.penDown,
+        controlMode: L.controlMode,
+      };
+    }
+    return {
+      cursorNorm: L.cursorNorm,
+      vx: L.vx,
+      vy: L.vy,
+      penDown: L.penDown,
+      controlMode: L.controlMode,
+    };
+  }, [manualDriveRef]);
 
-  const draw = useCallback(() => {
+  const paint = useCallback(() => {
     const canvas = canvasRef.current;
     const wrap = wrapRef.current;
     if (!canvas || !wrap) return;
-    const side = Math.max(200, Math.floor(Math.min(wrap.clientWidth, wrap.clientHeight)));
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
 
-    canvas.width = Math.floor(side * dpr);
-    canvas.height = Math.floor(side * dpr);
-    canvas.style.width = `${side}px`;
-    canvas.style.height = `${side}px`;
+    const plotW = Math.max(200, Math.floor(wrap.clientWidth));
+    const plotH = Math.max(160, Math.floor(wrap.clientHeight));
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const prev = lastCanvasLayoutRef.current;
+    if (prev.plotW !== plotW || prev.plotH !== plotH || prev.dpr !== dpr) {
+      lastCanvasLayoutRef.current = { plotW, plotH, dpr };
+      canvas.width = Math.floor(plotW * dpr);
+      canvas.height = Math.floor(plotH * dpr);
+      canvas.style.width = `${plotW}px`;
+      canvas.style.height = `${plotH}px`;
+    }
 
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    ctx.fillStyle = BG;
-    ctx.fillRect(0, 0, side, side);
+    fillScopeBackground(ctx, plotW, plotH);
+    drawGrid(ctx, plotW, plotH, dpr);
 
-    const g = 28;
-    ctx.strokeStyle = GRID;
-    ctx.lineWidth = 1;
-    for (let x = 0; x <= side; x += g) {
+    const M = mergedLive();
+    const cx = clamp(M.cursorNorm.x, 0, 1) * plotW;
+    const cy = clamp(M.cursorNorm.y, 0, 1) * plotH;
+    const t = performance.now() / 1000;
+    const pulse = 0.82 + 0.18 * Math.sin(t * 5.5);
+
+    const inkNow =
+      M.penDown && (M.controlMode === "automatic" || manualDriveRef.current.active);
+
+    const drawCursorGlow = (compact: boolean) => {
+      const rOuter = compact ? 26 : 52;
+      const rMid = compact ? 14 : 28;
+      const rCore = compact ? 4.5 : 6.5;
+      const rHot = compact ? 2.8 : 4;
+
+      const bloom = ctx.createRadialGradient(cx, cy, 0, cx, cy, rOuter);
+      bloom.addColorStop(0, `rgba(0, 255, 190, ${compact ? 0.22 * pulse : 0.32 * pulse})`);
+      bloom.addColorStop(0.35, `rgba(0, 255, 170, ${compact ? 0.1 * pulse : 0.16 * pulse})`);
+      bloom.addColorStop(0.7, "rgba(52, 211, 153, 0.04)");
+      bloom.addColorStop(1, "rgba(0, 255, 170, 0)");
+      ctx.fillStyle = bloom;
       ctx.beginPath();
-      ctx.moveTo(x + 0.5, 0);
-      ctx.lineTo(x + 0.5, side);
-      ctx.stroke();
-    }
-    for (let y = 0; y <= side; y += g) {
+      ctx.arc(cx, cy, rOuter, 0, Math.PI * 2);
+      ctx.fill();
+
+      const mid = ctx.createRadialGradient(cx, cy, 0, cx, cy, rMid);
+      mid.addColorStop(0, `rgba(120, 255, 220, ${0.55 * pulse})`);
+      mid.addColorStop(0.5, `rgba(0, 255, 170, ${0.2 * pulse})`);
+      mid.addColorStop(1, "rgba(0, 255, 170, 0)");
+      ctx.fillStyle = mid;
       ctx.beginPath();
-      ctx.moveTo(0, y + 0.5);
-      ctx.lineTo(side, y + 0.5);
+      ctx.arc(cx, cy, rMid, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.strokeStyle = CURSOR_RING;
+      ctx.lineWidth = compact ? 1.5 : 2;
+      ctx.shadowColor = "rgba(0, 255, 200, 0.95)";
+      ctx.shadowBlur = compact ? 14 : 28;
+      ctx.fillStyle = CURSOR_CORE;
+      ctx.beginPath();
+      ctx.arc(cx, cy, rCore, 0, Math.PI * 2);
+      ctx.fill();
       ctx.stroke();
-    }
 
-    ctx.strokeStyle = INK_DIM;
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(side / 2, 0);
-    ctx.lineTo(side / 2, side);
-    ctx.moveTo(0, side / 2);
-    ctx.lineTo(side, side / 2);
-    ctx.stroke();
+      ctx.shadowBlur = compact ? 10 : 22;
+      ctx.beginPath();
+      ctx.arc(cx, cy, rHot, 0, Math.PI * 2);
+      ctx.fillStyle = "#e8fff8";
+      ctx.fill();
+      ctx.shadowBlur = 0;
+    };
 
-    const toPx = (p: NormPoint) => ({
-      x: clamp(p.x, 0, 1) * side,
-      y: clamp(p.y, 0, 1) * side,
-    });
-
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
     for (const stroke of strokesRef.current) {
       if (stroke.length < 2) continue;
-      ctx.strokeStyle = INK;
-      ctx.lineWidth = 2.35;
+      const sm = strokeForRender(stroke);
+      const dense = densifyStroke(sm, 5);
+      const px = dense.map((p) => toPx(p, plotW, plotH));
+      ctx.strokeStyle = INK_GLOW;
+      ctx.shadowColor = "rgba(52, 211, 153, 0.5)";
+      ctx.shadowBlur = 16;
+      ctx.lineWidth = 16;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
       ctx.beginPath();
-      const p0 = toPx(stroke[0]);
-      ctx.moveTo(p0.x, p0.y);
-      for (let i = 1; i < stroke.length; i++) {
-        const p = toPx(stroke[i]);
-        ctx.lineTo(p.x, p.y);
+      ctx.moveTo(px[0].x, px[0].y);
+      for (let i = 1; i < px.length - 1; i++) {
+        const xc = (px[i].x + px[i + 1].x) / 2;
+        const yc = (px[i].y + px[i + 1].y) / 2;
+        ctx.quadraticCurveTo(px[i].x, px[i].y, xc, yc);
       }
+      ctx.quadraticCurveTo(px[px.length - 2].x, px[px.length - 2].y, px[px.length - 1].x, px[px.length - 1].y);
       ctx.stroke();
+      ctx.shadowBlur = 0;
+
+      ctx.strokeStyle = INK_HALO;
+      ctx.lineWidth = 28;
+      ctx.globalAlpha = 0.62;
+      ctx.beginPath();
+      ctx.moveTo(px[0].x, px[0].y);
+      for (let i = 1; i < px.length - 1; i++) {
+        const xc = (px[i].x + px[i + 1].x) / 2;
+        const yc = (px[i].y + px[i + 1].y) / 2;
+        ctx.quadraticCurveTo(px[i].x, px[i].y, xc, yc);
+      }
+      ctx.quadraticCurveTo(px[px.length - 2].x, px[px.length - 2].y, px[px.length - 1].x, px[px.length - 1].y);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+    ctx.restore();
+
+    for (const stroke of strokesRef.current) {
+      if (stroke.length < 2) continue;
+      const sm = strokeForRender(stroke);
+      drawSmoothQuadraticUnderlay(ctx, sm, plotW, plotH);
+      drawPenStroke(ctx, sm, plotW, plotH, 1);
     }
 
-    const cx = clamp(cursorNorm.x, 0, 1) * side;
-    const cy = clamp(cursorNorm.y, 0, 1) * side;
-    ctx.fillStyle = CURSOR_GLOW;
+    const active = activeStrokeRef.current;
+    if (active && active.length >= 2) {
+      const smA = strokeForRender(active);
+      drawSmoothQuadraticUnderlay(ctx, smA, plotW, plotH);
+      drawPenStroke(ctx, smA, plotW, plotH, 1);
+      const tail = smA.slice(-14);
+      if (tail.length >= 2) {
+        drawPenStroke(ctx, tail, plotW, plotH, 0.52);
+      }
+    }
+
+    if (!inkNow) {
+      drawCursorGlow(false);
+    } else {
+      drawCursorGlow(true);
+    }
+
+    const { line1, line2 } = formatHud(M.vx, M.vy, M.penDown);
+    ctx.save();
+    ctx.font = '600 11px ui-monospace, SFMono-Regular, Menlo, "Cascadia Mono", monospace';
+    const tw = Math.max(ctx.measureText(line1).width, ctx.measureText(line2).width);
+    const bx = 12;
+    const bh = 42;
+    const by = plotH - bh - 12;
+    const bw = Math.min(plotW - 24, tw + 24);
+    ctx.fillStyle = "rgba(0,0,0,0.78)";
+    ctx.strokeStyle = M.penDown ? "rgba(52, 211, 153, 0.45)" : "rgba(255,255,255,0.1)";
+    ctx.lineWidth = 1;
+    const r = 8;
     ctx.beginPath();
-    ctx.arc(cx, cy, 9, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.strokeStyle = "rgba(255,255,255,0.35)";
-    ctx.lineWidth = 1.25;
-    ctx.beginPath();
-    ctx.arc(cx, cy, 4.25, 0, Math.PI * 2);
-    ctx.fillStyle = CURSOR_CORE;
+    ctx.moveTo(bx + r, by);
+    ctx.lineTo(bx + bw - r, by);
+    ctx.quadraticCurveTo(bx + bw, by, bx + bw, by + r);
+    ctx.lineTo(bx + bw, by + bh - r);
+    ctx.quadraticCurveTo(bx + bw, by + bh, bx + bw - r, by + bh);
+    ctx.lineTo(bx + r, by + bh);
+    ctx.quadraticCurveTo(bx, by + bh, bx, by + bh - r);
+    ctx.lineTo(bx, by + r);
+    ctx.quadraticCurveTo(bx, by, bx + r, by);
+    ctx.closePath();
     ctx.fill();
     ctx.stroke();
-  }, [cursorNorm]);
+    ctx.fillStyle = "rgba(220, 245, 238, 0.96)";
+    ctx.textBaseline = "alphabetic";
+    ctx.fillText(line1, bx + 12, by + 17);
+    ctx.fillStyle = M.penDown ? "rgba(110, 231, 183, 0.98)" : "rgba(160, 180, 175, 0.9)";
+    ctx.fillText(line2, bx + 12, by + 33);
+    ctx.restore();
+  }, [manualDriveRef, mergedLive]);
+
+  const clearInk = useCallback(() => {
+    const strokeCount = strokesRef.current.length;
+    strokesRef.current = [];
+    activeStrokeRef.current = null;
+    lastInkNormRef.current = null;
+    onCanvasCleared?.();
+    console.log(`[BCITrackpad] clearInk: removed ${strokeCount} stroke(s)`);
+    paint();
+  }, [onCanvasCleared, paint]);
 
   useLayoutEffect(() => {
-    draw();
-  }, [draw, vx, vy, penDown, surfaceMode, controlMode, recognized]);
+    paint();
+  }, [paint, controlMode]);
 
   useEffect(() => {
     const wrap = wrapRef.current;
     if (!wrap) return;
-    const ro = new ResizeObserver(() => draw());
+    const ro = new ResizeObserver(() => paint());
     ro.observe(wrap);
     return () => ro.disconnect();
-  }, [draw]);
+  }, [paint]);
 
   useEffect(() => {
     let raf = 0;
+
     const tick = () => {
+      const M = mergedLive();
       const ink =
-        surfaceMode === "handwriting" &&
-        penDown &&
-        (controlMode === "automatic" || pointerOnPadRef.current);
+        M.penDown && (M.controlMode === "automatic" || manualDriveRef.current.active);
+
       if (ink) {
-        pushInkPoint({ x: cursorNorm.x, y: cursorNorm.y });
+        const v = Math.hypot(M.vx, M.vy);
+        pushInkPoint({
+          x: M.cursorNorm.x,
+          y: M.cursorNorm.y,
+          v: clamp(v, 0, 1.6),
+        });
       } else {
         closeStroke();
       }
-      draw();
+
+      paint();
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [cursorNorm, surfaceMode, penDown, controlMode, draw, pushInkPoint, closeStroke]);
+  }, [paint, pushInkPoint, closeStroke, mergedLive, manualDriveRef]);
 
-  const sampleJoystickFromEvent = (el: HTMLDivElement, clientX: number, clientY: number) => {
-    const r = el.getBoundingClientRect();
-    const mx = (clientX - r.left) / Math.max(1, r.width);
-    const my = (clientY - r.top) / Math.max(1, r.height);
-    let jx = (mx - 0.5) * 2;
-    let jy = (my - 0.5) * 2;
-    const m = Math.hypot(jx, jy);
-    if (m > 1 && m > 1e-6) {
-      jx /= m;
-      jy /= m;
+  const estimateVelocity = useCallback((nx: number, ny: number) => {
+    const now = performance.now();
+    const prev = velTrackRef.current;
+    const dt = (now - prev.t) / 1000;
+    if (dt > 0.07) {
+      velTrackRef.current = { nx, ny, t: now };
+      return { vx: 0, vy: 0 };
     }
-    return { vx: jx, vy: jy };
-  };
+    const dnx = nx - prev.nx;
+    const dny = ny - prev.ny;
+    velTrackRef.current = { nx, ny, t: now };
+    const scale = 2.4;
+    const effDt = Math.max(1e-4, dt);
+    return {
+      vx: clamp(dnx / effDt / scale, -1, 1),
+      vy: clamp(dny / effDt / scale, -1, 1),
+    };
+  }, []);
 
-  const flushManualRest = useCallback(() => {
-    pointerOnPadRef.current = false;
-    pointerIdRef.current = null;
-    onManualPadSample({ vx: 0, vy: 0, penDown: false });
-  }, [onManualPadSample]);
+  const writeDriveFromEvent = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      const wrap = wrapRef.current;
+      if (!wrap || controlMode !== "manual") return;
 
-  const onPointerDownCapture = (e: React.PointerEvent<HTMLDivElement>) => {
+      const r = wrap.getBoundingClientRect();
+      const inside =
+        e.clientX >= r.left &&
+        e.clientX <= r.right &&
+        e.clientY >= r.top &&
+        e.clientY <= r.bottom;
+      const dragging = (e.buttons & 1) !== 0;
+      const active = inside || dragging;
+
+      const { x: nx, y: ny } = normFromClient(wrap, e.clientX, e.clientY);
+      const { vx: evx, vy: evy } = estimateVelocity(nx, ny);
+      const penDownBtn = (e.buttons & 1) !== 0;
+
+      manualDriveRef.current = {
+        active,
+        nx,
+        ny,
+        vx: active ? evx : 0,
+        vy: active ? evy : 0,
+        penDown: active && penDownBtn,
+      };
+    },
+    [controlMode, estimateVelocity, manualDriveRef],
+  );
+
+  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (controlMode !== "manual") return;
-    e.currentTarget.setPointerCapture(e.pointerId);
-    pointerIdRef.current = e.pointerId;
-    pointerOnPadRef.current = true;
-    const { vx: jx, vy: jy } = sampleJoystickFromEvent(e.currentTarget, e.clientX, e.clientY);
-    const pen = surfaceMode === "handwriting" && (e.buttons & 1) !== 0;
-    onManualPadSample({ vx: jx, vy: jy, penDown: pen });
-  };
-
-  const onPointerMoveCapture = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (controlMode !== "manual" || !pointerOnPadRef.current) return;
-    const { vx: jx, vy: jy } = sampleJoystickFromEvent(e.currentTarget, e.clientX, e.clientY);
-    const pen = surfaceMode === "handwriting" && (e.buttons & 1) !== 0;
-    onManualPadSample({ vx: jx, vy: jy, penDown: pen });
-  };
-
-  const onPointerUpCapture = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (pointerIdRef.current === e.pointerId) {
-      flushManualRest();
+    if (e.button === 0) {
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        /* ignore */
+      }
     }
+    writeDriveFromEvent(e);
+  };
+
+  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (controlMode !== "manual") return;
+    writeDriveFromEvent(e);
+  };
+
+  const onPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    writeDriveFromEvent(e);
     try {
       e.currentTarget.releasePointerCapture(e.pointerId);
     } catch {
@@ -248,104 +657,71 @@ export function BCITrackpad({
     }
   };
 
-  const onRecognize = () => {
-    const strokes = strokesRef.current;
-    const pts = strokes.reduce((a, s) => a + s.length, 0);
-    setRecognized(
-      pts < 8
-        ? "(demo) Stroke too short — draw a letter, then Recognize."
-        : "(demo) Recognizer not wired — backend hook coming soon.",
-    );
+  const onPointerLeave = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (controlMode !== "manual") return;
+    if (e.buttons === 0) {
+      manualDriveRef.current = idleManualTrackpadDrive();
+    } else {
+      writeDriveFromEvent(e);
+    }
   };
 
-  const modeBtn = (mode: TrackpadSurfaceMode, label: string, hint: string) => (
-    <button
-      type="button"
-      key={mode}
-      title={hint}
-      onClick={() => onSurfaceModeChange(mode)}
-      className={`flex-1 rounded-lg px-2 py-1.5 text-[11px] font-semibold transition-all border ${
-        surfaceMode === mode
-          ? "border-emerald-400/55 bg-emerald-500/15 text-emerald-200 shadow-[0_0_20px_-8px_rgba(52,211,153,0.5)]"
-          : "border-neutral-700/90 bg-neutral-900/60 text-neutral-400 hover:text-neutral-200 hover:border-neutral-600"
-      }`}
-    >
-      {label}
-    </button>
+  const onRecognize = useCallback(() => {
+    const strokes = strokesRef.current;
+    const pts = strokes.reduce((a, s) => a + s.length, 0);
+    if (pts < 8) {
+      onRecognizeError?.("Stroke too short — draw a letter, then Recognize.");
+      return;
+    }
+    const letter = demoLetterFromStrokes(strokes);
+    onRecognizeLetter(letter);
+    strokesRef.current = [];
+    activeStrokeRef.current = null;
+    lastInkNormRef.current = null;
+    onCanvasCleared?.();
+    paint();
+  }, [onRecognizeLetter, onRecognizeError, onCanvasCleared, paint]);
+
+  const imperativeRef = useRef<BCITrackpadHandle>({
+    recognize: () => {},
+    clearCanvas: () => {},
+  });
+  imperativeRef.current = {
+    recognize: onRecognize,
+    clearCanvas: clearInk,
+  };
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      recognize: () => imperativeRef.current.recognize(),
+      clearCanvas: () => imperativeRef.current.clearCanvas(),
+    }),
+    [],
   );
 
   return (
-    <div className={`flex flex-col gap-2 min-h-0 ${className}`}>
-      <div className="flex items-center justify-between gap-2 flex-wrap shrink-0">
-        <h2 className="text-xs font-semibold uppercase tracking-wider text-neutral-400">Trackpad</h2>
-        <span className="text-[10px] font-mono text-neutral-500">
-          {controlMode === "manual" ? "Drag to steer · handwriting = draw while pressed" : "Decoder stream"}
-        </span>
-      </div>
-
+    <div className={`relative h-full w-full min-h-0 min-w-0 ${className}`}>
       <div
         ref={wrapRef}
-        className="relative mx-auto aspect-square w-full min-h-[12rem] max-h-[min(72vh,42rem)] max-w-[min(100%,72vh,42rem)] rounded-xl border border-neutral-800/90 bg-black overflow-hidden touch-none select-none shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]"
+        role="application"
+        aria-label="BCI drawing tablet"
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerCancel={onPointerUp}
+        onPointerLeave={onPointerLeave}
+        className={`relative h-full w-full min-h-0 min-w-0 rounded-2xl border border-emerald-400/25 bg-[#050505] overflow-hidden touch-none select-none shadow-[inset_0_0_48px_rgba(0,255,170,0.04),inset_0_1px_0_rgba(52,211,153,0.12),0_0_0_1px_rgba(0,0,0,0.7),0_28px_90px_-24px_rgba(0,255,159,0.2)] transition-shadow duration-500 hover:border-emerald-400/35 hover:shadow-[inset_0_0_56px_rgba(0,255,170,0.06),inset_0_1px_0_rgba(52,211,153,0.16),0_32px_100px_-20px_rgba(0,255,159,0.28)] ${
+          controlMode === "manual" ? "cursor-none" : "cursor-default"
+        }`}
       >
         <canvas
           ref={canvasRef}
-          className={`absolute inset-0 block h-full w-full ${controlMode === "manual" ? "cursor-crosshair" : "cursor-default"}`}
-          aria-label="BCI trackpad and handwriting canvas"
+          className="pointer-events-none absolute inset-0 block h-full w-full"
+          aria-hidden
         />
-        {controlMode === "manual" && (
-          <div
-            role="application"
-            aria-label="Manual velocity joystick"
-            className="absolute inset-0 z-10"
-            onPointerDown={onPointerDownCapture}
-            onPointerMove={onPointerMoveCapture}
-            onPointerUp={onPointerUpCapture}
-            onPointerCancel={onPointerUpCapture}
-            onPointerLeave={(e) => {
-              if (e.buttons === 0 && pointerOnPadRef.current) flushManualRest();
-            }}
-          />
-        )}
-        <div className="pointer-events-none absolute bottom-2 left-2 right-2 flex justify-between items-end gap-2">
-          <p className="text-[10px] font-mono text-neutral-500 bg-black/55 px-2 py-1 rounded-md border border-white/5 backdrop-blur-sm max-w-[min(100%,20rem)] truncate">
-            {formatVel(vx, vy)}
-          </p>
-          <p className="text-[10px] font-mono text-neutral-400 bg-black/55 px-2 py-1 rounded-md border border-white/5">
-            pen {penDown ? "down" : "up"} · {surfaceMode === "handwriting" ? "HW" : "cursor"}
-          </p>
-        </div>
       </div>
-
-      <div className="flex gap-1.5 shrink-0" role="group" aria-label="Ink mode">
-        {modeBtn("cursor", "Cursor mode", "Move without leaving ink")}
-        {modeBtn("handwriting", "Handwriting mode", "Hold primary button while dragging to write")}
-      </div>
-
-      <div className="flex flex-wrap gap-1.5 shrink-0">
-        <button
-          type="button"
-          onClick={clearInk}
-          className="rounded-lg border border-neutral-600 bg-neutral-900/80 px-3 py-1.5 text-[11px] font-medium text-neutral-200 hover:bg-neutral-800 hover:border-neutral-500 transition-colors"
-        >
-          Clear canvas
-        </button>
-        <button
-          type="button"
-          onClick={onRecognize}
-          className="rounded-lg border border-emerald-600/50 bg-emerald-950/40 px-3 py-1.5 text-[11px] font-semibold text-emerald-200 hover:bg-emerald-900/35 transition-colors"
-        >
-          Recognize
-        </button>
-      </div>
-
-      <label className="shrink-0 text-[10px] font-mono text-neutral-500 uppercase tracking-wider">
-        Recognized
-        <input
-          readOnly
-          value={recognized}
-          className="mt-1 w-full rounded-lg border border-neutral-800 bg-neutral-950/90 px-2.5 py-2 text-xs text-neutral-100 font-mono shadow-inner"
-        />
-      </label>
     </div>
   );
-}
+});
+BCITrackpad.displayName = "BCITrackpad";

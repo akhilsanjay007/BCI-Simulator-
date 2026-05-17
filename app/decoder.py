@@ -4,7 +4,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, Literal, Tuple
+from typing import Deque, Literal, Tuple, Union
 
 import numpy as np
 from pydantic import BaseModel, Field
@@ -115,6 +115,22 @@ class DecoderPacket(BaseModel):
         ge=1,
         description="Number of neural recording channels in the simulator/decoder configuration.",
     )
+
+
+class DecoderResetEvent(BaseModel):
+    """Out-of-band WebSocket event — tells the dashboard to clear canvas and metrics."""
+
+    type: Literal["decoder_reset"] = "decoder_reset"
+    timestamp_ms: float = Field(
+        ...,
+        description="Unix timestamp in milliseconds when reset was applied on the server.",
+    )
+    cursor_x: float = Field(0.5, ge=0.0, le=1.0)
+    cursor_y: float = Field(0.5, ge=0.0, le=1.0)
+    num_channels: int = Field(..., ge=1)
+
+
+DecoderWireMessage = Union[DecoderPacket, DecoderResetEvent]
 
 
 @dataclass(frozen=True)
@@ -786,8 +802,8 @@ class BciDecoder:
             num_channels=self._channels,
         )
 
-    def reset_state(self) -> None:
-        """Clear sliding window, score buffers, velocity smoothers, and cursor state."""
+    def reset(self) -> None:
+        """Clear spike window, rolling accuracy, velocity smoothers, and cursor integration."""
         self._spike_window.clear()
         self._window_count = 0
         self._recent_scores.clear()
@@ -802,6 +818,22 @@ class BciDecoder:
         self._cursor_vy = 0.0
         self._cursor_x_s = 0.5
         self._cursor_y_s = 0.5
+        print(
+            "[decoder] reset(): spike window, velocity history, cursor, and session scores cleared"
+        )
+
+    def reset_state(self) -> None:
+        """Backward-compatible alias for :meth:`reset`."""
+        self.reset()
+
+    def build_reset_event(self, *, num_channels: int) -> DecoderResetEvent:
+        """Wire payload broadcast to decoder WebSocket clients after :meth:`reset`."""
+        return DecoderResetEvent(
+            timestamp_ms=time.time() * 1000.0,
+            cursor_x=float(self._cursor_x_s),
+            cursor_y=float(self._cursor_y_s),
+            num_channels=int(num_channels),
+        )
 
 
 def generate_training_data(

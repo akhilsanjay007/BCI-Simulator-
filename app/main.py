@@ -1,6 +1,8 @@
+import asyncio
 import os
 import re
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -87,6 +89,47 @@ app.add_middleware(
 
 # Optional Redis Streams client (enabled when REDIS_URL is set).
 redis_client = get_redis_client()
+
+
+class DecoderWebSocketHub:
+    """Tracks live ``/ws/decoder`` clients for broadcast events (e.g. reset)."""
+
+    def __init__(self) -> None:
+        self._clients: set[WebSocket] = set()
+        self._lock = asyncio.Lock()
+
+    async def register(self, websocket: WebSocket) -> None:
+        async with self._lock:
+            self._clients.add(websocket)
+        print(f"[ws/decoder] client registered ({len(self._clients)} total)")
+
+    async def unregister(self, websocket: WebSocket) -> None:
+        async with self._lock:
+            self._clients.discard(websocket)
+        print(f"[ws/decoder] client unregistered ({len(self._clients)} total)")
+
+    async def broadcast_json(self, payload: dict[str, Any]) -> int:
+        async with self._lock:
+            clients = list(self._clients)
+        if not clients:
+            return 0
+        dead: list[WebSocket] = []
+        sent = 0
+        for ws in clients:
+            try:
+                await ws.send_json(payload)
+                sent += 1
+            except Exception as e:
+                print(f"[ws/decoder] broadcast failed for one client: {e}")
+                dead.append(ws)
+        if dead:
+            async with self._lock:
+                for ws in dead:
+                    self._clients.discard(ws)
+        return sent
+
+
+decoder_ws_hub = DecoderWebSocketHub()
 
 _reg_raw = os.getenv("DECODER_REGRESSOR", "ensemble").strip().lower()
 _decoder_reg: RegressorKind
@@ -219,9 +262,27 @@ async def set_decoder_mode(body: SetDecoderModeRequest) -> dict[str, str]:
 
 
 @app.post("/decoder/reset")
-async def reset_decoder() -> dict[str, str]:
-    decoder.reset_state()
-    return {"status": "ok"}
+async def reset_decoder() -> dict[str, object]:
+    """
+    Reset decoder state, clear Redis signal buffer (if configured), and notify dashboards.
+    """
+    print("[decoder/reset] POST received — clearing decoder + notifying WebSocket clients")
+    decoder.reset()
+    redis_cleared = False
+    if redis_client is not None:
+        redis_cleared = await redis_client.clear_signal_stream()
+    reset_event = decoder.build_reset_event(num_channels=generator.num_channels)
+    payload = reset_event.model_dump()
+    clients_notified = await decoder_ws_hub.broadcast_json(payload)
+    print(
+        f"[decoder/reset] done redis_cleared={redis_cleared} "
+        f"ws_clients_notified={clients_notified} cursor=({reset_event.cursor_x:.2f},{reset_event.cursor_y:.2f})"
+    )
+    return {
+        "status": "ok",
+        "redis_cleared": redis_cleared,
+        "ws_clients_notified": clients_notified,
+    }
 
 
 @app.get("/simulator/config")
@@ -256,6 +317,7 @@ async def decoder_stream(websocket: WebSocket):
     if not await accept_allowed_websocket(websocket):
         return
     print("✅ Client connected — decoder stream live")
+    await decoder_ws_hub.register(websocket)
     _log_i = 0
     try:
         async for packet in generator.stream():
@@ -280,6 +342,8 @@ async def decoder_stream(websocket: WebSocket):
     except Exception as e:
         print(f"Decoder error: {e}")
         await websocket.close()
+    finally:
+        await decoder_ws_hub.unregister(websocket)
 
 
 @app.on_event("shutdown")
