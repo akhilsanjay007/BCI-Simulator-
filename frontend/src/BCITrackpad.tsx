@@ -7,6 +7,7 @@ import {
   useRef,
   type MutableRefObject,
 } from "react";
+import { idleManualTrackpadDrive, type ManualTrackpadDrive } from "./manualTrackpad";
 
 const BG = "#050505";
 const INK_GLOW = "rgba(52, 211, 153, 0.48)";
@@ -20,23 +21,9 @@ const CURSOR_RING = "rgba(0, 255, 200, 0.85)";
 type NormPoint = { x: number; y: number };
 
 /** Sample on the pad: position + speed magnitude for simulated pressure (line width). */
-export type StrokePoint = NormPoint & { v: number };
+type StrokePoint = NormPoint & { v: number };
 
-/** Live tablet input — mutated by BCITrackpad on pointer events (read in parent rAF). */
-export type ManualTrackpadDrive = {
-  active: boolean;
-  nx: number;
-  ny: number;
-  vx: number;
-  vy: number;
-  penDown: boolean;
-};
-
-export function idleManualTrackpadDrive(): ManualTrackpadDrive {
-  return { active: false, nx: 0.5, ny: 0.5, vx: 0, vy: 0, penDown: false };
-}
-
-export interface BCITrackpadProps {
+interface BCITrackpadProps {
   controlMode: "automatic" | "manual";
   /** Normalized cursor [0,1]² — decoder or keyboard-smoothed physics. */
   cursorNorm: NormPoint;

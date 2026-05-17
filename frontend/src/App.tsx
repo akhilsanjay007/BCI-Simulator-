@@ -5,12 +5,8 @@ import {
   MANUAL_CONTROL_CONFIDENCE,
   type CursorMotionState,
 } from "./cursorPhysics";
-import {
-  BCITrackpad,
-  idleManualTrackpadDrive,
-  type BCITrackpadHandle,
-  type ManualTrackpadDrive,
-} from "./BCITrackpad";
+import { BCITrackpad, type BCITrackpadHandle } from "./BCITrackpad";
+import { idleManualTrackpadDrive, type ManualTrackpadDrive } from "./manualTrackpad";
 import { NeuralSignalCharts, type ManualNeuralBurstPayload } from "./NeuralSignalCharts";
 import {
   computeInstantSignalQuality,
@@ -157,6 +153,7 @@ function App() {
   const [spikeStrength, setSpikeStrength] = useState(0);
   const [manualNeuralBurst, setManualNeuralBurst] = useState<ManualNeuralBurstPayload | null>(null);
   const [manualPenDown, setManualPenDown] = useState(false);
+  const [manualTrackpadActive, setManualTrackpadActive] = useState(false);
   const [currentLetter, setCurrentLetter] = useState<string | null>(null);
   const [fullText, setFullText] = useState("");
   const [recognizeError, setRecognizeError] = useState<string | null>(null);
@@ -177,8 +174,12 @@ function App() {
   const latestSpikeConfidenceRef = useRef<number | null>(null);
   const spikePulseEnvelopeRef = useRef(0);
   const signalSmoothRef = useRef(0);
-  const penUpSinceRef = useRef(performance.now());
+  const penUpSinceRef = useRef(0);
   const spikeStrengthRef = useRef(0);
+
+  useEffect(() => {
+    penUpSinceRef.current = performance.now();
+  }, []);
 
   useLayoutEffect(() => {
     controlModeRef.current = controlMode;
@@ -257,6 +258,7 @@ function App() {
     setManualCmd({ vx: 0, vy: 0 });
     setManualVelocityLabel("rest");
     setManualPenDown(false);
+    setManualTrackpadActive(false);
     latestSpikeConfidenceRef.current = null;
     spikePulseEnvelopeRef.current = 0;
     setLatestSpikeCommandConfidence(null);
@@ -267,6 +269,8 @@ function App() {
 
   const absorbManualTrackpadFrame = useCallback(
     (pad: ManualTrackpadDrive, now: number) => {
+      setManualTrackpadActive((prev) => (prev === pad.active ? prev : pad.active));
+
       if (!pad.active) {
         manualVelocityRef.current = { vx: 0, vy: 0 };
         setManualCmd({ vx: 0, vy: 0 });
@@ -440,31 +444,34 @@ function App() {
 
       if (pad.active) {
         absorbManualTrackpadFrame(pad, now);
-      } else if (keysHeld) {
-        const { vx: cmdVx, vy: cmdVy } = manualVelocityRef.current;
-        let effectiveConfidence = 0;
-        if (Math.hypot(cmdVx, cmdVy) > 1e-6 && latestSpikeConfidenceRef.current != null) {
-          effectiveConfidence = latestSpikeConfidenceRef.current * spikePulseEnvelopeRef.current;
-        }
-
-        manualPhysicsRef.current = stepCursorMotion(
-          manualPhysicsRef.current,
-          cmdVx,
-          cmdVy,
-          effectiveConfidence,
-          dt,
-        );
-        const { xSmooth, ySmooth } = manualPhysicsRef.current;
-        setCursorDisplay({ x: xSmooth, y: ySmooth });
-
-        let strengthVisual = 0;
-        if (Math.hypot(cmdVx, cmdVy) > 1e-6 && latestSpikeConfidenceRef.current != null) {
-          strengthVisual = latestSpikeConfidenceRef.current * spikePulseEnvelopeRef.current;
-        }
-        setSpikeStrength(strengthVisual);
       } else {
-        manualVelocityRef.current = { vx: 0, vy: 0 };
-        setSpikeStrength(0);
+        setManualTrackpadActive((prev) => (prev ? false : prev));
+        if (keysHeld) {
+          const { vx: cmdVx, vy: cmdVy } = manualVelocityRef.current;
+          let effectiveConfidence = 0;
+          if (Math.hypot(cmdVx, cmdVy) > 1e-6 && latestSpikeConfidenceRef.current != null) {
+            effectiveConfidence = latestSpikeConfidenceRef.current * spikePulseEnvelopeRef.current;
+          }
+
+          manualPhysicsRef.current = stepCursorMotion(
+            manualPhysicsRef.current,
+            cmdVx,
+            cmdVy,
+            effectiveConfidence,
+            dt,
+          );
+          const { xSmooth, ySmooth } = manualPhysicsRef.current;
+          setCursorDisplay({ x: xSmooth, y: ySmooth });
+
+          let strengthVisual = 0;
+          if (Math.hypot(cmdVx, cmdVy) > 1e-6 && latestSpikeConfidenceRef.current != null) {
+            strengthVisual = latestSpikeConfidenceRef.current * spikePulseEnvelopeRef.current;
+          }
+          setSpikeStrength(strengthVisual);
+        } else {
+          manualVelocityRef.current = { vx: 0, vy: 0 };
+          setSpikeStrength(0);
+        }
       }
 
       frameId = requestAnimationFrame(loop);
@@ -527,9 +534,9 @@ function App() {
         mode === "manual" ? manualPenDownRef.current : (decoderDataRef.current?.pen_down ?? false);
       const penUpIdleSec = penDown ? 0 : (now - penUpSinceRef.current) / 1000;
 
-      let confidence = 0;
-      let velocityMag = 0;
-      let spike = 0;
+      let confidence: number;
+      let velocityMag: number;
+      let spike: number;
 
       if (mode === "manual") {
         const pad = manualTrackpadDriveRef.current;
@@ -591,8 +598,7 @@ function App() {
   };
 
   const manualDriving =
-    controlMode === "manual" &&
-    (manualPenDown || manualTrackpadDriveRef.current.active);
+    controlMode === "manual" && (manualPenDown || manualTrackpadActive);
   const metricsVx = manualDriving ? manualCmd.vx : (decoderData?.vx ?? 0);
   const metricsVy = manualDriving ? manualCmd.vy : (decoderData?.vy ?? 0);
   const metricsMoving = Math.hypot(metricsVx, metricsVy) > 1e-6;
