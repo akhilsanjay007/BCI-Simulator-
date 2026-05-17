@@ -1,73 +1,45 @@
-# React + TypeScript + Vite
+# Neuralink BCI dashboard (frontend)
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+React + TypeScript + Vite + Tailwind SPA for the **neuralink-bci-sim** backend: continuous handwriting on a square canvas, decoder metrics, neural spike raster, and thought-to-text output.
 
-Currently, two official plugins are available:
+## Scripts
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+| Command | Description |
+|---------|-------------|
+| `npm install` | Install dependencies (Node 20+) |
+| `npm run dev` | Dev server at [http://127.0.0.1:5173](http://127.0.0.1:5173) |
+| `npm run build` | Production bundle → `dist/` |
+| `npm run lint` | ESLint |
+| `npm run preview` | Serve `dist/` locally |
 
-## React Compiler
+## Backend URL
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+- **Development:** defaults to `http://localhost:8000` when `VITE_BACKEND_URL` is unset (`App.tsx`). Override in `frontend/.env`:
 
-## Expanding the ESLint configuration
+  ```env
+  VITE_BACKEND_URL=http://localhost:8000
+  ```
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+- **Production build:** `VITE_BACKEND_URL` is **required** (baked in at build time). Docker/Railway pass it as a build arg (see root `docker-compose.yml` and `frontend/Dockerfile`).
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+Start the API before the UI: `uvicorn app.main:app --port 8000` from the repo root.
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
+## UI overview
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+- **Center:** 1:1 handwriting canvas — Clear canvas, Recognize
+- **Left:** Decoder metrics + compact neural signal charts
+- **Right:** Current Letter + Full Text (accumulated sentence), Clear Text
+
+Recognition is demo-local until the backend recognizer endpoint is wired; **Recognize** still drives the two-panel text flow.
+
+## Docker
+
+Built from this directory:
+
+```bash
+docker build --build-arg VITE_BACKEND_URL=https://api.example.com -t bci-frontend .
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+Served on port **80** via nginx (`nginx.conf`).
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-```
+See the root [README.md](../README.md) for full-stack `docker compose` and Railway deployment.

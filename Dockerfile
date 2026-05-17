@@ -36,6 +36,22 @@ COPY --from=builder /wheels /wheels
 RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt \
     && rm -rf /wheels
 
+# Git LFS: materialize models/*.pkl inside the image (needs .git + .gitattributes in build context).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git git-lfs \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY .gitattributes ./
+COPY .git ./.git
+COPY models/ ./models/
+RUN git lfs install \
+    && git config --global --add safe.directory /app \
+    && git -C /app lfs pull \
+    && rm -rf /app/.git \
+    && apt-get update \
+    && apt-get purge -y --auto-remove git git-lfs \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY app/ ./app/
 
 USER app

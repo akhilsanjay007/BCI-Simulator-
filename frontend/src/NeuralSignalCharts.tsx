@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import type { ManualIntent } from "./cursorPhysics";
 
 /** Max rows shown in the UI raster (first N channels of the implant). */
 const MAX_DISPLAY_CHANNELS = 64;
@@ -15,24 +14,43 @@ const MANUAL_REST_P = 0.011;
 
 const ACCENT = "#34d399";
 const ACCENT_DIM = "rgba(52, 211, 153, 0.35)";
+const ACCENT_PEN = "rgba(110, 231, 183, 0.95)";
+const VEL_LINE = "#38bdf8";
+const VEL_LINE_DIM = "rgba(56, 189, 248, 0.45)";
 const BG = "#0a0a0a";
 const GRID = "rgba(64, 64, 64, 0.45)";
+/** Recent time window (ms) for stronger raster styling while pen is active. */
+const PEN_HIGHLIGHT_MS = 1700;
 
 export type ChartControlMode = "automatic" | "manual";
 
-/** Partitions the first N displayed channels into four groups (motor directions). */
-function intentBoostChannelIndices(intent: ManualIntent, numDisplayChannels: number): Set<number> {
+/** Channels whose preferred direction (ring layout) aligns with ``(vx, vy)`` — matches backend coding. */
+function velocityBoostChannelIndices(
+  vx: number,
+  vy: number,
+  numDisplayChannels: number,
+  ringChannels: number,
+): Set<number> {
   const cap = Math.max(0, Math.floor(numDisplayChannels));
-  if (cap === 0) return new Set();
-  const per = Math.max(1, Math.floor(cap / 4));
+  const cRing = Math.max(2, Math.floor(ringChannels));
+  const speed = Math.hypot(vx, vy);
+  if (cap === 0 || speed < 1e-6) return new Set();
+  const ux = vx / speed;
+  const uy = vy / speed;
+  const scored: { a: number; i: number }[] = [];
+  for (let ch = 0; ch < cap; ch++) {
+    const ang = (2 * Math.PI * ch) / cRing;
+    const ax = Math.cos(ang);
+    const ay = Math.sin(ang);
+    const align = ax * ux + ay * uy;
+    scored.push({ a: align, i: ch });
+  }
+  scored.sort((x, y) => y.a - x.a);
+  const k = Math.max(4, Math.ceil(cap * 0.28));
   const s = new Set<number>();
-  const addRange = (start: number) => {
-    for (let i = 0; i < per && start + i < cap; i++) s.add(start + i);
-  };
-  if (intent === "right") addRange(0);
-  else if (intent === "left") addRange(per);
-  else if (intent === "up") addRange(2 * per);
-  else if (intent === "down") addRange(3 * per);
+  for (let j = 0; j < Math.min(k, scored.length); j++) {
+    if (scored[j].a > 0.08) s.add(scored[j].i);
+  }
   return s;
 }
 
@@ -43,26 +61,35 @@ function clamp(n: number, lo: number, hi: number): number {
 export interface ManualNeuralBurstPayload {
   startMs: number;
   endMs: number;
-  intent: ManualIntent;
+  vx: number;
+  vy: number;
 }
 
 interface NeuralSignalChartsProps {
   controlMode: ChartControlMode;
-  /** Manual-only: cortical burst window from latest directional input. */
+  /** Manual-only: cortical burst window from latest velocity command. */
   manualBurst: ManualNeuralBurstPayload | null;
   /** Implant / decoder channel count (from WebSocket or default). */
   totalChannels: number;
+  /** Stylus / decoder contact — boosts recent raster + population activity. */
+  penDown: boolean;
+  /** Command velocity (manual pad or decoder), for movement trace. */
+  vx: number;
+  vy: number;
   /** Tighter layout and shorter canvases for dashboard embedding (≤400px block height). */
   compact?: boolean;
 }
 
-function buildColumnAutomatic(nowSec: number, nCh: number): boolean[] {
+function buildColumnAutomatic(nowSec: number, nCh: number, penDown: boolean): boolean[] {
   return Array.from({ length: nCh }, (_, ch) => {
-    const r = Math.min(
+    let r = Math.min(
       0.1,
       0.016 +
         0.045 * (0.5 + 0.5 * Math.sin(nowSec * 1.05 + ch * 0.37 + Math.sin(nowSec * 0.3))),
     );
+    if (penDown) {
+      r = Math.min(0.16, r + 0.055 + 0.02 * Math.sin(nowSec * 6 + ch * 0.2));
+    }
     return Math.random() < r;
   });
 }
@@ -71,14 +98,17 @@ function buildColumnManual(
   nowMs: number,
   burst: ManualNeuralBurstPayload | null,
   nCh: number,
+  ringChannels: number,
+  penDown: boolean,
 ): boolean[] {
   let envelope = 0;
   let boosted = new Set<number>();
-  if (burst && nowMs < burst.endMs && burst.intent !== "rest") {
+  const burstSpeed = burst ? Math.hypot(burst.vx, burst.vy) : 0;
+  if (burst && nowMs < burst.endMs && burstSpeed > 1e-6) {
     const elapsed = nowMs - burst.startMs;
     const dur = Math.max(1, burst.endMs - burst.startMs);
     envelope = Math.max(0, Math.pow(1 - Math.min(1, elapsed / dur), 1.35));
-    boosted = intentBoostChannelIndices(burst.intent, nCh);
+    boosted = velocityBoostChannelIndices(burst.vx, burst.vy, nCh, ringChannels);
   }
 
   return Array.from({ length: nCh }, (_, ch) => {
@@ -92,6 +122,9 @@ function buildColumnManual(
       } else {
         p += envelope * 0.024;
       }
+    }
+    if (penDown) {
+      p += 0.022 + (boosted.has(ch) ? 0.035 : 0.01) * (0.55 + 0.45 * Math.sin(nowMs / 140));
     }
     p = Math.min(0.88, p);
     return Math.random() < p;
@@ -118,12 +151,15 @@ function computeRasterCanvasHeight(nCh: number, compact: boolean): number {
 
 /**
  * Educational demo: synthetic multi-channel spike trains + population firing rate.
- * Manual mode: sparse rest + short intent-aligned bursts. Automatic: original roaming rates.
+ * Manual mode: sparse rest + short velocity-aligned bursts. Automatic: original roaming rates.
  */
 export function NeuralSignalCharts({
   controlMode,
   manualBurst,
   totalChannels,
+  penDown,
+  vx,
+  vy,
   compact = false,
 }: NeuralSignalChartsProps) {
   const total = Number.isFinite(totalChannels) && totalChannels >= 1 ? Math.floor(totalChannels) : 32;
@@ -137,12 +173,32 @@ export function NeuralSignalCharts({
 
   /** Columns left→right = past→present; each column is boolean[displayCount]. */
   const columnsRef = useRef<boolean[][]>([]);
+  /** Per-column pen contact (aligned with columnsRef indices). */
+  const penByColRef = useRef<boolean[]>(Array.from({ length: NUM_COLS }, () => false));
+  /** Per-column velocity magnitude |v| when the column was recorded. */
+  const velByColRef = useRef<number[]>(Array.from({ length: NUM_COLS }, () => 0));
   const lastStepRef = useRef(0);
 
-  const propsRef = useRef({ controlMode, manualBurst, displayCount });
+  const propsRef = useRef({
+    controlMode,
+    manualBurst,
+    displayCount,
+    totalChannels: total,
+    penDown,
+    vx,
+    vy,
+  });
   useLayoutEffect(() => {
-    propsRef.current = { controlMode, manualBurst, displayCount };
-  }, [controlMode, manualBurst, displayCount]);
+    propsRef.current = {
+      controlMode,
+      manualBurst,
+      displayCount,
+      totalChannels: total,
+      penDown,
+      vx,
+      vy,
+    };
+  }, [controlMode, manualBurst, displayCount, total, penDown, vx, vy]);
 
   const displayCountRef = useRef(displayCount);
   useLayoutEffect(() => {
@@ -161,6 +217,8 @@ export function NeuralSignalCharts({
       cols.push(Array.from({ length: nCh }, () => Math.random() < 0.025));
     }
     columnsRef.current = cols;
+    penByColRef.current = Array.from({ length: NUM_COLS }, () => false);
+    velByColRef.current = Array.from({ length: NUM_COLS }, () => 0);
   }, []);
 
   useEffect(() => {
@@ -211,19 +269,28 @@ export function NeuralSignalCharts({
         ctx.stroke();
       }
 
-      ctx.strokeStyle = ACCENT;
-      ctx.lineWidth = 1.25;
+      const penHist = penByColRef.current;
+      const highlightCols = Math.min(NUM_COLS, Math.max(1, Math.ceil(PEN_HIGHLIGHT_MS / BIN_MS)));
+
       for (let t = 0; t < NUM_COLS; t++) {
         const x = padL + t * colW + colW * 0.5;
+        const recent = t >= NUM_COLS - highlightCols;
+        const penOn = penHist[t] === true;
+        const emphasize = penOn && recent;
+        const tick = emphasize ? Math.min(tickHalf * 1.45, rowH * 0.42) : tickHalf;
+        ctx.strokeStyle = emphasize ? ACCENT_PEN : ACCENT;
+        ctx.lineWidth = emphasize ? 2.1 : 1.25;
+        ctx.globalAlpha = emphasize ? 1 : 0.92;
         for (let ch = 0; ch < nCh; ch++) {
           if (!cols[t]?.[ch]) continue;
           const yMid = padT + ch * rowH + rowH * 0.5;
           ctx.beginPath();
-          ctx.moveTo(x, yMid - tickHalf);
-          ctx.lineTo(x, yMid + tickHalf);
+          ctx.moveTo(x, yMid - tick);
+          ctx.lineTo(x, yMid + tick);
           ctx.stroke();
         }
       }
+      ctx.globalAlpha = 1;
 
       ctx.fillStyle = "rgba(163,163,163,0.9)";
       ctx.font = "10px ui-monospace, monospace";
@@ -238,10 +305,11 @@ export function NeuralSignalCharts({
 
   const drawRate = useCallback((ctx: CanvasRenderingContext2D, w: number, h: number, nCh: number) => {
     const cols = columnsRef.current;
+    const velHist = velByColRef.current;
     const padL = 52;
     const padR = 12;
     const padT = 10;
-    const padB = 28;
+    const padB = compact ? 38 : 36;
     const plotW = w - padL - padR;
     const plotH = h - padT - padB;
 
@@ -255,8 +323,31 @@ export function NeuralSignalCharts({
       rates.push(hz);
     }
 
-    let peak = 8;
-    for (const r of rates) peak = Math.max(peak, r * 1.15);
+    const penLive = propsRef.current.penDown;
+    const velAlpha = penLive ? 0.52 : 0.28;
+    const velSmooth: number[] = [];
+    let ve = velHist[0] ?? 0;
+    for (let t = 0; t < NUM_COLS; t++) {
+      ve = velAlpha * (velHist[t] ?? 0) + (1 - velAlpha) * ve;
+      velSmooth.push(ve);
+    }
+
+    /** Map |v| into same vertical space as population Hz (demo scale). */
+    const VEL_TO_HZ = 11;
+    const velAsHz = velSmooth.map((v) => v * VEL_TO_HZ);
+
+    const smooth: number[] = [];
+    let ema = rates[0] ?? 0;
+    const rateAlpha = penLive ? 0.32 : 0.18;
+    for (let t = 0; t < NUM_COLS; t++) {
+      ema = rateAlpha * rates[t] + (1 - rateAlpha) * ema;
+      smooth.push(ema);
+    }
+
+    let peak = 7;
+    for (const r of smooth) peak = Math.max(peak, r * 1.12);
+    for (const v of velAsHz) peak = Math.max(peak, v * 1.08);
+    peak = Math.max(peak, 4);
 
     ctx.fillStyle = BG;
     ctx.fillRect(0, 0, w, h);
@@ -275,26 +366,37 @@ export function NeuralSignalCharts({
       ctx.fillText(`${hzLabel} Hz`, 8, y + 3);
     }
 
-    ctx.strokeStyle = ACCENT_DIM;
+    ctx.strokeStyle = VEL_LINE_DIM;
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 4]);
     ctx.beginPath();
     for (let t = 0; t < NUM_COLS; t++) {
       const x = padL + (t / (NUM_COLS - 1)) * plotW;
-      const y = padT + plotH - (rates[t] / peak) * plotH;
+      const y = padT + plotH - (velAsHz[t] / peak) * plotH;
       if (t === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
     }
     ctx.stroke();
+    ctx.setLineDash([]);
 
-    const smooth: number[] = [];
-    let ema = rates[0] ?? 0;
-    const alpha = 0.18;
+    ctx.strokeStyle = VEL_LINE;
+    ctx.lineWidth = penLive ? 2.1 : 1.65;
+    ctx.shadowColor = "rgba(56, 189, 248, 0.35)";
+    ctx.shadowBlur = penLive ? 8 : 4;
+    ctx.beginPath();
     for (let t = 0; t < NUM_COLS; t++) {
-      ema = alpha * rates[t] + (1 - alpha) * ema;
-      smooth.push(ema);
+      const x = padL + (t / (NUM_COLS - 1)) * plotW;
+      const y = padT + plotH - (velAsHz[t] / peak) * plotH;
+      if (t === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
     }
+    ctx.stroke();
+    ctx.shadowBlur = 0;
 
     ctx.strokeStyle = ACCENT;
-    ctx.lineWidth = 2;
+    ctx.lineWidth = penLive ? 2.35 : 2;
+    ctx.shadowColor = "rgba(52, 211, 153, 0.25)";
+    ctx.shadowBlur = penLive ? 6 : 3;
     ctx.beginPath();
     for (let t = 0; t < NUM_COLS; t++) {
       const x = padL + (t / (NUM_COLS - 1)) * plotW;
@@ -303,11 +405,22 @@ export function NeuralSignalCharts({
       else ctx.lineTo(x, y);
     }
     ctx.stroke();
+    ctx.shadowBlur = 0;
 
-    ctx.fillStyle = "rgba(163,163,163,0.9)";
-    ctx.font = "10px ui-monospace, monospace";
-    ctx.fillText("Mean firing rate across channels (smoothed)", padL, h - 10);
-  }, []);
+    const legY = h - (compact ? 10 : 12);
+    const legX = padL;
+    ctx.font = compact ? "8px ui-monospace, monospace" : "9px ui-monospace, monospace";
+    ctx.fillStyle = ACCENT;
+    ctx.fillRect(legX, legY - 6, 10, 3);
+    ctx.fillStyle = "rgba(180, 190, 185, 0.92)";
+    ctx.fillText(compact ? "Firing (Hz)" : "Mean firing (Hz · smoothed)", legX + 14, legY);
+
+    const leg2 = legX + (compact ? 108 : 200);
+    ctx.fillStyle = VEL_LINE;
+    ctx.fillRect(leg2, legY - 6, 10, 3);
+    ctx.fillStyle = "rgba(180, 200, 215, 0.92)";
+    ctx.fillText(compact ? "|v| scaled" : "|v| movement (scaled)", leg2 + 14, legY);
+  }, [compact]);
 
   const resizeAndDraw = useCallback(() => {
     const wrap = wrapRef.current;
@@ -327,7 +440,7 @@ export function NeuralSignalCharts({
         rasterH = h;
       }
     }
-    const rateH = compact ? 84 : 120;
+    const rateH = compact ? 96 : 120;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
 
     const setup = (canvas: HTMLCanvasElement, h: number) => {
@@ -366,14 +479,19 @@ export function NeuralSignalCharts({
     const step = (now: number) => {
       if (now - lastStepRef.current >= STEP_MS) {
         lastStepRef.current = now;
-        const { controlMode: mode, manualBurst: burst, displayCount: n } = propsRef.current;
+        const { controlMode: mode, manualBurst: burst, displayCount: n, totalChannels: t, penDown: pd, vx, vy } =
+          propsRef.current;
         const cols = columnsRef.current;
         const col =
           mode === "manual"
-            ? buildColumnManual(Date.now(), burst, n)
-            : buildColumnAutomatic(now / 1000, n);
+            ? buildColumnManual(Date.now(), burst, n, t, pd)
+            : buildColumnAutomatic(now / 1000, n, pd);
         cols.push(col);
         cols.shift();
+        penByColRef.current.push(pd);
+        penByColRef.current.shift();
+        velByColRef.current.push(Math.hypot(vx, vy));
+        velByColRef.current.shift();
 
         resizeAndDraw();
       }
@@ -382,6 +500,10 @@ export function NeuralSignalCharts({
     raf = requestAnimationFrame(step);
     return () => cancelAnimationFrame(raf);
   }, [resizeAndDraw]);
+
+  useLayoutEffect(() => {
+    resizeAndDraw();
+  }, [penDown, resizeAndDraw]);
 
   const onRasterMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = rasterRef.current;
@@ -447,8 +569,8 @@ export function NeuralSignalCharts({
             <p className="mt-2 text-[11px] font-mono text-neutral-500">{channelSummary}</p>
             {controlMode === "manual" && (
               <p className="mt-3 text-xs text-amber-500/85 font-mono leading-relaxed max-w-3xl">
-                Manual mode: low-rate “rest” baseline · each directional input triggers a ~300–600 ms burst on
-                matching channel groups (like motor cortical patches), then fades back.
+                Manual mode: low-rate “rest” baseline · each velocity command triggers a ~300–600 ms burst on
+                ring-aligned channel subsets (population coding), then fades back.
               </p>
             )}
           </>
@@ -458,7 +580,7 @@ export function NeuralSignalCharts({
             {channelSummary}
             <span className="text-neutral-600">
               {" "}
-              · raster + rate{controlMode === "manual" ? " · manual overlay" : ""}
+              · raster + neural activity{controlMode === "manual" ? " · manual overlay" : ""}
             </span>
           </p>
         )}
@@ -491,15 +613,23 @@ export function NeuralSignalCharts({
         </div>
 
         <div className={compact ? "min-h-0 shrink-0 pt-0.5" : ""}>
-          <h3 className={`font-medium text-neutral-300 ${compact ? "text-[10px] mb-0.5 text-neutral-500" : "text-sm mb-2"}`}>
-            Average firing rate
+          <h3
+            className={`font-medium text-neutral-300 ${
+              compact ? "text-[10px] mb-0.5 text-neutral-400 uppercase tracking-wider" : "text-sm mb-2"
+            }`}
+          >
+            Neural activity vs movement
           </h3>
           <div className="relative rounded-lg border border-neutral-800 overflow-hidden bg-black">
-            <canvas ref={rateRef} className="block w-full" aria-label="Mean firing rate across channels" />
+            <canvas
+              ref={rateRef}
+              className="block w-full"
+              aria-label="Neural activity and velocity magnitude"
+            />
           </div>
           {!compact && (
             <p className="mt-2 text-xs text-neutral-500 font-mono">
-              Thin trace = instant rate · Bold = exponentially smoothed (easier to read).
+              Emerald = population mean firing (smoothed). Cyan = command speed |v| on a matched scale while drawing.
             </p>
           )}
         </div>

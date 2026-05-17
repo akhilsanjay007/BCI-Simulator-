@@ -9,6 +9,7 @@ services:
     ports:
       - "8000:8000"
     environment:
+      ENV: development
       # Async Redis client (Streams buffering). Overridable for prod.
       REDIS_URL: redis://redis:6379/0
       REDIS_STREAM_SIGNALS: bci:signals

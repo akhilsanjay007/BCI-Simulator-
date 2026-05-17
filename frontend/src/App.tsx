@@ -2,10 +2,19 @@ import { useState, useEffect, useLayoutEffect, useRef, useCallback } from "react
 import {
   stepCursorMotion,
   seedCursorMotion,
+  MANUAL_CONTROL_CONFIDENCE,
   type CursorMotionState,
-  type ManualIntent,
 } from "./cursorPhysics";
+import { BCITrackpad, type BCITrackpadHandle } from "./BCITrackpad";
+import { idleManualTrackpadDrive, type ManualTrackpadDrive } from "./manualTrackpad";
 import { NeuralSignalCharts, type ManualNeuralBurstPayload } from "./NeuralSignalCharts";
+import {
+  computeInstantSignalQuality,
+  signalTierFromPct,
+  signalTierStyles,
+  stepSignalSmooth,
+  type SignalQualityInput,
+} from "./signalQuality";
 
 function resolveBackendUrl(): string {
   const configured = (import.meta.env.VITE_BACKEND_URL as string | undefined)?.trim();
@@ -33,45 +42,82 @@ const BACKEND_ENDPOINTS = {
   manualNeuralBurst: `${BACKEND_HTTP_ORIGIN}/manual-neural-burst`,
   simulatorConfig: `${BACKEND_HTTP_ORIGIN}/simulator/config`,
   decoderReset: `${BACKEND_HTTP_ORIGIN}/decoder/reset`,
-  bciStreamWs: `${BACKEND_WS_ORIGIN}/ws/bci-stream`,
+  decoderMode: `${BACKEND_HTTP_ORIGIN}/decoder/mode`,
   decoderWs: `${BACKEND_WS_ORIGIN}/ws/decoder`,
 } as const;
 
+/** Shown in the current-letter slot before any recognition this session. */
+const CURRENT_LETTER_IDLE = "—";
+/** Hint when the accumulated sentence is empty. */
+const FULL_TEXT_PLACEHOLDER = "Your sentence builds here, letter by letter…";
+
 interface DecoderPacket {
   timestamp_ms: number;
-  predicted_intent: "left" | "right" | "up" | "down" | "rest";
+  vx: number;
+  vy: number;
+  pen_down: boolean;
   confidence: number;
+  mode: "cursor" | "handwriting";
   latency_ms: number;
-  /** Rolling accuracy, last 20 predictions */
   accuracy: number;
-  /** Session accuracy since connect or last reset */
   session_accuracy: number;
-  /** Normalized [0,1] from server-integrated 2D cursor */
   cursor_x?: number;
   cursor_y?: number;
-  /** Implant / decoder channel count (simulator config) */
   num_channels?: number;
 }
 
-/** Interpolation between WebSocket samples (~20 ms); server applies velocity + EMA smoothing. */
-const CURSOR_CSS_TRANSITION_MS = 280;
+interface DecoderResetEvent {
+  type: "decoder_reset";
+  timestamp_ms: number;
+  cursor_x: number;
+  cursor_y: number;
+  num_channels: number;
+}
+
+function isDecoderResetEvent(data: unknown): data is DecoderResetEvent {
+  return (
+    typeof data === "object" &&
+    data !== null &&
+    (data as { type?: string }).type === "decoder_reset"
+  );
+}
+
+function formatDecoderVelocity(vx: number, vy: number): string {
+  const mag = Math.hypot(vx, vy);
+  return `vx ${vx >= 0 ? "+" : ""}${vx.toFixed(2)} · vy ${vy >= 0 ? "+" : ""}${vy.toFixed(2)} · |v| ${mag.toFixed(2)}`;
+}
+
+function velocityHueClass(vx: number, vy: number): string {
+  const mag = Math.hypot(vx, vy);
+  if (mag < 0.06) return "text-cyan-400/90";
+  const ang = (Math.atan2(vy, vx) * 180) / Math.PI;
+  if (ang >= -45 && ang < 45) return "text-red-400";
+  if (ang >= 45 && ang < 135) return "text-yellow-400";
+  if (ang >= -135 && ang < -45) return "text-green-400";
+  return "text-blue-400";
+}
 
 type ControlMode = "automatic" | "manual";
 
-const DIR_ORDER: ManualIntent[] = ["left", "right", "up", "down"];
+type DirectionKey = "left" | "right" | "up" | "down";
 
-const KEY_TO_DIR: Record<string, ManualIntent> = {
+const KEY_TO_DIR: Record<string, DirectionKey> = {
   ArrowLeft: "left",
   ArrowRight: "right",
   ArrowUp: "up",
   ArrowDown: "down",
 };
 
-function pickHeldDirection(held: Set<ManualIntent>): ManualIntent {
-  for (const d of DIR_ORDER) {
-    if (held.has(d)) return d;
-  }
-  return "rest";
+function netVelocityFromHeld(held: Set<DirectionKey>): { vx: number; vy: number } {
+  let vx = 0;
+  let vy = 0;
+  if (held.has("left")) vx -= 1;
+  if (held.has("right")) vx += 1;
+  if (held.has("up")) vy -= 1;
+  if (held.has("down")) vy += 1;
+  const n = Math.hypot(vx, vy);
+  if (n < 1e-6) return { vx: 0, vy: 0 };
+  return { vx: vx / n, vy: vy / n };
 }
 
 function formatSessionClock(totalSeconds: number): string {
@@ -84,10 +130,8 @@ function formatSessionClock(totalSeconds: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-/** Random synaptic weight per discrete manual input (direction key / pad press). */
 const SPIKE_CONFIDENCE_MIN = 0.75;
 const SPIKE_CONFIDENCE_MAX = 0.99;
-/** Exponential decay of the velocity boost envelope (1 → 0) after each spike. */
 const SPIKE_PULSE_DECAY_PER_S = 5.4;
 
 function sampleSpikeConfidence(): number {
@@ -96,93 +140,196 @@ function sampleSpikeConfidence(): number {
 
 function App() {
   const [status, setStatus] = useState<"connected" | "disconnected">("disconnected");
-  /** Total channels from decoder WebSocket (simulator/implant). */
   const [totalChannels, setTotalChannels] = useState(32);
   const [decoderData, setDecoderData] = useState<DecoderPacket | null>(null);
   const [cursorDisplay, setCursorDisplay] = useState({ x: 0.5, y: 0.5 });
   const [controlMode, setControlMode] = useState<ControlMode>("manual");
-  const [manualIntentLabel, setManualIntentLabel] = useState<ManualIntent>("rest");
-  /** Wall-clock session length for Manual metrics (seconds since load). */
+  const [manualVelocityLabel, setManualVelocityLabel] = useState("rest");
+  const [manualCmd, setManualCmd] = useState({ vx: 0, vy: 0 });
   const [sessionElapsedSec, setSessionElapsedSec] = useState(0);
-  /** Confidence sampled on the latest directional input (null after Rest / no spike yet). */
-  const [latestSpikeCommandConfidence, setLatestSpikeCommandConfidence] = useState<number | null>(null);
-  /** Instantaneous spike envelope × confidence for visuals (updated each animation frame). */
+  const [latestSpikeCommandConfidence, setLatestSpikeCommandConfidence] = useState<number | null>(
+    null,
+  );
   const [spikeStrength, setSpikeStrength] = useState(0);
-  /** Manual neural charts: cortical burst window aligned with directional input. */
   const [manualNeuralBurst, setManualNeuralBurst] = useState<ManualNeuralBurstPayload | null>(null);
+  const [manualPenDown, setManualPenDown] = useState(false);
+  const [manualTrackpadActive, setManualTrackpadActive] = useState(false);
+  const [currentLetter, setCurrentLetter] = useState<string | null>(null);
+  const [fullText, setFullText] = useState("");
+  const [recognizeError, setRecognizeError] = useState<string | null>(null);
+  const [signalPct, setSignalPct] = useState(0);
 
   const wsRef = useRef<WebSocket | null>(null);
+  const trackpadRef = useRef<BCITrackpadHandle | null>(null);
   const controlModeRef = useRef<ControlMode>("manual");
   const cursorDisplayRef = useRef(cursorDisplay);
-  const manualIntentRef = useRef<ManualIntent>("rest");
+  const decoderDataRef = useRef<DecoderPacket | null>(null);
+  const manualPenDownRef = useRef(false);
+  const manualVelocityRef = useRef({ vx: 0, vy: 0 });
   const manualPhysicsRef = useRef<CursorMotionState>(seedCursorMotion(0.5, 0.5));
-  /** Directions currently held via keyboard or on-screen buttons (not rest). */
-  const manualDirectionsHeldRef = useRef<Set<ManualIntent>>(new Set());
-  /** Confidence drawn for the current directional spike burst (drives physics + UI number). */
+  const manualDirectionsHeldRef = useRef<Set<DirectionKey>>(new Set());
+  const manualTrackpadDriveRef = useRef<ManualTrackpadDrive>(idleManualTrackpadDrive());
+  const lastManualPadSpeedRef = useRef(0);
+  const lastSpikeFireAtRef = useRef(0);
   const latestSpikeConfidenceRef = useRef<number | null>(null);
-  /** 1 = fresh spike, decays toward 0 — multiplies confidence for a brief velocity boost. */
   const spikePulseEnvelopeRef = useRef(0);
+  const signalSmoothRef = useRef(0);
+  const penUpSinceRef = useRef(0);
+  const spikeStrengthRef = useRef(0);
+
+  useEffect(() => {
+    penUpSinceRef.current = performance.now();
+  }, []);
 
   useLayoutEffect(() => {
     controlModeRef.current = controlMode;
     cursorDisplayRef.current = cursorDisplay;
-  }, [controlMode, cursorDisplay]);
+    decoderDataRef.current = decoderData;
+    manualPenDownRef.current = manualPenDown;
+    spikeStrengthRef.current = spikeStrength;
+  }, [controlMode, cursorDisplay, decoderData, manualPenDown, spikeStrength]);
 
-  const syncManualIntentFromHeld = useCallback(() => {
-    const intent = pickHeldDirection(manualDirectionsHeldRef.current);
-    manualIntentRef.current = intent;
-    setManualIntentLabel(intent);
+  const handleRecognizeLetter = useCallback((letter: string) => {
+    setRecognizeError(null);
+    setCurrentLetter(letter);
+    setFullText((prev) => prev + letter);
   }, []);
 
-  const fireManualDirectionSpike = useCallback((intentDir: ManualIntent) => {
+  const handleRecognizeError = useCallback((message: string) => {
+    setRecognizeError(message);
+  }, []);
+
+  const handleCanvasCleared = useCallback(() => {
+    setCurrentLetter(null);
+    setRecognizeError(null);
+  }, []);
+
+  const handleClearText = useCallback(() => {
+    setFullText("");
+  }, []);
+
+  const syncManualVelocityFromHeld = useCallback(() => {
+    const v = netVelocityFromHeld(manualDirectionsHeldRef.current);
+    manualVelocityRef.current = v;
+    const n = Math.hypot(v.vx, v.vy);
+    setManualCmd(v);
+    setManualVelocityLabel(n < 1e-6 ? "rest" : formatDecoderVelocity(v.vx, v.vy));
+  }, []);
+
+  const fireManualVelocitySpike = useCallback((vx: number, vy: number) => {
     const c = sampleSpikeConfidence();
     latestSpikeConfidenceRef.current = c;
     spikePulseEnvelopeRef.current = 1;
     setLatestSpikeCommandConfidence(c);
     const duration = 300 + Math.random() * 300;
     const start = Date.now();
-    setManualNeuralBurst({ startMs: start, endMs: start + duration, intent: intentDir });
+    setManualNeuralBurst({ startMs: start, endMs: start + duration, vx, vy });
     void fetch(BACKEND_ENDPOINTS.manualNeuralBurst, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ intent: intentDir, duration_ms: duration }),
+      body: JSON.stringify({ vx, vy, duration_ms: duration }),
     }).catch(() => {});
   }, []);
 
   const applyManualDirectionDown = useCallback(
-    (dir: ManualIntent) => {
-      if (dir === "rest") return;
-      fireManualDirectionSpike(dir);
+    (dir: DirectionKey) => {
       manualDirectionsHeldRef.current.add(dir);
-      syncManualIntentFromHeld();
+      syncManualVelocityFromHeld();
+      const v = netVelocityFromHeld(manualDirectionsHeldRef.current);
+      if (Math.hypot(v.vx, v.vy) > 1e-6) {
+        fireManualVelocitySpike(v.vx, v.vy);
+      }
     },
-    [syncManualIntentFromHeld, fireManualDirectionSpike],
+    [syncManualVelocityFromHeld, fireManualVelocitySpike],
   );
 
   const applyManualDirectionUp = useCallback(
-    (dir: ManualIntent) => {
-      if (dir === "rest") return;
+    (dir: DirectionKey) => {
       manualDirectionsHeldRef.current.delete(dir);
-      syncManualIntentFromHeld();
+      syncManualVelocityFromHeld();
     },
-    [syncManualIntentFromHeld],
+    [syncManualVelocityFromHeld],
   );
 
   const applyManualRest = useCallback(() => {
     manualDirectionsHeldRef.current.clear();
-    manualIntentRef.current = "rest";
-    setManualIntentLabel("rest");
+    manualVelocityRef.current = { vx: 0, vy: 0 };
+    manualTrackpadDriveRef.current = idleManualTrackpadDrive();
+    setManualCmd({ vx: 0, vy: 0 });
+    setManualVelocityLabel("rest");
+    setManualPenDown(false);
+    setManualTrackpadActive(false);
     latestSpikeConfidenceRef.current = null;
     spikePulseEnvelopeRef.current = 0;
     setLatestSpikeCommandConfidence(null);
     setSpikeStrength(0);
     setManualNeuralBurst(null);
+    lastManualPadSpeedRef.current = 0;
   }, []);
 
-  /**
-   * Switches control mode and updates the ref synchronously so WebSocket handlers
-   * cannot apply decoder cursor/metrics in the gap before React re-renders.
-   */
+  const absorbManualTrackpadFrame = useCallback(
+    (pad: ManualTrackpadDrive, now: number) => {
+      setManualTrackpadActive((prev) => (prev === pad.active ? prev : pad.active));
+
+      if (!pad.active) {
+        manualVelocityRef.current = { vx: 0, vy: 0 };
+        setManualCmd({ vx: 0, vy: 0 });
+        setManualPenDown(false);
+        setManualVelocityLabel("rest");
+        lastManualPadSpeedRef.current = 0;
+        return;
+      }
+
+      manualVelocityRef.current = { vx: pad.vx, vy: pad.vy };
+      setManualCmd({ vx: pad.vx, vy: pad.vy });
+      setManualPenDown(pad.penDown);
+
+      const n = Math.hypot(pad.vx, pad.vy);
+      setManualVelocityLabel(n < 1e-6 ? "rest" : formatDecoderVelocity(pad.vx, pad.vy));
+
+      manualPhysicsRef.current = {
+        ...manualPhysicsRef.current,
+        xRaw: pad.nx,
+        yRaw: pad.ny,
+        xSmooth: pad.nx,
+        ySmooth: pad.ny,
+      };
+      setCursorDisplay({ x: pad.nx, y: pad.ny });
+
+      const crossed = n > 0.14 && lastManualPadSpeedRef.current <= 0.14;
+      const cooled = now - lastSpikeFireAtRef.current > 420;
+      if (n > 0.14 && (crossed || cooled)) {
+        fireManualVelocitySpike(pad.vx, pad.vy);
+        lastSpikeFireAtRef.current = now;
+      }
+      lastManualPadSpeedRef.current = n;
+    },
+    [fireManualVelocitySpike],
+  );
+
+  const applyDecoderReset = useCallback(
+    (event: DecoderResetEvent) => {
+      const cx = event.cursor_x ?? 0.5;
+      const cy = event.cursor_y ?? 0.5;
+      if (typeof event.num_channels === "number" && event.num_channels >= 1) {
+        setTotalChannels(Math.floor(event.num_channels));
+      }
+      setDecoderData(null);
+      manualPhysicsRef.current = seedCursorMotion(cx, cy);
+      setCursorDisplay({ x: cx, y: cy });
+      applyManualRest();
+      manualTrackpadDriveRef.current = idleManualTrackpadDrive();
+      trackpadRef.current?.clearCanvas();
+      setCurrentLetter(null);
+      setFullText("");
+      setRecognizeError(null);
+      signalSmoothRef.current = 0;
+      setSignalPct(0);
+      penUpSinceRef.current = performance.now();
+    },
+    [applyManualRest],
+  );
+
   const selectControlMode = useCallback((mode: ControlMode) => {
     controlModeRef.current = mode;
     setControlMode(mode);
@@ -196,7 +343,14 @@ function App() {
     setManualNeuralBurst(null);
   }, []);
 
-  // Match simulator channel count before / between WebSocket frames (same source as `num_channels` in packets).
+  useEffect(() => {
+    void fetch(BACKEND_ENDPOINTS.decoderMode, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: "handwriting" }),
+    }).catch(() => {});
+  }, []);
+
   useEffect(() => {
     void fetch(BACKEND_ENDPOINTS.simulatorConfig)
       .then((r) => (r.ok ? r.json() : null))
@@ -219,11 +373,15 @@ function App() {
 
     ws.onmessage = (event) => {
       try {
-        const data: DecoderPacket = JSON.parse(event.data);
+        const raw: unknown = JSON.parse(event.data);
+        if (isDecoderResetEvent(raw)) {
+          applyDecoderReset(raw);
+          return;
+        }
+        const data = raw as DecoderPacket;
         if (typeof data.num_channels === "number" && data.num_channels >= 1) {
           setTotalChannels(Math.floor(data.num_channels));
         }
-        // Apply decoder packets only in Automatic mode so Manual stays free of model metrics/state.
         if (controlModeRef.current !== "automatic") {
           return;
         }
@@ -250,9 +408,8 @@ function App() {
     return () => {
       ws.close();
     };
-  }, []);
+  }, [applyDecoderReset]);
 
-  // Session clock for Manual metrics panel (elapsed since page load).
   useEffect(() => {
     const id = window.setInterval(() => {
       setSessionElapsedSec((s) => s + 1);
@@ -260,7 +417,6 @@ function App() {
     return () => window.clearInterval(id);
   }, []);
 
-  // When entering Manual mode, seed local physics from the current cursor so motion stays continuous.
   useEffect(() => {
     if (controlMode === "manual") {
       const { x, y } = cursorDisplayRef.current;
@@ -268,7 +424,6 @@ function App() {
     }
   }, [controlMode]);
 
-  // Manual mode: same velocity + EMA integration as the decoder, stepped each animation frame.
   useEffect(() => {
     if (controlMode !== "manual") return;
 
@@ -284,35 +439,48 @@ function App() {
         spikePulseEnvelopeRef.current = 0;
       }
 
-      const intent = manualIntentRef.current;
-      let effectiveConfidence = 0;
-      if (intent !== "rest" && latestSpikeConfidenceRef.current != null) {
-        effectiveConfidence = latestSpikeConfidenceRef.current * spikePulseEnvelopeRef.current;
-      }
+      const pad = manualTrackpadDriveRef.current;
+      const keysHeld = manualDirectionsHeldRef.current.size > 0;
 
-      manualPhysicsRef.current = stepCursorMotion(
-        manualPhysicsRef.current,
-        intent,
-        effectiveConfidence,
-        dt,
-      );
-      const { xSmooth, ySmooth } = manualPhysicsRef.current;
-      setCursorDisplay({ x: xSmooth, y: ySmooth });
+      if (pad.active) {
+        absorbManualTrackpadFrame(pad, now);
+      } else {
+        setManualTrackpadActive((prev) => (prev ? false : prev));
+        if (keysHeld) {
+          const { vx: cmdVx, vy: cmdVy } = manualVelocityRef.current;
+          let effectiveConfidence = 0;
+          if (Math.hypot(cmdVx, cmdVy) > 1e-6 && latestSpikeConfidenceRef.current != null) {
+            effectiveConfidence = latestSpikeConfidenceRef.current * spikePulseEnvelopeRef.current;
+          }
 
-      let strengthVisual = 0;
-      if (intent !== "rest" && latestSpikeConfidenceRef.current != null) {
-        strengthVisual = latestSpikeConfidenceRef.current * spikePulseEnvelopeRef.current;
+          manualPhysicsRef.current = stepCursorMotion(
+            manualPhysicsRef.current,
+            cmdVx,
+            cmdVy,
+            effectiveConfidence,
+            dt,
+          );
+          const { xSmooth, ySmooth } = manualPhysicsRef.current;
+          setCursorDisplay({ x: xSmooth, y: ySmooth });
+
+          let strengthVisual = 0;
+          if (Math.hypot(cmdVx, cmdVy) > 1e-6 && latestSpikeConfidenceRef.current != null) {
+            strengthVisual = latestSpikeConfidenceRef.current * spikePulseEnvelopeRef.current;
+          }
+          setSpikeStrength(strengthVisual);
+        } else {
+          manualVelocityRef.current = { vx: 0, vy: 0 };
+          setSpikeStrength(0);
+        }
       }
-      setSpikeStrength(strengthVisual);
 
       frameId = requestAnimationFrame(loop);
     };
 
     frameId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(frameId);
-  }, [controlMode]);
+  }, [controlMode, absorbManualTrackpadFrame]);
 
-  // Keyboard: arrows + Space (rest). Only active in Manual mode.
   useEffect(() => {
     if (controlMode !== "manual") return;
 
@@ -344,64 +512,133 @@ function App() {
     };
   }, [controlMode, applyManualDirectionDown, applyManualDirectionUp, applyManualRest]);
 
+  const metricsPenDown =
+    controlMode === "manual" ? manualPenDown : (decoderData?.pen_down ?? false);
+
+  useEffect(() => {
+    if (!metricsPenDown) {
+      penUpSinceRef.current = performance.now();
+    }
+  }, [metricsPenDown]);
+
+  useEffect(() => {
+    let frameId = 0;
+    let last = performance.now();
+
+    const loop = (now: number) => {
+      const dt = Math.min((now - last) / 1000, 0.064);
+      last = now;
+
+      const mode = controlModeRef.current;
+      const penDown =
+        mode === "manual" ? manualPenDownRef.current : (decoderDataRef.current?.pen_down ?? false);
+      const penUpIdleSec = penDown ? 0 : (now - penUpSinceRef.current) / 1000;
+
+      let confidence: number;
+      let velocityMag: number;
+      let spike: number;
+
+      if (mode === "manual") {
+        const pad = manualTrackpadDriveRef.current;
+        const cmd = manualVelocityRef.current;
+        velocityMag = pad.active ? Math.hypot(pad.vx, pad.vy) : Math.hypot(cmd.vx, cmd.vy);
+        confidence =
+          latestSpikeConfidenceRef.current != null
+            ? latestSpikeConfidenceRef.current
+            : MANUAL_CONTROL_CONFIDENCE;
+        spike = spikeStrengthRef.current;
+      } else {
+        const pkt = decoderDataRef.current;
+        velocityMag = pkt ? Math.hypot(pkt.vx, pkt.vy) : 0;
+        confidence = pkt?.confidence ?? 0;
+        spike = 0;
+      }
+
+      const input: SignalQualityInput = {
+        confidence,
+        penDown,
+        velocityMag,
+        spikeStrength: spike,
+        penUpIdleSec,
+      };
+      const target = computeInstantSignalQuality(input);
+      signalSmoothRef.current = stepSignalSmooth(signalSmoothRef.current, target, dt);
+      setSignalPct(Math.round(signalSmoothRef.current * 100));
+
+      frameId = requestAnimationFrame(loop);
+    };
+
+    frameId = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(frameId);
+  }, []);
+
   const resetDecoderState = async () => {
     try {
       await fetch(BACKEND_ENDPOINTS.decoderReset, { method: "POST" });
-      if (controlMode === "automatic") {
-        setCursorDisplay({ x: 0.5, y: 0.5 });
-      } else {
-        manualPhysicsRef.current = seedCursorMotion(0.5, 0.5);
-        setCursorDisplay({ x: 0.5, y: 0.5 });
-      }
+      applyDecoderReset({
+        type: "decoder_reset",
+        timestamp_ms: Date.now(),
+        cursor_x: 0.5,
+        cursor_y: 0.5,
+        num_channels: totalChannels,
+      });
     } catch (e) {
-      console.error("Decoder reset failed:", e);
+      console.error("[App] Decoder reset failed:", e);
     }
   };
 
-  const getIntentColor = (intent: string) => {
-    switch (intent) {
-      case "left":
-        return "text-blue-400";
-      case "right":
-        return "text-red-400";
-      case "up":
-        return "text-green-400";
-      case "down":
-        return "text-yellow-400";
-      case "rest":
-        return "text-cyan-400/90";
-      default:
-        return "text-neutral-400";
-    }
+  const handleClearCanvas = () => {
+    trackpadRef.current?.clearCanvas();
+    manualTrackpadDriveRef.current = idleManualTrackpadDrive();
+    applyManualRest();
   };
 
-  const showCursor = controlMode === "manual" || decoderData !== null;
+  const handleRecognize = () => {
+    trackpadRef.current?.recognize();
+  };
 
-  const footerIntent =
-    controlMode === "automatic"
-      ? decoderData?.predicted_intent
-        ? `${decoderData.predicted_intent.toUpperCase()} (${(decoderData.confidence * 100).toFixed(0)}%)`
-        : "—"
-      : manualIntentLabel && manualIntentLabel !== "rest"
-        ? `${manualIntentLabel.toUpperCase()} · synth`
-        : "REST";
+  const manualDriving =
+    controlMode === "manual" && (manualPenDown || manualTrackpadActive);
+  const metricsVx = manualDriving ? manualCmd.vx : (decoderData?.vx ?? 0);
+  const metricsVy = manualDriving ? manualCmd.vy : (decoderData?.vy ?? 0);
+  const metricsMoving = Math.hypot(metricsVx, metricsVy) > 1e-6;
 
-  const footerLatency =
-    controlMode === "automatic" && decoderData ? `${decoderData.latency_ms.toFixed(1)} ms` : "—";
+  const signalTier = signalTierFromPct(signalPct);
+  const signalStyle = signalTierStyles(signalTier);
+
+  const isComposing =
+    controlMode === "manual"
+      ? manualPenDown
+      : (decoderData?.pen_down ?? false);
+
+  const displayConfidence =
+    controlMode === "manual"
+      ? latestSpikeCommandConfidence != null
+        ? latestSpikeCommandConfidence
+        : MANUAL_CONTROL_CONFIDENCE
+      : (decoderData?.confidence ?? 0);
+
+  const velocityLabel =
+    controlMode === "manual"
+      ? manualVelocityLabel
+      : decoderData
+        ? formatDecoderVelocity(decoderData.vx, decoderData.vy)
+        : "—";
 
   return (
     <div className="h-screen min-h-0 flex flex-col overflow-hidden bg-neuralink-bg text-neuralink-text">
-      {/* 1. Top bar */}
-      <header className="shrink-0 flex items-center justify-between gap-3 px-3 py-2 border-b border-neutral-800/90 bg-black/50 backdrop-blur-sm">
+      <header className="shrink-0 flex items-center justify-between gap-3 px-4 py-2.5 border-b border-neutral-800/90 bg-black/60 backdrop-blur-md">
         <div className="flex items-center gap-2.5 min-w-0">
-          <div className="w-8 h-8 shrink-0 bg-neuralink-accent rounded-full flex items-center justify-center text-black font-bold text-lg">
+          <div className="w-9 h-9 shrink-0 rounded-full bg-neuralink-accent flex items-center justify-center text-black font-bold text-lg shadow-[0_0_24px_rgba(0,255,159,0.35)]">
             N
           </div>
           <div className="min-w-0">
-            <h1 className="text-sm sm:text-base font-semibold tracking-tight text-neutral-100 truncate">
+            <h1 className="font-display text-sm sm:text-base font-semibold tracking-tight text-neutral-100 truncate">
               Neuralink BCI
             </h1>
-            <p className="text-[10px] text-neutral-500 font-mono uppercase tracking-wider">Dashboard</p>
+            <p className="text-[10px] text-neutral-500 font-mono uppercase tracking-[0.2em]">
+              Implant dashboard
+            </p>
           </div>
         </div>
 
@@ -414,9 +651,9 @@ function App() {
             type="button"
             role="tab"
             aria-selected={controlMode === "automatic"}
-            className={`px-3 py-1 rounded-full text-xs font-semibold transition-colors ${
+            className={`px-3.5 py-1.5 rounded-full text-xs font-semibold transition-colors ${
               controlMode === "automatic"
-                ? "bg-neuralink-accent text-black shadow-[0_0_16px_rgba(0,255,170,0.25)]"
+                ? "bg-neuralink-accent text-black shadow-[0_0_20px_rgba(0,255,170,0.3)]"
                 : "text-neutral-500 hover:text-neutral-300"
             }`}
             onClick={() => selectControlMode("automatic")}
@@ -427,9 +664,9 @@ function App() {
             type="button"
             role="tab"
             aria-selected={controlMode === "manual"}
-            className={`px-3 py-1 rounded-full text-xs font-semibold transition-colors ${
+            className={`px-3.5 py-1.5 rounded-full text-xs font-semibold transition-colors ${
               controlMode === "manual"
-                ? "bg-neuralink-accent text-black shadow-[0_0_16px_rgba(0,255,170,0.25)]"
+                ? "bg-neuralink-accent text-black shadow-[0_0_20px_rgba(0,255,170,0.3)]"
                 : "text-neutral-500 hover:text-neutral-300"
             }`}
             onClick={() => selectControlMode("manual")}
@@ -439,297 +676,288 @@ function App() {
         </div>
 
         <div
-          className={`shrink-0 flex items-center gap-2 px-2.5 py-1 rounded-md text-[11px] font-mono font-medium border ${
+          className={`shrink-0 flex items-center gap-2 px-3 py-1.5 rounded-lg text-[11px] font-mono font-medium border ${
             status === "connected"
-              ? "border-emerald-500/35 text-emerald-400 bg-emerald-500/5"
+              ? "border-emerald-500/40 text-emerald-300 bg-emerald-500/10"
               : "border-red-500/35 text-red-400 bg-red-500/5"
           }`}
         >
           <span
             className={`w-2 h-2 rounded-full ${
-              status === "connected" ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]" : "bg-red-400"
+              status === "connected"
+                ? "bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.85)] animate-bci-pulse"
+                : "bg-red-400"
             }`}
           />
-          {status === "connected" ? "Connected" : "Disconnected"}
+          {status === "connected" ? "Live" : "Offline"}
         </div>
       </header>
 
-      {/* 2. Main: cursor (hero) | controls + neural signals (raster is second visual priority) */}
-      <div className="flex-1 min-h-0 flex flex-col md:flex-row gap-2 p-2">
-        {/* LEFT — cursor (primary) */}
-        <section className="flex-[7] min-h-0 min-w-0 flex flex-col rounded-xl border border-neutral-800 bg-neutral-900/60 px-2 pt-2 pb-2">
-          <div className="flex items-center justify-between gap-2 mb-1.5 shrink-0">
-            <h2 className="text-xs font-semibold uppercase tracking-wider text-neutral-400">Cursor</h2>
-            <span
-              className={`text-[10px] font-mono uppercase tracking-wider rounded px-2 py-0.5 border ${
-                controlMode === "manual"
-                  ? "text-amber-300 border-amber-500/30 bg-amber-950/40"
-                  : "text-emerald-300 border-emerald-500/30 bg-emerald-950/40"
-              }`}
-            >
-              {controlMode === "manual" ? "Manual" : "Decoder"}
-            </span>
-          </div>
-          <div className="flex-1 min-h-[12rem] bg-black rounded-lg border border-neutral-800/90 relative overflow-hidden">
-            <div
-              className="absolute inset-0 opacity-[0.22] pointer-events-none"
-              style={{
-                backgroundImage: `
-                  linear-gradient(to right, rgb(55 55 55) 1px, transparent 1px),
-                  linear-gradient(to bottom, rgb(55 55 55) 1px, transparent 1px)
-                `,
-                backgroundSize: "32px 32px",
-              }}
-            />
-            <div
-              className="absolute left-1/2 top-1/2 w-1.5 h-1.5 -ml-[3px] -mt-[3px] rounded-full bg-neutral-500 ring-1 ring-neutral-700"
-              aria-hidden
-            />
-            {showCursor && (
-              <div
-                className="absolute w-3.5 h-3.5 rounded-full bg-neuralink-accent shadow-[0_0_18px_rgba(0,255,170,0.5)] border border-white/90 z-10 will-change-[left,top]"
-                style={{
-                  left: `${cursorDisplay.x * 100}%`,
-                  top: `${cursorDisplay.y * 100}%`,
-                  transform: "translate(-50%, -50%)",
-                  transition: `left ${CURSOR_CSS_TRANSITION_MS}ms cubic-bezier(0.25, 0.06, 0.22, 1), top ${CURSOR_CSS_TRANSITION_MS}ms cubic-bezier(0.25, 0.06, 0.22, 1)`,
-                }}
-                title={
+      <main className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[minmax(0,0.95fr)_minmax(0,1.2fr)_minmax(0,0.85fr)] gap-2 p-2 overflow-hidden">
+        {/* LEFT — decoder metrics + neural charts */}
+        <aside className="order-2 lg:order-1 min-h-0 min-w-0 flex flex-col gap-2 overflow-hidden">
+          <section className="shrink-0 rounded-xl border border-neutral-800/90 bg-gradient-to-b from-neutral-900/70 to-black/50 px-3 py-2.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
+            <div className="flex items-center justify-between gap-2 mb-2">
+              <h2 className="text-[10px] font-mono font-semibold uppercase tracking-[0.2em] text-neutral-400">
+                Decoder metrics
+              </h2>
+              <span
+                className={`text-[9px] font-mono uppercase tracking-wider px-1.5 py-px rounded border ${
                   controlMode === "manual"
-                    ? "Manual cursor (client physics, matches decoder smoothing)"
-                    : "Decoded cursor (velocity-smoothed from server)"
-                }
-              />
-            )}
-            {!showCursor && (
-              <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                <p className="text-neutral-500 font-mono text-center text-xs">Waiting for decoder stream…</p>
-              </div>
-            )}
-          </div>
-        </section>
+                    ? "text-amber-300 border-amber-500/35 bg-amber-950/40"
+                    : "text-emerald-300 border-emerald-500/35 bg-emerald-950/40"
+                }`}
+              >
+                {controlMode === "manual" ? "Manual" : "Decoder"}
+              </span>
+            </div>
 
-        {/* RIGHT — compact command / decoder strip + neural signals (dominant) */}
-        <aside className="flex-[5] min-h-0 min-w-0 flex flex-col gap-1.5 overflow-hidden">
-          <div className="shrink-0 rounded-lg border border-neutral-800/90 bg-neutral-900/50 px-2 py-1.5">
-            {controlMode === "manual" ? (
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between gap-2">
-                  <p className="text-[9px] font-mono font-semibold uppercase tracking-[0.18em] text-amber-400/95">
-                    Manual
-                  </p>
-                  <span className="text-[8px] font-mono text-amber-950 bg-amber-400/90 px-1 py-px rounded">
-                    Live
-                  </span>
+            <div className="space-y-2">
+              <p
+                className={`text-sm font-bold font-mono leading-snug tracking-tight ${
+                  metricsMoving ? velocityHueClass(metricsVx, metricsVy) : "text-cyan-400/90"
+                }`}
+              >
+                {controlMode === "manual"
+                  ? manualVelocityLabel !== "rest"
+                    ? manualVelocityLabel
+                    : "REST"
+                  : velocityLabel}
+              </p>
+
+              <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-[10px] font-mono">
+                <div className="flex justify-between gap-1 col-span-2 border-b border-white/[0.06] pb-1">
+                  <dt className="text-neutral-500">Confidence</dt>
+                  <dd className="text-neutral-100 tabular-nums">{(displayConfidence * 100).toFixed(0)}%</dd>
                 </div>
-                <div className="grid grid-cols-[1fr_auto] gap-x-2 gap-y-1 items-center">
-                  <div
-                    className={`text-2xl font-bold leading-none tracking-tight ${
-                      manualIntentLabel ? getIntentColor(manualIntentLabel) : "text-neutral-500"
-                    }`}
-                  >
-                    {manualIntentLabel ? manualIntentLabel.toUpperCase() : "—"}
-                  </div>
-                  <div className="text-[9px] font-mono text-right text-neutral-400 space-y-0.5">
-                    <div>
-                      <span className="text-neutral-600">conf </span>
-                      <span className="text-amber-100 tabular-nums">
-                        {latestSpikeCommandConfidence != null ? latestSpikeCommandConfidence.toFixed(2) : "—"}
-                      </span>
-                    </div>
-                    <div>
-                      <span className="text-neutral-600">str </span>
-                      <span className="text-amber-200 tabular-nums">{(spikeStrength * 100).toFixed(0)}%</span>
-                    </div>
-                  </div>
+                <div className="flex justify-between gap-1">
+                  <dt className="text-neutral-500">Latency</dt>
+                  <dd className="text-emerald-400 tabular-nums">
+                    {controlMode === "automatic" && decoderData
+                      ? `${decoderData.latency_ms.toFixed(0)} ms`
+                      : "—"}
+                  </dd>
                 </div>
-                <div
-                  className="h-1 rounded-sm bg-neutral-950 border border-amber-900/40 overflow-hidden"
-                  title="Spike envelope × confidence"
-                >
-                  <div
-                    className="h-full rounded-sm bg-gradient-to-r from-amber-700 via-amber-400 to-amber-200 transition-[width] duration-75"
-                    style={{ width: `${Math.min(100, spikeStrength * 100)}%` }}
-                  />
+                <div className="flex justify-between gap-1">
+                  <dt className="text-neutral-500">Pen</dt>
+                  <dd className="text-neutral-200 tabular-nums">{metricsPenDown ? "down" : "up"}</dd>
                 </div>
-                <div className="grid grid-cols-4 gap-1 text-[9px] font-mono">
-                  <div className="col-span-2 rounded border border-amber-900/25 px-1.5 py-0.5 text-neutral-400">
-                    Sess <span className="text-amber-100 tabular-nums">{formatSessionClock(sessionElapsedSec)}</span>
-                  </div>
-                  <div className="rounded border border-amber-900/25 px-1.5 py-0.5 text-neutral-400 truncate">
-                    X <span className="text-neutral-200 tabular-nums">{cursorDisplay.x.toFixed(3)}</span>
-                  </div>
-                  <div className="rounded border border-amber-900/25 px-1.5 py-0.5 text-neutral-400 truncate">
-                    Y <span className="text-neutral-200 tabular-nums">{cursorDisplay.y.toFixed(3)}</span>
-                  </div>
-                </div>
-                <div className="select-none">
-                  <div className="flex flex-col items-center gap-0.5">
-                    <ManualPadButton
-                      label="Up"
-                      compact
-                      onDown={() => applyManualDirectionDown("up")}
-                      onUp={() => applyManualDirectionUp("up")}
-                    />
-                    <div className="flex gap-0.5">
-                      <ManualPadButton
-                        label="L"
-                        compact
-                        onDown={() => applyManualDirectionDown("left")}
-                        onUp={() => applyManualDirectionUp("left")}
-                      />
-                      <ManualPadButton label="RST" isRest compact onDown={applyManualRest} onUp={() => {}} />
-                      <ManualPadButton
-                        label="R"
-                        compact
-                        onDown={() => applyManualDirectionDown("right")}
-                        onUp={() => applyManualDirectionUp("right")}
-                      />
-                    </div>
-                    <ManualPadButton
-                      label="Dn"
-                      compact
-                      onDown={() => applyManualDirectionDown("down")}
-                      onUp={() => applyManualDirectionUp("down")}
-                    />
-                  </div>
-                </div>
-              </div>
-            ) : (
-              <div className="space-y-1">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-[9px] font-mono font-semibold uppercase tracking-[0.18em] text-emerald-400/95">
-                    Decoder
-                  </span>
-                  <span className="text-[8px] font-mono px-1 py-px rounded border border-emerald-500/35 text-emerald-300/95 bg-emerald-950/50">
-                    Live
-                  </span>
-                </div>
-                <div className="grid grid-cols-[1fr_1fr] gap-x-2 items-start">
-                  <div
-                    className={`text-2xl font-bold leading-none tracking-tight ${
-                      decoderData?.predicted_intent
-                        ? getIntentColor(decoderData.predicted_intent)
-                        : "text-neutral-500"
-                    }`}
-                  >
-                    {decoderData?.predicted_intent ? decoderData.predicted_intent.toUpperCase() : "—"}
-                  </div>
-                  <dl className="grid grid-cols-2 gap-x-2 gap-y-0.5 text-[9px] font-mono leading-tight">
-                    <div className="flex justify-between gap-1 col-span-2 border-b border-white/[0.05] pb-0.5">
-                      <dt className="text-neutral-500">Conf</dt>
-                      <dd className="text-neutral-100 tabular-nums">
-                        {decoderData ? `${(decoderData.confidence * 100).toFixed(0)}%` : "—"}
-                      </dd>
-                    </div>
-                    <div className="flex justify-between gap-1">
-                      <dt className="text-neutral-500">Lat</dt>
-                      <dd className="text-emerald-400 tabular-nums">
-                        {decoderData ? `${decoderData.latency_ms.toFixed(0)}` : "—"}
-                      </dd>
-                    </div>
+                {controlMode === "automatic" && decoderData ? (
+                  <>
                     <div className="flex justify-between gap-1">
                       <dt className="text-neutral-500">A20</dt>
                       <dd className="text-emerald-400/95 tabular-nums">
-                        {decoderData ? `${(decoderData.accuracy * 100).toFixed(0)}` : "—"}
+                        {(decoderData.accuracy * 100).toFixed(0)}%
                       </dd>
                     </div>
-                    <div className="flex justify-between gap-1 col-span-2">
-                      <dt className="text-neutral-500">Asess</dt>
+                    <div className="flex justify-between gap-1">
+                      <dt className="text-neutral-500">Session</dt>
                       <dd className="text-emerald-300/95 tabular-nums">
-                        {decoderData ? `${(decoderData.session_accuracy * 100).toFixed(1)}%` : "—"}
+                        {(decoderData.session_accuracy * 100).toFixed(1)}%
                       </dd>
                     </div>
-                  </dl>
-                </div>
-                <button
-                  type="button"
-                  onClick={resetDecoderState}
-                  className="w-full py-1 rounded border border-neutral-600 text-neutral-300 text-[9px] font-medium hover:bg-neutral-800/80 transition-colors"
-                >
-                  Reset
-                </button>
-              </div>
-            )}
-          </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="flex justify-between gap-1">
+                      <dt className="text-neutral-500">Spike</dt>
+                      <dd className="text-amber-200 tabular-nums">{(spikeStrength * 100).toFixed(0)}%</dd>
+                    </div>
+                    <div className="flex justify-between gap-1">
+                      <dt className="text-neutral-500">Sess</dt>
+                      <dd className="text-amber-100 tabular-nums">{formatSessionClock(sessionElapsedSec)}</dd>
+                    </div>
+                  </>
+                )}
+              </dl>
 
-          <div className="flex-1 min-h-0 flex flex-col overflow-hidden rounded-lg border border-emerald-900/20 bg-black/20">
+              <div>
+                <div className="flex items-center justify-between gap-2 mb-1">
+                  <span className="text-[9px] font-mono uppercase tracking-wider text-neutral-500">
+                    Signal
+                  </span>
+                  <span className={`text-[10px] font-mono font-semibold tabular-nums ${signalStyle.text}`}>
+                    {signalPct}%
+                  </span>
+                </div>
+                <div
+                  className={`h-1.5 rounded-full bg-neutral-950 border overflow-hidden ${signalStyle.border}`}
+                  title="Smoothed neural signal quality"
+                >
+                  <div
+                    className={`h-full rounded-full bg-gradient-to-r transition-[width] duration-75 ${signalStyle.bar}`}
+                    style={{ width: `${signalPct}%` }}
+                  />
+                </div>
+                <p className="mt-1 text-[9px] font-mono text-neutral-600 flex items-center gap-1.5">
+                  <span className={`inline-block w-1.5 h-1.5 rounded-full ${signalStyle.dot}`} />
+                  {signalTier === "good" ? "Strong coupling" : signalTier === "medium" ? "Moderate" : "Weak"}
+                </p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-1 text-[9px] font-mono text-neutral-500">
+                <div className="rounded border border-neutral-800/80 px-1.5 py-0.5">
+                  X <span className="text-neutral-200 tabular-nums">{cursorDisplay.x.toFixed(3)}</span>
+                </div>
+                <div className="rounded border border-neutral-800/80 px-1.5 py-0.5">
+                  Y <span className="text-neutral-200 tabular-nums">{cursorDisplay.y.toFixed(3)}</span>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => void resetDecoderState()}
+                className="w-full py-1.5 rounded-lg border border-neutral-600/80 text-neutral-300 text-[10px] font-medium hover:bg-neutral-800/80 transition-colors"
+              >
+                Reset decoder
+              </button>
+            </div>
+          </section>
+
+          <div className="flex-1 min-h-0 flex flex-col overflow-hidden rounded-xl border border-emerald-900/25 bg-black/30">
             <NeuralSignalCharts
               controlMode={controlMode}
               manualBurst={manualNeuralBurst}
               totalChannels={totalChannels}
+              penDown={metricsPenDown}
+              vx={metricsVx}
+              vy={metricsVy}
               compact
             />
           </div>
         </aside>
-      </div>
 
-      {/* 3. Bottom bar */}
-      <footer className="shrink-0 border-t border-neutral-800/90 bg-black/40 px-3 py-1">
-        <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-0.5 text-[10px] font-mono text-neutral-500">
-          <span>
-            <span className="text-neutral-600">Intent distribution</span>{" "}
-            <span className="text-neutral-300">{footerIntent}</span>
-          </span>
-          <span className="text-neutral-700 hidden sm:inline" aria-hidden>
-            ·
-          </span>
-          <span>
-            <span className="text-neutral-600">Latency</span>{" "}
-            <span className="text-neutral-300">{footerLatency}</span>
-          </span>
-          <span className="text-neutral-700 hidden sm:inline" aria-hidden>
-            ·
-          </span>
-          <span>
-            <span className="text-neutral-600">Session time</span>{" "}
-            <span className="text-neutral-300 tabular-nums">{formatSessionClock(sessionElapsedSec)}</span>
-          </span>
-        </div>
-      </footer>
+        {/* CENTER — square handwriting canvas */}
+        <section className="order-1 lg:order-2 min-h-0 min-w-0 flex flex-col items-center justify-center gap-2 overflow-hidden">
+          <div className="w-full max-w-full flex flex-col items-center shrink-0">
+            <p className="text-[10px] font-mono uppercase tracking-[0.18em] text-neutral-500 mb-1.5 self-start">
+              Handwriting canvas
+            </p>
+            <div
+              className="relative w-full aspect-square max-w-full"
+              style={{ maxHeight: "min(100%, calc(100vh - 11rem))" }}
+            >
+              <BCITrackpad
+                ref={trackpadRef}
+                className="absolute inset-0"
+                controlMode={controlMode}
+                cursorNorm={cursorDisplay}
+                vx={controlMode === "manual" ? manualCmd.vx : (decoderData?.vx ?? 0)}
+                vy={controlMode === "manual" ? manualCmd.vy : (decoderData?.vy ?? 0)}
+                penDown={metricsPenDown}
+                manualDriveRef={manualTrackpadDriveRef}
+                onRecognizeLetter={handleRecognizeLetter}
+                onRecognizeError={handleRecognizeError}
+                onCanvasCleared={handleCanvasCleared}
+              />
+            </div>
+
+            <div className="flex flex-wrap items-center justify-center gap-2 mt-3 w-full">
+              <button
+                type="button"
+                onClick={handleClearCanvas}
+                className="px-4 py-2 rounded-lg border border-red-500/40 bg-red-950/30 text-red-200 text-xs font-semibold hover:bg-red-950/50 transition-colors"
+              >
+                Clear canvas
+              </button>
+              <button
+                type="button"
+                onClick={handleRecognize}
+                className="px-4 py-2 rounded-lg border border-emerald-500/45 bg-emerald-950/40 text-emerald-200 text-xs font-semibold hover:bg-emerald-900/50 shadow-[0_0_20px_-8px_rgba(52,211,153,0.5)] transition-colors"
+              >
+                Recognize
+              </button>
+            </div>
+
+            <p className="mt-2 text-[10px] font-mono text-neutral-500 text-center leading-relaxed max-w-md">
+              Hover to move the stylus · click-drag to ink · Space = rest · arrow keys still steer in Manual
+            </p>
+            {controlMode === "automatic" && !decoderData && (
+              <p className="text-[10px] font-mono text-amber-500/80 mt-1">Waiting for decoder stream…</p>
+            )}
+          </div>
+        </section>
+
+        {/* RIGHT — thought-to-text output */}
+        <aside className="order-3 min-h-0 min-w-0 flex flex-col gap-2 overflow-hidden">
+          <section className="flex-1 min-h-0 flex flex-col rounded-xl border border-neutral-800/90 bg-gradient-to-b from-neutral-900/60 to-black/50 px-3 py-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
+            <div className="flex items-center justify-between gap-2 shrink-0 mb-3">
+              <h2 className="font-display text-[10px] font-semibold uppercase tracking-[0.2em] text-emerald-400/75">
+                Thought → Text
+              </h2>
+              {isComposing ? (
+                <span className="text-[9px] font-mono font-medium text-emerald-400/95 uppercase tracking-wider animate-bci-pulse">
+                  Live
+                </span>
+              ) : (
+                <span className="text-[9px] font-mono text-neutral-600 uppercase tracking-wider">Standby</span>
+              )}
+            </div>
+
+            <div className="shrink-0 mb-3">
+              <p className="text-[9px] font-mono font-semibold uppercase tracking-[0.18em] text-neutral-500 mb-1.5">
+                Current Letter
+              </p>
+              <div className={`relative rounded-lg border overflow-hidden flex items-center justify-center min-h-[4.5rem] px-3 py-2 ${
+                  recognizeError
+                    ? "border-amber-500/40 bg-amber-950/20"
+                    : "border-emerald-400/30 bg-emerald-950/20 shadow-[0_0_24px_-12px_rgba(52,211,153,0.35),inset_0_1px_0_rgba(255,255,255,0.05)]"
+                }`}>
+                <div className="absolute inset-0 bg-gradient-to-b from-emerald-500/[0.05] to-transparent pointer-events-none" />
+                <p
+                  className={`relative font-display font-bold tabular-nums leading-none select-none ${
+                    currentLetter != null
+                      ? "text-5xl sm:text-6xl text-emerald-50 tracking-tight"
+                      : "text-4xl text-neutral-600"
+                  } ${currentLetter === " " ? "underline decoration-emerald-400/50 decoration-2 underline-offset-[10px]" : ""}`}
+                  aria-live="polite"
+                  aria-atomic="true"
+                >
+                  {currentLetter ?? CURRENT_LETTER_IDLE}
+                </p>
+              </div>
+              {recognizeError ? (
+                <p className="mt-1.5 text-[9px] font-mono text-amber-400/90 leading-snug">{recognizeError}</p>
+              ) : null}
+            </div>
+
+            <div className="flex-1 min-h-0 flex flex-col">
+              <p className="text-[9px] font-mono font-semibold uppercase tracking-[0.18em] text-neutral-500 mb-1.5 shrink-0">
+                Full Text
+              </p>
+              <div className="relative flex-1 min-h-[7rem] rounded-lg border border-emerald-400/25 bg-black/40 overflow-hidden shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
+                <div className="absolute inset-0 bg-gradient-to-br from-emerald-500/[0.03] via-transparent to-transparent pointer-events-none" />
+                <div className="relative h-full overflow-y-auto px-3 py-3">
+                  <p
+                    className={`font-display text-lg sm:text-xl font-medium leading-relaxed tracking-tight break-words whitespace-pre-wrap ${
+                      fullText.length === 0 ? "text-neutral-600 italic text-base" : "text-neutral-100"
+                    }`}
+                    aria-live="polite"
+                  >
+                    {fullText.length === 0 ? FULL_TEXT_PLACEHOLDER : fullText}
+                    {isComposing && fullText.length > 0 ? (
+                      <span
+                        className="inline-block w-[2px] h-[0.9em] ml-0.5 align-middle rounded-sm bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)] animate-bci-caret"
+                        aria-hidden
+                      />
+                    ) : null}
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={handleClearText}
+              disabled={fullText.length === 0}
+              className="mt-3 w-full shrink-0 rounded-lg border border-neutral-600/70 bg-neutral-950/80 px-3 py-2 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-500 hover:bg-neutral-900/90 disabled:opacity-40 disabled:pointer-events-none"
+            >
+              Clear Text
+            </button>
+          </section>
+        </aside>
+      </main>
     </div>
-  );
-}
-
-/** Large touch-friendly pad button with pointer capture for reliable hold/release. */
-function ManualPadButton(props: {
-  label: string;
-  isRest?: boolean;
-  compact?: boolean;
-  onDown: () => void;
-  onUp: () => void;
-}) {
-  const { label, isRest, compact, onDown, onUp } = props;
-
-  return (
-    <button
-      type="button"
-      className={`rounded-lg border font-semibold tracking-wide transition-colors active:scale-[0.98] ${
-        compact
-          ? "min-w-[4.25rem] min-h-[2.35rem] px-2.5 text-xs"
-          : "min-w-[5.5rem] min-h-[3.25rem] px-4 text-sm"
-      } ${
-        isRest
-          ? "border-cyan-500/40 bg-cyan-950/40 text-cyan-200 hover:bg-cyan-900/50"
-          : "border-neutral-600 bg-neutral-800/80 text-neutral-100 hover:bg-neutral-700/90 hover:border-neutral-500"
-      }`}
-      onPointerDown={(e) => {
-        e.currentTarget.setPointerCapture(e.pointerId);
-        onDown();
-      }}
-      onPointerUp={(e) => {
-        e.currentTarget.releasePointerCapture(e.pointerId);
-        onUp();
-      }}
-      onPointerCancel={() => {
-        onUp();
-      }}
-      onPointerLeave={(e) => {
-        if (e.buttons === 0) onUp();
-      }}
-    >
-      {label}
-    </button>
   );
 }
 

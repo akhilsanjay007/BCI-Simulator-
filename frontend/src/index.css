@@ -9,7 +9,13 @@ body,
 }
 
 body {
-  @apply bg-neuralink-bg text-neuralink-text font-mono;
+  @apply bg-neuralink-bg text-neuralink-text font-mono antialiased;
   margin: 0;
   overflow: hidden;
+}
+
+@layer utilities {
+  .font-display {
+    font-family: ui-sans-serif, system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
 }

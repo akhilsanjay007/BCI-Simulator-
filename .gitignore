@@ -59,3 +59,7 @@ docker-compose.override.yml
 
 # Optional local tooling
 .envrc
+
+# Pickle binaries: only `models/*.pkl` is versioned (Git LFS). Ignore stray dumps elsewhere.
+*.pkl
+!models/*.pkl

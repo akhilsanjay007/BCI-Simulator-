@@ -1,0 +1,23 @@
+# https://docs.railway.com/deploy/config-as-code
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+# Git LFS: the root Dockerfile runs `git lfs pull` during the image build. The build context must
+# include `.git` and `models/*.pkl` pointers (see root `.dockerignore`). Railway’s Docker build
+# receives the repo checkout; keep Git LFS files tracked and ensure the remote (e.g. GitHub) has LFS
+# bandwidth/storage for ~2GB objects. Private repos: Railway must be able to reach your Git host over
+# HTTPS for LFS fetch (same as `git clone` / deploy hooks).
+
+[deploy]
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+
+# Backend service variables (Railway dashboard → Variables), e.g.:
+#   ENV=production
+#   REDIS_URL=redis://...          # Railway Redis plugin or external
+#   FRONTEND_URL=https://<frontend>.up.railway.app
+# Optional: MODEL_PATH / DECODER_MODEL_PATH (default models/velocity_decoder.pkl under /app)
+#
+# Frontend service: separate Dockerfile at frontend/Dockerfile with build arg:
+#   VITE_BACKEND_URL=https://<backend>.up.railway.app

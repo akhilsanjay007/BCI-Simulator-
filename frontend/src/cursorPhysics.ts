@@ -3,8 +3,6 @@
  * matches Automatic Mode smoothing without backend changes.
  */
 
-export type ManualIntent = "left" | "right" | "up" | "down" | "rest";
-
 /** Match decoder defaults (see app/decoder.py). */
 export const CURSOR_MAX_SPEED_PER_S = 0.85;
 export const CURSOR_VEL_TRACKING_PER_S = 14.0;
@@ -37,46 +35,35 @@ export function seedCursorMotion(x: number, y: number): CursorMotionState {
   };
 }
 
-function intentVelocityDirection(intent: ManualIntent): [number, number] {
-  switch (intent) {
-    case "right":
-      return [1, 0];
-    case "left":
-      return [-1, 0];
-    case "up":
-      return [0, -1];
-    case "down":
-      return [0, 1];
-    default:
-      return [0, 0];
-  }
-}
-
 /**
  * One timestep of velocity integration + display EMA (same structure as BciDecoder._step_cursor).
+ *
+ * ``cmd_vx``, ``cmd_vy`` are normalized velocity commands in [-1, 1] (diagonals pre-normalized).
  */
 export function stepCursorMotion(
   s: CursorMotionState,
-  intent: ManualIntent,
+  cmd_vx: number,
+  cmd_vy: number,
   confidence: number,
   dt_s: number,
 ): CursorMotionState {
   if (dt_s <= 0) return s;
 
   const conf = Math.min(1, Math.max(0, confidence));
-  const [dirX, dirY] = intentVelocityDirection(intent);
+  const speed = Math.hypot(cmd_vx, cmd_vy);
+  const atRest = speed < 1e-6;
 
   let targetVx: number;
   let targetVy: number;
   let drive: number;
-  if (intent === "rest") {
+  if (atRest) {
     targetVx = 0;
     targetVy = 0;
     drive = 0;
   } else {
     const gain = conf ** 0.88;
-    targetVx = dirX * CURSOR_MAX_SPEED_PER_S * gain;
-    targetVy = dirY * CURSOR_MAX_SPEED_PER_S * gain;
+    targetVx = cmd_vx * CURSOR_MAX_SPEED_PER_S * gain;
+    targetVy = cmd_vy * CURSOR_MAX_SPEED_PER_S * gain;
     drive = conf;
   }
 
@@ -84,7 +71,7 @@ export function stepCursorMotion(
   let vy = s.vy + CURSOR_VEL_TRACKING_PER_S * (targetVy - s.vy) * dt_s;
 
   let dampTotal = CURSOR_VEL_DAMPING_PER_S;
-  if (intent === "rest") {
+  if (atRest) {
     dampTotal += CURSOR_REST_EXTRA_DAMPING_PER_S;
   } else {
     dampTotal += CURSOR_WEAK_INTENT_DAMPING_PER_S * (1 - drive);
