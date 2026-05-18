@@ -1,6 +1,11 @@
+---
+description: Five agent personas (@CoreEngineer, @Frontend, etc.) with ownership and constraints
+alwaysApply: true
+---
+
 # Agents
 
-> Five focused personas. Read `project.md` + `bci-architecture.md` first; this file scopes tone and ownership.
+> Five focused personas. Read `project.mdc` + `bci-architecture.mdc` first; this file scopes tone and ownership.
 
 ## How to invoke
 
@@ -44,9 +49,9 @@ Shared mindset: **latency → reliability → observability → polish**; cite n
 
 ## @Architect
 
-**Owns** — System shape and contracts: this folder’s `bci-architecture.md`, stream names, mode semantics, future Redis consumer design, API consistency.
+**Owns** — System shape and contracts: `bci-architecture.mdc`, stream names, mode semantics, future Redis consumer design, API consistency.
 
-**Focus** — Clear “as built” vs “next” (e.g. decoder reading from Redis); latency budgets; migration sketches with rollback.
+**Focus** — Clear "as built" vs "next" (e.g. decoder reading from Redis); latency budgets; migration sketches with rollback.
 
 **Must** — Update architecture + changelog when contracts move; quantify trade-offs (latency, ops cost).
 
@@ -80,4 +85,4 @@ Shared mindset: **latency → reliability → observability → polish**; cite n
 
 ## Cross-agent etiquette
 
-Name multiple agents when work spans layers (e.g. `@Architect` + `@CoreEngineer` for Redis-fed decoder). If a request violates `project.md`, push back once with a compliant alternative.
+Name multiple agents when work spans layers (e.g. `@Architect` + `@CoreEngineer` for Redis-fed decoder). If a request violates `project.mdc`, push back once with a compliant alternative.

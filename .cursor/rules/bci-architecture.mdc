@@ -1,12 +1,17 @@
+---
+description: End-to-end pipeline, WebSocket contracts, latency budgets, failure behavior
+alwaysApply: true
+---
+
 # BCI architecture
 
-> Read after `project.md`. Runtime flow, contracts, latency budgets, and failure behavior.
+> Read after `project.mdc`. Runtime flow, contracts, latency budgets, and failure behavior.
 
 ---
 
 ## 1. End-to-end flow (current)
 
-The live dashboard path is **in-process** from generator to decoder to WebSocket. **Redis** is an **optional parallel buffer** (enabled when `REDIS_URL` is set): same packets are appended to a Streams log with **time-based retention**, without changing the decoder’s read source today.
+The live dashboard path is **in-process** from generator to decoder to WebSocket. **Redis** is an **optional parallel buffer** (enabled when `REDIS_URL` is set): same packets are appended to a Streams log with **time-based retention**, without changing the decoder's read source today.
 
 ```
 ┌─────────────────────────┐
@@ -28,7 +33,7 @@ The live dashboard path is **in-process** from generator to decoder to WebSocket
                                          ┌─────────────────────────┐
                                          │ BciDecoder              │
                                          │ window → vx, vy,        │
-                                         │ pen_down, confidence, │
+                                         │ pen_down, confidence,   │
                                          │ cursor integrate        │
                                          └────────────┬────────────┘
                                                       │

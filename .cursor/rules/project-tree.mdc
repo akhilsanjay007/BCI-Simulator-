@@ -1,3 +1,8 @@
+---
+description: Key repo layout — update when adding top-level or app/frontend entry points
+alwaysApply: true
+---
+
 # Project tree (key paths)
 
 > Update in the same PR when you add or relocate **tracked** top-level or `app/` / `frontend/src/` entry points.
@@ -7,10 +12,10 @@ neuralink-bci-sim/
 ├── .cursor/
 │   └── rules/
 │       ├── README.md
-│       ├── project.md
-│       ├── bci-architecture.md
-│       ├── agents.md
-│       └── project-tree.md
+│       ├── project.mdc
+│       ├── bci-architecture.mdc
+│       ├── agents.mdc
+│       └── project-tree.mdc
 ├── .github/
 │   └── workflows/
 │       └── ci-cd.yml

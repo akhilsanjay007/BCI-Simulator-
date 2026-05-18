@@ -1,7 +1,12 @@
+---
+description: Project goal, stack, quality bar, and hard rules (read first)
+alwaysApply: true
+---
+
 # Project — neuralink-bci-sim
 
 > Read first. Source of truth for intent, stack, and quality bar.  
-> `bci-architecture.md`, `agents.md`, and `project-tree.md` extend this file.
+> `bci-architecture.mdc`, `agents.mdc`, and `project-tree.mdc` extend this file.
 
 ---
 
@@ -14,7 +19,7 @@ Ship a **real-time BCI simulator + continuous velocity decoder + dashboard** tha
 - **Synthetic neural stream** — LFP + multi-channel spike batches at implant-scale sample rates (`app/simulator.py`).
 - **Continuous velocity decoder** — sliding spike window → `(vx, vy)` regression, EMA-smoothed confidence, server-side cursor integration, optional `pen_down` semantics for handwriting (`app/decoder.py`).
 - **Handwriting + cursor trackpad** — single high-signal canvas: normalized cursor, velocity HUD, cursor vs handwriting surface modes, ink strokes (`frontend/src/BCITrackpad.tsx`).
-- **Redis Streams buffering** — when `REDIS_URL` is set, each simulator packet is **XADD**’d to a time-trimmed stream (default `bci:signals`) for bounded retention and future fan-out (`app/redis_client.py`, wired from `NeuralSignalGenerator.stream()`).
+- **Redis Streams buffering** — when `REDIS_URL` is set, each simulator packet is **XADD**'d to a time-trimmed stream (default `bci:signals`) for bounded retention and future fan-out (`app/redis_client.py`, wired from `NeuralSignalGenerator.stream()`).
 
 **Audience**
 
@@ -57,7 +62,7 @@ Pinned versions live in `requirements.txt` and `frontend/package.json`. Do not b
 
 ## 4. Performance goals (soft real-time)
 
-Targets are defined in `bci-architecture.md`. Any hot-path PR should cite **before / after** `latency_ms` (p50 / p95 over ~30 s steady state) when behavior or cost changes.
+Targets are defined in `bci-architecture.mdc`. Any hot-path PR should cite **before / after** `latency_ms` (p50 / p95 over ~30 s steady state) when behavior or cost changes.
 
 ---
 
@@ -67,7 +72,7 @@ Targets are defined in `bci-architecture.md`. Any hot-path PR should cite **befo
 
 **TypeScript** — Strict; mirror `DecoderPacket` and REST shapes; `useEffect` WS lifecycle with cleanup; `requestAnimationFrame` or throttled ticks for motion/ink; Tailwind-first.
 
-**Contracts** — Changing `DecoderPacket` or stream JSON requires coordinated backend + frontend + tests + `bci-architecture.md` changelog.
+**Contracts** — Changing `DecoderPacket` or stream JSON requires coordinated backend + frontend + tests + `bci-architecture.mdc` changelog.
 
 ---
 
