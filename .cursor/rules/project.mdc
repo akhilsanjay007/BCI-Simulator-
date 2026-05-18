@@ -17,8 +17,8 @@ Ship a **real-time BCI simulator + continuous velocity decoder + dashboard** tha
 **What the product does**
 
 - **Synthetic neural stream** — LFP + multi-channel spike batches at implant-scale sample rates (`app/simulator.py`).
-- **Continuous velocity decoder** — sliding spike window → `(vx, vy)` regression, EMA-smoothed confidence, server-side cursor integration, optional `pen_down` semantics for handwriting (`app/decoder.py`).
-- **Handwriting + cursor trackpad** — single high-signal canvas: normalized cursor, velocity HUD, cursor vs handwriting surface modes, ink strokes (`frontend/src/BCITrackpad.tsx`).
+- **Continuous velocity decoder** — sliding spike window → `(vx, vy)` regression, EMA-smoothed confidence, server-side cursor integration, `pen_down` as key select / click (`app/decoder.py`).
+- **Virtual keyboard trackpad** — single high-signal canvas: QWERTY layout, normalized cursor, velocity HUD, typed text panel (`frontend/src/BCITrackpad.tsx`, `keyboardLayout.ts`).
 - **Redis Streams buffering** — when `REDIS_URL` is set, each simulator packet is **XADD**'d to a time-trimmed stream (default `bci:signals`) for bounded retention and future fan-out (`app/redis_client.py`, wired from `NeuralSignalGenerator.stream()`).
 
 **Audience**

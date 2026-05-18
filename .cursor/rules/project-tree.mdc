@@ -52,7 +52,8 @@ neuralink-bci-sim/
 │       ├── App.tsx             # layout, WS, manual/automatic, metrics strip
 │       ├── App.css
 │       ├── index.css
-│       ├── BCITrackpad.tsx     # canvas: cursor + handwriting ink + mode chrome
+│       ├── BCITrackpad.tsx     # canvas: virtual QWERTY keyboard + BCI cursor
+│       ├── keyboardLayout.ts   # QWERTY layout, hit-test, draw
 │       ├── NeuralSignalCharts.tsx
 │       ├── cursorPhysics.ts
 │       └── vite-env.d.ts

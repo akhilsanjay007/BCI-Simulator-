@@ -56,10 +56,10 @@ The live dashboard path is **in-process** from generator to decoder to WebSocket
 
 | Mode | Where | Behavior |
 | --- | --- | --- |
-| **Cursor** | Decoder `output_mode` + trackpad `surfaceMode: "cursor"` | Velocity drives 2D cursor; primary navigation surface. |
-| **Handwriting** | Decoder `output_mode` + trackpad `surfaceMode: "handwriting"` | `pen_down` gates contact; canvas accumulates ink in normalized space; decoder/simulator GT aligned for evaluation. |
+| **Keyboard** | `BCITrackpad` + `keyboardLayout.ts` | Virtual QWERTY on canvas; velocity drives cursor; `pen_down` rising edge types the key under the cursor. |
+| **Automatic / Manual** | `App.tsx` | **Automatic**: decoder WS drives cursor + click. **Manual**: pointer hover/click or arrow keys + synthetic burst via `POST /manual-neural-burst`. |
 
-Runtime API: `POST /decoder/mode` with `{ "mode": "cursor" \| "handwriting" }` (`SetDecoderModeRequest`). Frontend should stay in sync with user-facing mode switches when testing end-to-end.
+`pen_down` on `DecoderPacket` means **key select / click** (speed-derived in automatic mode).
 
 **Dashboard control** — `App.tsx`: **Automatic** (decoder packets drive cursor + pen) vs **Manual** (local velocity from keyboard / trackpad pad, synthetic burst to backend via `POST /manual-neural-burst`).
 
@@ -71,7 +71,7 @@ Runtime API: `POST /decoder/mode` with `{ "mode": "cursor" \| "handwriting" }` (
 2. **Buffer (optional)** — If Redis configured: `publish_signal_packet` → `XADD` + approximate `XTRIM` by time (`REDIS_STREAM_RETENTION_SECONDS`).
 3. **Decode** — `BciDecoder.predict` on spike tensor; emits `DecoderPacket` with latency stamp, rolling/session accuracy vs GT, integrated `cursor_x` / `cursor_y`.
 4. **Deliver** — `send_json` per decoded batch on `/ws/decoder`; raw stream on `/ws/bci-stream`.
-5. **Render** — Client parses packets; **BCITrackpad** draws grid, cursor, strokes; charts use ring buffers / throttling — not full React tree per packet.
+5. **Render** — Client parses packets; **BCITrackpad** draws virtual keyboard + cursor; typed text in right panel; charts use ring buffers / throttling — not full React tree per packet.
 
 ---
 
@@ -98,7 +98,6 @@ type DecoderPacket = {
   vy: number;
   pen_down: boolean;
   confidence: number;
-  mode: "cursor" | "handwriting";
   latency_ms: number;
   accuracy: number;
   session_accuracy: number;
@@ -108,7 +107,7 @@ type DecoderPacket = {
 };
 ```
 
-**REST** — `GET /api/decoder/info`, `GET /simulator/config`, `POST /decoder/reset`, `POST /decoder/mode`, `POST /manual-neural-burst`, `GET /health`, `GET /health/redis`.
+**REST** — `GET /api/decoder/info`, `GET /simulator/config`, `POST /decoder/reset`, `POST /manual-neural-burst`, `GET /health`, `GET /health/redis`.
 
 Any shape change → update Pydantic models, TS types in `App.tsx`, tests, and the changelog below.
 
@@ -150,5 +149,6 @@ Report p50/p95 over ~30 s steady state for perf-sensitive PRs.
 
 ## 8. Changelog (contract / pipeline)
 
+- **2026-05-18** — Handwriting removed; pure Keyboard Mode UI (`keyboardLayout.ts`, `BCITrackpad`); `pen_down` = click/select; removed `mode` from `DecoderPacket` and `POST /decoder/mode`.
 - **2026-05-13** — Rules refresh: document optional Redis side-buffer from simulator; React trackpad surface (`BCITrackpad`); clarify decoder still reads in-process `generator.stream()`.
 - **2026-05-11** — Continuous velocity regression (`vx`, `vy`), `pen_down`, `mode`; ensemble/RF/HGB regressors; `GET /api/decoder/info`, `POST /decoder/mode`; manual burst `{ vx, vy, duration_ms }`.

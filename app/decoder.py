@@ -11,7 +11,6 @@ from pydantic import BaseModel, Field
 from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 
-DecoderMode = Literal["cursor", "handwriting"]
 RegressorKind = Literal["rf", "hgb", "ensemble"]
 
 # Default trained weights relative to repo root (Docker WORKDIR / app cwd). Tracked with Git LFS.
@@ -53,7 +52,7 @@ CURSOR_WEAK_CONF_DAMPING_PER_S = 3.5
 VELOCITY_EMA_ALPHA = 0.30
 # Trees used for prediction spread → confidence (cap for latency on large forests).
 CONFIDENCE_TREE_SAMPLE = 64
-# Pen-down threshold on smoothed speed (handwriting): below this ⇒ "lifted".
+# Click threshold on smoothed speed (keyboard select): below this ⇒ "lifted".
 PEN_DOWN_SPEED_THRESHOLD = 0.11
 
 
@@ -78,13 +77,9 @@ class DecoderPacket(BaseModel):
     )
     pen_down: bool = Field(
         ...,
-        description="True when decoded motion implies contact with the writing surface.",
+        description="True when decoded speed implies a key select / click (keyboard mode).",
     )
     confidence: float = Field(..., ge=0.0, le=1.0)
-    mode: DecoderMode = Field(
-        "cursor",
-        description='Output semantics: "cursor" (2D pointer) vs "handwriting" (pen lift).',
-    )
     latency_ms: float = Field(..., ge=0.0)
     accuracy: float = Field(
         ...,
@@ -344,7 +339,6 @@ class BciDecoder:
         window_ms: int = 200,
         exploration_prob: float = 0.08,
         cursor_smooth_alpha: float = 0.24,
-        output_mode: DecoderMode = "cursor",
         regressor: RegressorKind = "ensemble",
     ) -> None:
         if fs <= 0:
@@ -357,7 +351,6 @@ class BciDecoder:
         self._cfg = _WindowConfig(fs=fs, window_ms=window_ms)
         self._channels = channels
         self._n_features = window_feature_dim(channels)
-        self._output_mode: DecoderMode = output_mode
         self._regressor_kind: RegressorKind = regressor
 
         self._model: RandomForestRegressor | None = None
@@ -439,16 +432,8 @@ class BciDecoder:
         return self._n_features
 
     @property
-    def output_mode(self) -> DecoderMode:
-        return self._output_mode
-
-    @property
     def window_ms(self) -> int:
         return self._cfg.window_ms
-
-    def set_output_mode(self, mode: DecoderMode) -> None:
-        """Switch packet semantics: cursor (pen always down) vs handwriting (pen from speed)."""
-        self._output_mode = mode
 
     def train(self, X: np.ndarray, y: np.ndarray) -> None:
         """
@@ -722,7 +707,6 @@ class BciDecoder:
         *,
         true_vx: float,
         true_vy: float,
-        true_pen_down: bool,
     ) -> DecoderPacket:
         start = time.perf_counter()
         self._push_spikes(spikes_batch)
@@ -761,10 +745,7 @@ class BciDecoder:
         vx_out = float(np.clip(self._vx_smooth, -1.0, 1.0))
         vy_out = float(np.clip(self._vy_smooth, -1.0, 1.0))
 
-        if self._output_mode == "cursor":
-            pen_down = True
-        else:
-            pen_down = float(np.hypot(vx_out, vy_out)) >= PEN_DOWN_SPEED_THRESHOLD
+        pen_down = float(np.hypot(vx_out, vy_out)) >= PEN_DOWN_SPEED_THRESHOLD
 
         batch_samples = len(spikes_batch)
         cx, cy, _, _ = self._step_cursor(vx_out, vy_out, confidence, batch_samples)
@@ -793,7 +774,6 @@ class BciDecoder:
             vy=vy_out,
             pen_down=pen_down,
             confidence=float(np.clip(confidence, 0.0, 1.0)),
-            mode=self._output_mode,
             latency_ms=latency_ms,
             accuracy=accuracy,
             session_accuracy=session_accuracy,

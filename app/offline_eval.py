@@ -93,10 +93,8 @@ def measure_velocity_decoding_performance(
             mag = float(rng.uniform(0.2, 1.0))
             vx = float(np.clip(mag * np.cos(ang), -1.0, 1.0))
             vy = float(np.clip(mag * np.sin(ang), -1.0, 1.0))
-        pen = bool(rng.random() < 0.75)
-
-        spikes = synthetic_spikes_batch(batch_size, channels, vx, vy, pen, rng, fs=fs)
-        pkt = decoder.predict(spikes, true_vx=vx, true_vy=vy, true_pen_down=pen)
+        spikes = synthetic_spikes_batch(batch_size, channels, vx, vy, True, rng, fs=fs)
+        pkt = decoder.predict(spikes, true_vx=vx, true_vy=vy)
         dist = float(np.hypot(pkt.vx - vx, pkt.vy - vy))
         score_sum += float(np.clip(1.0 - dist / max_dist, 0.0, 1.0))
         conf_sum += float(pkt.confidence)
@@ -193,9 +191,8 @@ def velocity_error_histogram_offline(
     for _ in range(batches):
         vx = float(rng.uniform(-1.0, 1.0))
         vy = float(rng.uniform(-1.0, 1.0))
-        pen = bool(rng.random() < 0.8)
-        spikes = synthetic_spikes_batch(batch_size, channels, vx, vy, pen, rng, fs=fs)
-        pkt = decoder.predict(spikes, true_vx=vx, true_vy=vy, true_pen_down=pen)
+        spikes = synthetic_spikes_batch(batch_size, channels, vx, vy, True, rng, fs=fs)
+        pkt = decoder.predict(spikes, true_vx=vx, true_vy=vy)
         err_sum += float(np.hypot(pkt.vx - vx, pkt.vy - vy))
 
     return {"mean_l2_error": err_sum / float(batches) if batches else 0.0}
