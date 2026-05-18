@@ -11,14 +11,32 @@ import {
   useRef,
   type MutableRefObject,
 } from "react";
-import { drawKeyboard, drawSuggestions, hitKey, hitSuggestion } from "./keyboardLayout";
+import {
+  drawKeyboard,
+  drawSuggestions,
+  drawSwipeTrail,
+  hitKey,
+  hitSuggestion,
+  type KeyDef,
+  type SwipeTrailPoint,
+} from "./keyboardLayout";
 import { DASHBOARD_THEME } from "./dashboardTheme";
 import { idleManualTrackpadDrive, type ManualTrackpadDrive } from "./manualTrackpad";
 
 const T = DASHBOARD_THEME;
 
-/** Minimum ms between key presses (debounce). */
+/** Minimum ms between chip presses (prevents accidental double-fire). */
 const PRESS_COOLDOWN_MS = 120;
+/** Hard cap on the swipe key path length — defensive against pathological glides. */
+const MAX_SWIPE_PATH = 32;
+/** Max cursor samples kept for the trail (~1.6 s @ 60 fps). */
+const MAX_SWIPE_POINTS = 96;
+/**
+ * Normalized squared step below which we skip recording a new cursor sample —
+ * keeps the trail from piling up extra alpha when the cursor is stationary,
+ * while staying small enough to capture every real movement frame.
+ */
+const SWIPE_MIN_STEP_SQ = 0.001 * 0.001;
 
 type NormPoint = { x: number; y: number };
 
@@ -31,8 +49,10 @@ interface BCITrackpadProps {
   /** Select / click (decoder speed burst or manual left button). */
   penDown: boolean;
   manualDriveRef: MutableRefObject<ManualTrackpadDrive>;
-  /** Fired once per click rising edge while cursor is over a key. */
+  /** Fired on release when the press only touched one key (single click). */
   onKeyPress: (keyId: string) => void;
+  /** Fired on release when the press swept through ≥ 2 keys (swipe). */
+  onSwipeComplete: (keyIds: string[]) => void;
   /** Autocomplete chips shown above the keyboard. */
   suggestions: string[];
   /** Fired when a suggestion chip is clicked. */
@@ -65,6 +85,19 @@ function normFromClient(wrap: HTMLDivElement, clientX: number, clientY: number):
   return { x: nx, y: ny };
 }
 
+type SwipeState = {
+  /** Ordered, consecutively-deduped list of keyboard keys touched this press. */
+  keys: KeyDef[];
+  /** Last key id appended — quick equality check for dedup. */
+  lastKeyId: string | null;
+  /** Press began on a suggestion chip — bypass key/swipe handling for this press. */
+  chipHandled: boolean;
+};
+
+function freshSwipeState(): SwipeState {
+  return { keys: [], lastKeyId: null, chipHandled: false };
+}
+
 export const BCITrackpad = forwardRef<BCITrackpadHandle, BCITrackpadProps>(function BCITrackpad(
   {
     controlMode,
@@ -74,6 +107,7 @@ export const BCITrackpad = forwardRef<BCITrackpadHandle, BCITrackpadProps>(funct
     penDown,
     manualDriveRef,
     onKeyPress,
+    onSwipeComplete,
     suggestions,
     onSuggestionSelect,
     className = "",
@@ -87,8 +121,12 @@ export const BCITrackpad = forwardRef<BCITrackpadHandle, BCITrackpadProps>(funct
   const prevPenDownRef = useRef(false);
   const pressCooldownUntilRef = useRef(0);
   const onKeyPressRef = useRef(onKeyPress);
+  const onSwipeCompleteRef = useRef(onSwipeComplete);
   const onSuggestionSelectRef = useRef(onSuggestionSelect);
   const suggestionsRef = useRef(suggestions);
+  const swipeStateRef = useRef<SwipeState>(freshSwipeState());
+  /** Cursor sample ring buffer — populated only while pen is down. */
+  const swipePointsRef = useRef<SwipeTrailPoint[]>([]);
 
   const liveRef = useRef({
     cursorNorm,
@@ -100,9 +138,10 @@ export const BCITrackpad = forwardRef<BCITrackpadHandle, BCITrackpadProps>(funct
 
   useLayoutEffect(() => {
     onKeyPressRef.current = onKeyPress;
+    onSwipeCompleteRef.current = onSwipeComplete;
     onSuggestionSelectRef.current = onSuggestionSelect;
     suggestionsRef.current = suggestions;
-  }, [onKeyPress, onSuggestionSelect, suggestions]);
+  }, [onKeyPress, onSwipeComplete, onSuggestionSelect, suggestions]);
 
   useLayoutEffect(() => {
     liveRef.current = { cursorNorm, vx, vy, penDown, controlMode };
@@ -132,31 +171,90 @@ export const BCITrackpad = forwardRef<BCITrackpadHandle, BCITrackpadProps>(funct
   const clearKeyboardState = useCallback(() => {
     prevPenDownRef.current = false;
     pressCooldownUntilRef.current = 0;
+    swipeStateRef.current = freshSwipeState();
+    swipePointsRef.current = [];
   }, []);
 
-  const tryKeyPress = useCallback((M: ReturnType<typeof mergedLive>) => {
+  const recordSwipePoint = (pt: NormPoint): void => {
+    const arr = swipePointsRef.current;
+    if (arr.length > 0) {
+      const last = arr[arr.length - 1];
+      const dx = pt.x - last.x;
+      const dy = pt.y - last.y;
+      if (dx * dx + dy * dy < SWIPE_MIN_STEP_SQ) return;
+    }
+    arr.push({ x: pt.x, y: pt.y });
+    if (arr.length > MAX_SWIPE_POINTS) {
+      arr.splice(0, arr.length - MAX_SWIPE_POINTS);
+    }
+  };
+
+  /**
+   * Single-source-of-truth keypress + swipe state machine, ticked every frame.
+   *
+   * - rising edge over a chip → fire suggestion immediately and mark this
+   *   press as chip-handled (no trail recording for this press).
+   * - rising edge over a key (or empty area) → seed the swipe path and start
+   *   recording cursor samples for the trail.
+   * - held + cursor enters a new key → append to the swipe path (deduped).
+   * - held → keep recording cursor samples for the smooth trail.
+   * - falling edge:
+   *     • 1 key in path → single click → onKeyPress.
+   *     • ≥ 2 keys in path → swipe → onSwipeComplete with ordered ids.
+   */
+  const tickPressMachine = useCallback((M: ReturnType<typeof mergedLive>) => {
     const now = performance.now();
-    const rising = M.penDown && !prevPenDownRef.current;
-    prevPenDownRef.current = M.penDown;
+    const wasPressed = prevPenDownRef.current;
+    const isPressed = M.penDown;
+    prevPenDownRef.current = isPressed;
 
-    if (!rising || now < pressCooldownUntilRef.current) {
+    if (isPressed && !wasPressed) {
+      swipePointsRef.current = [];
+      const chip = hitSuggestion(M.cursorNorm.x, M.cursorNorm.y, suggestionsRef.current);
+      if (chip) {
+        swipeStateRef.current = { keys: [], lastKeyId: null, chipHandled: true };
+        if (now >= pressCooldownUntilRef.current) {
+          pressCooldownUntilRef.current = now + PRESS_COOLDOWN_MS;
+          onSuggestionSelectRef.current(chip.word);
+        }
+        return;
+      }
+      swipeStateRef.current = freshSwipeState();
+      const key = hitKey(M.cursorNorm.x, M.cursorNorm.y);
+      if (key) {
+        swipeStateRef.current.keys.push(key);
+        swipeStateRef.current.lastKeyId = key.id;
+      }
+      recordSwipePoint(M.cursorNorm);
       return;
     }
 
-    const chip = hitSuggestion(M.cursorNorm.x, M.cursorNorm.y, suggestionsRef.current);
-    if (chip) {
-      pressCooldownUntilRef.current = now + PRESS_COOLDOWN_MS;
-      onSuggestionSelectRef.current(chip.word);
+    if (isPressed && wasPressed) {
+      const s = swipeStateRef.current;
+      if (s.chipHandled) return;
+      recordSwipePoint(M.cursorNorm);
+      const key = hitKey(M.cursorNorm.x, M.cursorNorm.y);
+      if (key && key.id !== s.lastKeyId) {
+        s.keys.push(key);
+        s.lastKeyId = key.id;
+        if (s.keys.length > MAX_SWIPE_PATH) {
+          s.keys.splice(0, s.keys.length - MAX_SWIPE_PATH);
+        }
+      }
       return;
     }
 
-    const key = hitKey(M.cursorNorm.x, M.cursorNorm.y);
-    if (!key) {
-      return;
+    if (!isPressed && wasPressed) {
+      const s = swipeStateRef.current;
+      swipeStateRef.current = freshSwipeState();
+      swipePointsRef.current = [];
+      if (s.chipHandled) return;
+      if (s.keys.length >= 2) {
+        onSwipeCompleteRef.current(s.keys.map((k) => k.id));
+      } else if (s.keys.length === 1) {
+        onKeyPressRef.current(s.keys[0].id);
+      }
     }
-
-    pressCooldownUntilRef.current = now + PRESS_COOLDOWN_MS;
-    onKeyPressRef.current(key.id);
   }, []);
 
   const paint = useCallback(() => {
@@ -187,9 +285,16 @@ export const BCITrackpad = forwardRef<BCITrackpadHandle, BCITrackpadProps>(funct
     const hoveredChip = hitSuggestion(M.cursorNorm.x, M.cursorNorm.y, words);
     const hoveredKey = hitKey(M.cursorNorm.x, M.cursorNorm.y);
     const pressing = M.penDown;
+    const swipeState = swipeStateRef.current;
+    const swipeKeys = swipeState.keys;
+    const swipingKeys = pressing && !swipeState.chipHandled;
+    const swipedIds: Set<string> | null =
+      swipingKeys && swipeKeys.length > 0
+        ? new Set(swipeKeys.map((k) => k.id))
+        : null;
     const pressedChipIndex =
-      pressing && hoveredChip ? hoveredChip.index : null;
-    const pressedKeyId = pressing && hoveredKey ? hoveredKey.id : null;
+      pressing && swipeState.chipHandled && hoveredChip ? hoveredChip.index : null;
+    const pressedKeyId = swipingKeys && hoveredKey ? hoveredKey.id : null;
     drawSuggestions(
       ctx,
       plotW,
@@ -205,7 +310,14 @@ export const BCITrackpad = forwardRef<BCITrackpadHandle, BCITrackpadProps>(funct
       hoveredKey?.id ?? null,
       pressedKeyId,
       dpr,
+      swipedIds,
     );
+    if (swipingKeys) {
+      const trailPoints = swipePointsRef.current;
+      if (trailPoints.length >= 2) {
+        drawSwipeTrail(ctx, plotW, plotH, trailPoints);
+      }
+    }
 
     const cx = clamp(M.cursorNorm.x, 0, 1) * plotW;
     const cy = clamp(M.cursorNorm.y, 0, 1) * plotH;
@@ -277,13 +389,13 @@ export const BCITrackpad = forwardRef<BCITrackpadHandle, BCITrackpadProps>(funct
 
     const tick = () => {
       const M = mergedLive();
-      tryKeyPress(M);
+      tickPressMachine(M);
       paint();
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [paint, mergedLive, tryKeyPress]);
+  }, [paint, mergedLive, tickPressMachine]);
 
   const estimateVelocity = useCallback((nx: number, ny: number) => {
     const now = performance.now();

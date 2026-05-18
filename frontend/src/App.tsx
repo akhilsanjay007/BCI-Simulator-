@@ -22,7 +22,11 @@ import {
   DASHBOARD_PANEL,
   DASHBOARD_PANEL_HEADER,
 } from "./dashboardTheme";
-import { applyWordSuggestion, getWordSuggestions } from "./wordSuggestions";
+import {
+  applyWordSuggestion,
+  getWordSuggestions,
+  predictSwipeWords,
+} from "./wordSuggestions";
 
 function resolveBackendUrl(): string {
   const configured = (import.meta.env.VITE_BACKEND_URL as string | undefined)?.trim();
@@ -159,6 +163,8 @@ function App() {
   const [manualPenDown, setManualPenDown] = useState(false);
   const [manualTrackpadActive, setManualTrackpadActive] = useState(false);
   const [fullText, setFullText] = useState("");
+  /** Non-empty while a finished swipe is awaiting a chip selection. */
+  const [swipeSuggestions, setSwipeSuggestions] = useState<string[]>([]);
   const [signalPct, setSignalPct] = useState(0);
   /** Pointer over the full Thought → Text panel (hover = decode intent). */
   const [thoughtPanelIntent, setThoughtPanelIntent] = useState(false);
@@ -196,6 +202,7 @@ function App() {
   }, [controlMode, cursorDisplay, decoderData, manualPenDown, spikeStrength]);
 
   const handleKeyPress = useCallback((keyId: string) => {
+    setSwipeSuggestions([]);
     if (keyId === "Backspace") {
       setFullText((prev) => prev.slice(0, -1));
     } else if (keyId === "Enter") {
@@ -208,12 +215,20 @@ function App() {
   }, []);
 
   const handleClearText = useCallback(() => {
+    setSwipeSuggestions([]);
     setFullText("");
   }, []);
 
-  const suggestions = useMemo(() => getWordSuggestions(fullText), [fullText]);
+  const handleSwipeComplete = useCallback((keyIds: string[]) => {
+    const words = predictSwipeWords(keyIds);
+    setSwipeSuggestions(words);
+  }, []);
+
+  const prefixSuggestions = useMemo(() => getWordSuggestions(fullText), [fullText]);
+  const suggestions = swipeSuggestions.length > 0 ? swipeSuggestions : prefixSuggestions;
 
   const handleSuggestionSelect = useCallback((word: string) => {
+    setSwipeSuggestions([]);
     setFullText((prev) => applyWordSuggestion(prev, word));
   }, []);
 
@@ -384,6 +399,7 @@ function App() {
       applyManualRest();
       manualTrackpadDriveRef.current = idleManualTrackpadDrive();
       trackpadRef.current?.clearKeyboard();
+      setSwipeSuggestions([]);
       signalSmoothRef.current = 0;
       setSignalPct(0);
       penUpSinceRef.current = performance.now();
@@ -644,6 +660,7 @@ function App() {
     trackpadRef.current?.clearKeyboard();
     manualTrackpadDriveRef.current = idleManualTrackpadDrive();
     applyManualRest();
+    setSwipeSuggestions([]);
     manualPhysicsRef.current = seedCursorMotion(0.5, 0.5);
     setCursorDisplay({ x: 0.5, y: 0.5 });
   };
@@ -942,6 +959,7 @@ function App() {
               penDown={clickActionPenDown}
               manualDriveRef={manualTrackpadDriveRef}
               onKeyPress={handleKeyPress}
+              onSwipeComplete={handleSwipeComplete}
               suggestions={suggestions}
               onSuggestionSelect={handleSuggestionSelect}
             />
