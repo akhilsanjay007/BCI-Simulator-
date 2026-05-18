@@ -209,6 +209,8 @@ function App() {
       setFullText((prev) => prev + "\n");
     } else if (keyId === " ") {
       setFullText((prev) => prev + " ");
+    } else if (keyId.length === 1 && /[A-Za-z]/.test(keyId)) {
+      setFullText((prev) => prev + keyId.toUpperCase());
     } else {
       setFullText((prev) => prev + keyId);
     }

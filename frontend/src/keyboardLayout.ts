@@ -468,14 +468,91 @@ export function drawKeyboard(
 /** Normalized cursor sample fed into {@link drawSwipeTrail}. */
 export type SwipeTrailPoint = { x: number; y: number };
 
+/** Minimum pixel spacing when densifying sparse cursor samples. */
+const TRAIL_DENSIFY_PX = 2.5;
+
 /**
- * Renders a Gboard-style swipe trail: a quadratic-midpoint smoothed polyline
- * through the actual cursor samples (not key centers), with a wide soft
- * underglow, a medium emerald halo, and a bright top stroke whose alpha fades
- * from tail (dim) to head (bright). Sized + colored to match the dashboard
- * Neuralink palette.
- *
- * Points are normalized [0,1]² so this is layout-independent.
+ * Insert intermediate points along long segments so Catmull-Rom splines stay
+ * fluid even when the source stream is sparse (decoder ~50 Hz or fast glides).
+ */
+function densifySwipePoints(
+  points: readonly SwipeTrailPoint[],
+  plotW: number,
+  plotH: number,
+): SwipeTrailPoint[] {
+  if (points.length < 2) return [...points];
+
+  const out: SwipeTrailPoint[] = [{ x: points[0].x, y: points[0].y }];
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1];
+    const b = points[i];
+    const dx = (b.x - a.x) * plotW;
+    const dy = (b.y - a.y) * plotH;
+    const dist = Math.hypot(dx, dy);
+    const steps = Math.max(1, Math.ceil(dist / TRAIL_DENSIFY_PX));
+    for (let s = 1; s <= steps; s++) {
+      const t = s / steps;
+      out.push({
+        x: a.x + (b.x - a.x) * t,
+        y: a.y + (b.y - a.y) * t,
+      });
+    }
+  }
+  return out;
+}
+
+/** Catmull-Rom segment → cubic Bezier control points (uniform chordal). */
+function catmullRomToBezier(
+  p0: SwipeTrailPoint,
+  p1: SwipeTrailPoint,
+  p2: SwipeTrailPoint,
+  p3: SwipeTrailPoint,
+  tension: number,
+): { cp1: SwipeTrailPoint; cp2: SwipeTrailPoint; end: SwipeTrailPoint } {
+  const t = tension / 6;
+  return {
+    cp1: {
+      x: p1.x + (p2.x - p0.x) * t,
+      y: p1.y + (p2.y - p0.y) * t,
+    },
+    cp2: {
+      x: p2.x - (p3.x - p1.x) * t,
+      y: p2.y - (p3.y - p1.y) * t,
+    },
+    end: { x: p2.x, y: p2.y },
+  };
+}
+
+/** Build a closed-form Path2D through pixel-space points using cubic Beziers. */
+function buildCatmullRomPath(pts: readonly SwipeTrailPoint[], tension = 1): Path2D {
+  const path = new Path2D();
+  if (pts.length === 0) return path;
+  if (pts.length === 1) {
+    path.moveTo(pts[0].x, pts[0].y);
+    return path;
+  }
+  if (pts.length === 2) {
+    path.moveTo(pts[0].x, pts[0].y);
+    path.lineTo(pts[1].x, pts[1].y);
+    return path;
+  }
+
+  path.moveTo(pts[0].x, pts[0].y);
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[Math.max(0, i - 1)];
+    const p1 = pts[i];
+    const p2 = pts[i + 1];
+    const p3 = pts[Math.min(pts.length - 1, i + 2)];
+    const { cp1, cp2, end } = catmullRomToBezier(p0, p1, p2, p3, tension);
+    path.bezierCurveTo(cp1.x, cp1.y, cp2.x, cp2.y, end.x, end.y);
+  }
+  return path;
+}
+
+/**
+ * Gboard-style swipe trail: follows exact cursor samples (not key centers).
+ * Densifies + Catmull-Rom smooths the path, then layers wide glow, mid halo,
+ * tapered bright stroke (tail dim → head bright), and a fingertip bloom.
  */
 export function drawSwipeTrail(
   ctx: CanvasRenderingContext2D,
@@ -486,71 +563,56 @@ export function drawSwipeTrail(
   if (points.length < 2) return;
   const T = DASHBOARD_THEME;
 
-  const n = points.length;
-  const pts = new Array<SwipeTrailPoint>(n);
-  for (let i = 0; i < n; i++) {
-    pts[i] = { x: points[i].x * plotW, y: points[i].y * plotH };
-  }
+  const dense = densifySwipePoints(points, plotW, plotH);
+  const pts = dense.map((p) => ({ x: p.x * plotW, y: p.y * plotH }));
+  const smooth = buildCatmullRomPath(pts, 1);
+  const head = pts[pts.length - 1];
 
   ctx.save();
   ctx.lineJoin = "round";
   ctx.lineCap = "round";
 
-  // Smoothed path once (quadratic Bezier through midpoints of consecutive pts).
-  const smooth = new Path2D();
-  smooth.moveTo(pts[0].x, pts[0].y);
-  for (let i = 1; i < n - 1; i++) {
-    const xc = (pts[i].x + pts[i + 1].x) / 2;
-    const yc = (pts[i].y + pts[i + 1].y) / 2;
-    smooth.quadraticCurveTo(pts[i].x, pts[i].y, xc, yc);
-  }
-  smooth.lineTo(pts[n - 1].x, pts[n - 1].y);
-
-  // 1) wide soft underglow
+  // 1) Wide soft underglow (Gboard outer bloom).
   ctx.shadowColor = T.accentPressGlow;
-  ctx.shadowBlur = 24;
-  ctx.strokeStyle = "rgba(0, 255, 159, 0.14)";
-  ctx.lineWidth = 14;
+  ctx.shadowBlur = 28;
+  ctx.strokeStyle = "rgba(0, 255, 159, 0.16)";
+  ctx.lineWidth = 18;
   ctx.stroke(smooth);
 
-  // 2) medium emerald halo
-  ctx.shadowBlur = 12;
-  ctx.strokeStyle = "rgba(52, 211, 153, 0.32)";
-  ctx.lineWidth = 6;
+  // 2) Medium emerald halo.
+  ctx.shadowBlur = 14;
+  ctx.strokeStyle = "rgba(52, 211, 153, 0.38)";
+  ctx.lineWidth = 8;
   ctx.stroke(smooth);
 
-  // 3) bright top stroke, per-segment alpha fade (tail dim → head bright).
-  ctx.shadowBlur = 0;
-  ctx.strokeStyle = "rgba(220, 255, 240, 1)";
-  ctx.lineWidth = 2.4;
+  // 3) Bright core stroke (single smooth pass — underglow layers carry tail fade).
+  ctx.shadowBlur = 8;
+  ctx.shadowColor = "rgba(52, 211, 153, 0.55)";
+  ctx.globalAlpha = 0.94;
+  ctx.strokeStyle = "rgba(232, 255, 248, 0.96)";
+  ctx.lineWidth = 3.2;
+  ctx.stroke(smooth);
 
-  const denom = Math.max(1, n - 2);
-  for (let i = 0; i < n - 1; i++) {
-    const t = n === 2 ? 1 : i / denom;
-    ctx.globalAlpha = 0.08 + 0.92 * t;
-    ctx.beginPath();
-    if (i === 0) {
-      ctx.moveTo(pts[0].x, pts[0].y);
-    } else {
-      ctx.moveTo(
-        (pts[i - 1].x + pts[i].x) / 2,
-        (pts[i - 1].y + pts[i].y) / 2,
-      );
-    }
-    if (i < n - 2) {
-      ctx.quadraticCurveTo(
-        pts[i].x,
-        pts[i].y,
-        (pts[i].x + pts[i + 1].x) / 2,
-        (pts[i].y + pts[i + 1].y) / 2,
-      );
-    } else {
-      ctx.lineTo(pts[n - 1].x, pts[n - 1].y);
-    }
-    ctx.stroke();
-  }
-
+  // 4) Fingertip bloom at the live cursor head.
   ctx.globalAlpha = 1;
   ctx.shadowBlur = 0;
+  const tipOuter = ctx.createRadialGradient(head.x, head.y, 0, head.x, head.y, 22);
+  tipOuter.addColorStop(0, "rgba(0, 255, 159, 0.55)");
+  tipOuter.addColorStop(0.35, "rgba(52, 211, 153, 0.22)");
+  tipOuter.addColorStop(1, "rgba(0, 0, 0, 0)");
+  ctx.fillStyle = tipOuter;
+  ctx.beginPath();
+  ctx.arc(head.x, head.y, 22, 0, Math.PI * 2);
+  ctx.fill();
+
+  const tipCore = ctx.createRadialGradient(head.x, head.y, 0, head.x, head.y, 7);
+  tipCore.addColorStop(0, "rgba(232, 255, 248, 0.95)");
+  tipCore.addColorStop(0.5, "rgba(52, 211, 153, 0.7)");
+  tipCore.addColorStop(1, "rgba(52, 211, 153, 0)");
+  ctx.fillStyle = tipCore;
+  ctx.beginPath();
+  ctx.arc(head.x, head.y, 7, 0, Math.PI * 2);
+  ctx.fill();
+
   ctx.restore();
 }

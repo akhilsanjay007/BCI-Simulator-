@@ -29,14 +29,13 @@ const T = DASHBOARD_THEME;
 const PRESS_COOLDOWN_MS = 120;
 /** Hard cap on the swipe key path length — defensive against pathological glides. */
 const MAX_SWIPE_PATH = 32;
-/** Max cursor samples kept for the trail (~1.6 s @ 60 fps). */
-const MAX_SWIPE_POINTS = 96;
+/** Max cursor samples kept for the trail (~4 s @ 60 fps dense sampling). */
+const MAX_SWIPE_POINTS = 240;
 /**
- * Normalized squared step below which we skip recording a new cursor sample —
- * keeps the trail from piling up extra alpha when the cursor is stationary,
- * while staying small enough to capture every real movement frame.
+ * Normalized squared step below which we skip duplicate samples — small enough
+ * to capture fluid motion at pointer-event rate without stacking when still.
  */
-const SWIPE_MIN_STEP_SQ = 0.001 * 0.001;
+const SWIPE_MIN_STEP_SQ = 0.00012 * 0.00012;
 
 type NormPoint = { x: number; y: number };
 
@@ -127,6 +126,8 @@ export const BCITrackpad = forwardRef<BCITrackpadHandle, BCITrackpadProps>(funct
   const swipeStateRef = useRef<SwipeState>(freshSwipeState());
   /** Cursor sample ring buffer — populated only while pen is down. */
   const swipePointsRef = useRef<SwipeTrailPoint[]>([]);
+  /** Scratch buffer: trail samples + live cursor head for paint (avoids alloc). */
+  const trailDrawBufRef = useRef<SwipeTrailPoint[]>([]);
 
   const liveRef = useRef({
     cursorNorm,
@@ -247,7 +248,10 @@ export const BCITrackpad = forwardRef<BCITrackpadHandle, BCITrackpadProps>(funct
     if (!isPressed && wasPressed) {
       const s = swipeStateRef.current;
       swipeStateRef.current = freshSwipeState();
-      swipePointsRef.current = [];
+      // Trail cleared on next paint so the release frame still shows the glide.
+      if (s.chipHandled) {
+        swipePointsRef.current = [];
+      }
       if (s.chipHandled) return;
       if (s.keys.length >= 2) {
         onSwipeCompleteRef.current(s.keys.map((k) => k.id));
@@ -288,10 +292,13 @@ export const BCITrackpad = forwardRef<BCITrackpadHandle, BCITrackpadProps>(funct
     const swipeState = swipeStateRef.current;
     const swipeKeys = swipeState.keys;
     const swipingKeys = pressing && !swipeState.chipHandled;
-    const swipedIds: Set<string> | null =
-      swipingKeys && swipeKeys.length > 0
-        ? new Set(swipeKeys.map((k) => k.id))
-        : null;
+    const swipedIds: Set<string> | null = swipingKeys
+      ? (() => {
+          const ids = new Set(swipeKeys.map((k) => k.id));
+          if (hoveredKey) ids.add(hoveredKey.id);
+          return ids.size > 0 ? ids : null;
+        })()
+      : null;
     const pressedChipIndex =
       pressing && swipeState.chipHandled && hoveredChip ? hoveredChip.index : null;
     const pressedKeyId = swipingKeys && hoveredKey ? hoveredKey.id : null;
@@ -313,10 +320,37 @@ export const BCITrackpad = forwardRef<BCITrackpadHandle, BCITrackpadProps>(funct
       swipedIds,
     );
     if (swipingKeys) {
-      const trailPoints = swipePointsRef.current;
-      if (trailPoints.length >= 2) {
-        drawSwipeTrail(ctx, plotW, plotH, trailPoints);
+      const src = swipePointsRef.current;
+      const head = M.cursorNorm;
+      const buf = trailDrawBufRef.current;
+      buf.length = 0;
+      for (let i = 0; i < src.length; i++) buf.push(src[i]);
+      if (buf.length === 0) {
+        buf.push({ x: head.x, y: head.y });
+      } else {
+        const last = buf[buf.length - 1];
+        const dx = head.x - last.x;
+        const dy = head.y - last.y;
+        if (dx * dx + dy * dy > SWIPE_MIN_STEP_SQ * 0.25) {
+          buf.push({ x: head.x, y: head.y });
+        }
       }
+      if (buf.length >= 2) {
+        drawSwipeTrail(ctx, plotW, plotH, buf);
+      }
+    } else if (!pressing && swipePointsRef.current.length >= 2) {
+      const src = swipePointsRef.current;
+      const buf = trailDrawBufRef.current;
+      buf.length = 0;
+      for (let i = 0; i < src.length; i++) buf.push(src[i]);
+      const last = buf[buf.length - 1];
+      const hx = M.cursorNorm.x;
+      const hy = M.cursorNorm.y;
+      if ((hx - last.x) ** 2 + (hy - last.y) ** 2 > SWIPE_MIN_STEP_SQ * 0.25) {
+        buf.push({ x: hx, y: hy });
+      }
+      drawSwipeTrail(ctx, plotW, plotH, buf.length >= 2 ? buf : src);
+      swipePointsRef.current = [];
     }
 
     const cx = clamp(M.cursorNorm.x, 0, 1) * plotW;
@@ -442,6 +476,11 @@ export const BCITrackpad = forwardRef<BCITrackpadHandle, BCITrackpadProps>(funct
         vy: active ? evy : 0,
         penDown: active && penDownBtn,
       };
+
+      // High-rate samples on move (down edge is recorded in tickPressMachine).
+      if (penDownBtn && active && prevPenDownRef.current && !swipeStateRef.current.chipHandled) {
+        recordSwipePoint({ x: nx, y: ny });
+      }
     },
     [controlMode, estimateVelocity, manualDriveRef],
   );
