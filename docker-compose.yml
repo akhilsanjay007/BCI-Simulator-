@@ -18,6 +18,9 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    # Optional: use host weights instead of image COPY/LFS (uncomment after `git lfs pull`)
+    # volumes:
+    #   - ./models:/app/models:ro
     restart: unless-stopped
 
   frontend:

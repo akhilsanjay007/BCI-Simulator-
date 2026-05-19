@@ -149,6 +149,9 @@ decoder = BciDecoder(
 )
 _decoder_train_n = int(os.getenv("DECODER_TRAIN_SAMPLES", "25000"))
 
+# Must match the Railway volume mount path (e.g. volume `decoder-model` → `/app/models`).
+RAILWAY_VOLUME_MODEL_PATH = Path("/app/models/velocity_decoder.pkl")
+
 
 def _decoder_artifact_path_from_env() -> tuple[Path, bool]:
     """Return (resolved path, True if MODEL_PATH or DECODER_MODEL_PATH was set). MODEL_PATH wins."""
@@ -157,17 +160,23 @@ def _decoder_artifact_path_from_env() -> tuple[Path, bool]:
         if raw:
             p = Path(raw)
             return (p.resolve() if p.is_absolute() else (Path.cwd() / p).resolve(), True)
+    if RAILWAY_VOLUME_MODEL_PATH.is_file():
+        return RAILWAY_VOLUME_MODEL_PATH.resolve(), False
     return default_decoder_artifact_path().resolve(), False
 
 
-_artifact_path, _artifact_path_explicit = _decoder_artifact_path_from_env()
-try:
-    if _artifact_path.is_file():
-        load_decoder_artifact_into(decoder, _artifact_path)
-        print(f"Loaded decoder weights from {_artifact_path}")
-    elif IS_PRODUCTION or _artifact_path_explicit:
-        raise FileNotFoundError(velocity_decoder_missing_help(_artifact_path))
-    else:
+def _load_decoder_at_startup() -> None:
+    artifact_path, artifact_path_explicit = _decoder_artifact_path_from_env()
+    try:
+        if artifact_path.is_file():
+            load_decoder_artifact_into(decoder, artifact_path)
+            if artifact_path == RAILWAY_VOLUME_MODEL_PATH.resolve():
+                print(f"✅ Successfully loaded model from Railway Volume: {artifact_path}")
+            else:
+                print(f"✅ Successfully loaded model: {artifact_path}")
+            return
+        if IS_PRODUCTION or artifact_path_explicit:
+            raise FileNotFoundError(velocity_decoder_missing_help(artifact_path))
         try:
             X_train, y_train = generate_training_data(
                 fs=generator.fs,
@@ -179,14 +188,18 @@ try:
             decoder.train(X_train, y_train)
             print(f"Bootstrap-trained decoder on {len(X_train):,} synthetic windows")
         except Exception as e:
-            # If training fails for any reason, keep server runnable with heuristic fallback.
             print(f"⚠️ Decoder bootstrap training failed; using heuristic fallback. Error: {e}")
-except FileNotFoundError:
-    raise
-except Exception as e:
-    if IS_PRODUCTION:
-        raise RuntimeError(f"Velocity decoder failed to load or train: {e}") from e
-    print(f"⚠️ Decoder load/bootstrap failed; using heuristic fallback. Error: {e}")
+    except FileNotFoundError as e:
+        print(f"❌ Failed to load model: {e}")
+        raise
+    except Exception as e:
+        print(f"❌ Failed to load model: {e}")
+        if IS_PRODUCTION:
+            raise RuntimeError(f"Velocity decoder failed to load or train: {e}") from e
+        print("⚠️ Decoder load/bootstrap failed; using heuristic fallback.")
+
+
+_load_decoder_at_startup()
 
 
 class ManualBurstRequest(BaseModel):

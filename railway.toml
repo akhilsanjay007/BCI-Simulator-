@@ -17,7 +17,17 @@ restartPolicyType = "ON_FAILURE"
 #   ENV=production
 #   REDIS_URL=redis://...          # Railway Redis plugin or external
 #   FRONTEND_URL=https://<frontend>.up.railway.app
-# Optional: MODEL_PATH / DECODER_MODEL_PATH (default models/velocity_decoder.pkl under /app)
+# Optional: MODEL_PATH / DECODER_MODEL_PATH (default models/velocity_decoder.pkl → /app/models/…)
+#
+# Persistent decoder weights (Railway UI — not supported in railway.toml yet):
+#   1. Create volume name: decoder-model
+#   2. Attach to backend service
+#   3. Mount path: /app/models
+#   4. Upload models/velocity_decoder.pkl into the volume (e.g. railway ssh + copy, or one-off job)
+#      Mount replaces the image’s /app/models at runtime; baked-in LFS weights are hidden until the
+#      file exists on the volume.
+#   5. Set RAILWAY_RUN_UID=0 on the backend (image runs as non-root user `app`; volumes mount root-owned)
+#   6. ENV=production, REDIS_URL, FRONTEND_URL as below
 #
 # Frontend service: separate Dockerfile at frontend/Dockerfile with build arg:
 #   VITE_BACKEND_URL=https://<backend>.up.railway.app

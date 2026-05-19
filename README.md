@@ -152,6 +152,29 @@ Build arg **`VITE_BACKEND_URL`** must be the browser-reachable API base (e.g. `h
 2. **Redis** — Railway Redis plugin or external URL → `REDIS_URL` on backend.
 3. **Frontend** — root `frontend/`, `frontend/Dockerfile`, build arg `VITE_BACKEND_URL` = backend public URL, set backend `FRONTEND_URL` to frontend public URL.
 
+#### Optional: volume for decoder weights (~2 GB)
+
+Use a Railway volume when you do **not** want the pickle baked into every image build (or to update weights without redeploying).
+
+| Setting | Value |
+|---------|--------|
+| Volume name | `decoder-model` (any name is fine) |
+| Mount path | **`/app/models`** |
+| Expected file | `/app/models/velocity_decoder.pkl` (default `MODEL_PATH`; no env change needed) |
+
+**Railway UI:** open the backend service → **Volumes** → create volume → mount at **`/app/models`**.
+
+Volumes are **not** configurable in `railway.toml` today; use the dashboard (or a template).
+
+After mount, copy `velocity_decoder.pkl` onto the volume (the mount **replaces** the image’s `models/` directory at runtime). Set **`RAILWAY_RUN_UID=0`** on the backend so the non-root `app` user can read the volume (Railway mounts volumes as root).
+
+```text
+ENV=production
+RAILWAY_RUN_UID=0
+```
+
+`RAILWAY_VOLUME_MOUNT_PATH` is set automatically when a volume is attached; default artifact resolution still uses `models/velocity_decoder.pkl` under `/app`.
+
 ### GHCR images (CI)
 
 On push to **`main`**, [`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml) publishes:
