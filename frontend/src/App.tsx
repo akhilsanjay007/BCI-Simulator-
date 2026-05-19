@@ -1,4 +1,4 @@
-import { useState, useEffect, useLayoutEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from "react";
 import {
   stepCursorMotion,
   seedCursorMotion,
@@ -15,6 +15,18 @@ import {
   stepSignalSmooth,
   type SignalQualityInput,
 } from "./signalQuality";
+import {
+  DASHBOARD_BTN,
+  DASHBOARD_DIVIDER,
+  DASHBOARD_INNER_SURFACE,
+  DASHBOARD_PANEL,
+  DASHBOARD_PANEL_HEADER,
+} from "./dashboardTheme";
+import {
+  applyWordSuggestion,
+  getWordSuggestions,
+  predictSwipeWords,
+} from "./wordSuggestions";
 
 function resolveBackendUrl(): string {
   const configured = (import.meta.env.VITE_BACKEND_URL as string | undefined)?.trim();
@@ -42,14 +54,11 @@ const BACKEND_ENDPOINTS = {
   manualNeuralBurst: `${BACKEND_HTTP_ORIGIN}/manual-neural-burst`,
   simulatorConfig: `${BACKEND_HTTP_ORIGIN}/simulator/config`,
   decoderReset: `${BACKEND_HTTP_ORIGIN}/decoder/reset`,
-  decoderMode: `${BACKEND_HTTP_ORIGIN}/decoder/mode`,
   decoderWs: `${BACKEND_WS_ORIGIN}/ws/decoder`,
 } as const;
 
-/** Shown in the current-letter slot before any recognition this session. */
-const CURRENT_LETTER_IDLE = "—";
 /** Hint when the accumulated sentence is empty. */
-const FULL_TEXT_PLACEHOLDER = "Your sentence builds here, letter by letter…";
+const FULL_TEXT_PLACEHOLDER = "Type with the BCI cursor on the keyboard…";
 
 interface DecoderPacket {
   timestamp_ms: number;
@@ -57,7 +66,6 @@ interface DecoderPacket {
   vy: number;
   pen_down: boolean;
   confidence: number;
-  mode: "cursor" | "handwriting";
   latency_ms: number;
   accuracy: number;
   session_accuracy: number;
@@ -154,13 +162,17 @@ function App() {
   const [manualNeuralBurst, setManualNeuralBurst] = useState<ManualNeuralBurstPayload | null>(null);
   const [manualPenDown, setManualPenDown] = useState(false);
   const [manualTrackpadActive, setManualTrackpadActive] = useState(false);
-  const [currentLetter, setCurrentLetter] = useState<string | null>(null);
   const [fullText, setFullText] = useState("");
-  const [recognizeError, setRecognizeError] = useState<string | null>(null);
+  /** Non-empty while a finished swipe is awaiting a chip selection. */
+  const [swipeSuggestions, setSwipeSuggestions] = useState<string[]>([]);
   const [signalPct, setSignalPct] = useState(0);
+  /** Pointer over the full Thought → Text panel (hover = decode intent). */
+  const [thoughtPanelIntent, setThoughtPanelIntent] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const trackpadRef = useRef<BCITrackpadHandle | null>(null);
+  const thoughtPanelRef = useRef<HTMLElement | null>(null);
+  const thoughtPanelIntentRef = useRef(false);
   const controlModeRef = useRef<ControlMode>("manual");
   const cursorDisplayRef = useRef(cursorDisplay);
   const decoderDataRef = useRef<DecoderPacket | null>(null);
@@ -189,24 +201,93 @@ function App() {
     spikeStrengthRef.current = spikeStrength;
   }, [controlMode, cursorDisplay, decoderData, manualPenDown, spikeStrength]);
 
-  const handleRecognizeLetter = useCallback((letter: string) => {
-    setRecognizeError(null);
-    setCurrentLetter(letter);
-    setFullText((prev) => prev + letter);
-  }, []);
-
-  const handleRecognizeError = useCallback((message: string) => {
-    setRecognizeError(message);
-  }, []);
-
-  const handleCanvasCleared = useCallback(() => {
-    setCurrentLetter(null);
-    setRecognizeError(null);
+  const handleKeyPress = useCallback((keyId: string) => {
+    setSwipeSuggestions([]);
+    if (keyId === "Backspace") {
+      setFullText((prev) => prev.slice(0, -1));
+    } else if (keyId === "Enter") {
+      setFullText((prev) => prev + "\n");
+    } else if (keyId === " ") {
+      setFullText((prev) => prev + " ");
+    } else if (keyId.length === 1 && /[A-Za-z]/.test(keyId)) {
+      setFullText((prev) => prev + keyId.toUpperCase());
+    } else {
+      setFullText((prev) => prev + keyId);
+    }
   }, []);
 
   const handleClearText = useCallback(() => {
+    setSwipeSuggestions([]);
     setFullText("");
   }, []);
+
+  const handleSwipeComplete = useCallback((keyIds: string[]) => {
+    const words = predictSwipeWords(keyIds);
+    setSwipeSuggestions(words);
+  }, []);
+
+  const prefixSuggestions = useMemo(() => getWordSuggestions(fullText), [fullText]);
+  const suggestions = swipeSuggestions.length > 0 ? swipeSuggestions : prefixSuggestions;
+
+  const handleSuggestionSelect = useCallback((word: string) => {
+    setSwipeSuggestions([]);
+    setFullText((prev) => applyWordSuggestion(prev, word));
+  }, []);
+
+  const setThoughtPanelIntentSynced = useCallback((active: boolean) => {
+    if (thoughtPanelIntentRef.current === active) return;
+    thoughtPanelIntentRef.current = active;
+    setThoughtPanelIntent(active);
+  }, []);
+
+  const isPointerInsideThoughtPanel = useCallback((clientX: number, clientY: number) => {
+    const el = thoughtPanelRef.current;
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    return (
+      clientX >= r.left && clientX <= r.right && clientY >= r.top && clientY <= r.bottom
+    );
+  }, []);
+
+  const onThoughtPanelPointerEnter = useCallback(() => {
+    setThoughtPanelIntentSynced(true);
+  }, [setThoughtPanelIntentSynced]);
+
+  const onThoughtPanelPointerLeave = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      const next = e.relatedTarget;
+      if (next instanceof Node && thoughtPanelRef.current?.contains(next)) {
+        return;
+      }
+      setThoughtPanelIntentSynced(false);
+    },
+    [setThoughtPanelIntentSynced],
+  );
+
+  useEffect(() => {
+    const onWindowBlur = () => setThoughtPanelIntentSynced(false);
+    window.addEventListener("blur", onWindowBlur);
+    return () => window.removeEventListener("blur", onWindowBlur);
+  }, [setThoughtPanelIntentSynced]);
+
+  useEffect(() => {
+    if (!thoughtPanelIntent) return;
+
+    const verifyPointerStillInside = (e: PointerEvent) => {
+      if (!isPointerInsideThoughtPanel(e.clientX, e.clientY)) {
+        setThoughtPanelIntentSynced(false);
+      }
+    };
+
+    document.addEventListener("pointermove", verifyPointerStillInside);
+    document.addEventListener("pointerup", verifyPointerStillInside);
+    document.addEventListener("pointercancel", verifyPointerStillInside);
+    return () => {
+      document.removeEventListener("pointermove", verifyPointerStillInside);
+      document.removeEventListener("pointerup", verifyPointerStillInside);
+      document.removeEventListener("pointercancel", verifyPointerStillInside);
+    };
+  }, [thoughtPanelIntent, isPointerInsideThoughtPanel, setThoughtPanelIntentSynced]);
 
   const syncManualVelocityFromHeld = useCallback(() => {
     const v = netVelocityFromHeld(manualDirectionsHeldRef.current);
@@ -319,10 +400,8 @@ function App() {
       setCursorDisplay({ x: cx, y: cy });
       applyManualRest();
       manualTrackpadDriveRef.current = idleManualTrackpadDrive();
-      trackpadRef.current?.clearCanvas();
-      setCurrentLetter(null);
-      setFullText("");
-      setRecognizeError(null);
+      trackpadRef.current?.clearKeyboard();
+      setSwipeSuggestions([]);
       signalSmoothRef.current = 0;
       setSignalPct(0);
       penUpSinceRef.current = performance.now();
@@ -341,14 +420,6 @@ function App() {
       setSpikeStrength(0);
     }
     setManualNeuralBurst(null);
-  }, []);
-
-  useEffect(() => {
-    void fetch(BACKEND_ENDPOINTS.decoderMode, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ mode: "handwriting" }),
-    }).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -512,14 +583,15 @@ function App() {
     };
   }, [controlMode, applyManualDirectionDown, applyManualDirectionUp, applyManualRest]);
 
-  const metricsPenDown =
+  /** Actual click / pen_down — drives key select and pressed-key visuals. */
+  const clickActionPenDown =
     controlMode === "manual" ? manualPenDown : (decoderData?.pen_down ?? false);
 
   useEffect(() => {
-    if (!metricsPenDown) {
+    if (!thoughtPanelIntent) {
       penUpSinceRef.current = performance.now();
     }
-  }, [metricsPenDown]);
+  }, [thoughtPanelIntent]);
 
   useEffect(() => {
     let frameId = 0;
@@ -530,8 +602,7 @@ function App() {
       last = now;
 
       const mode = controlModeRef.current;
-      const penDown =
-        mode === "manual" ? manualPenDownRef.current : (decoderDataRef.current?.pen_down ?? false);
+      const penDown = thoughtPanelIntentRef.current;
       const penUpIdleSec = penDown ? 0 : (now - penUpSinceRef.current) / 1000;
 
       let confidence: number;
@@ -587,14 +658,13 @@ function App() {
     }
   };
 
-  const handleClearCanvas = () => {
-    trackpadRef.current?.clearCanvas();
+  const handleClearKeyboard = () => {
+    trackpadRef.current?.clearKeyboard();
     manualTrackpadDriveRef.current = idleManualTrackpadDrive();
     applyManualRest();
-  };
-
-  const handleRecognize = () => {
-    trackpadRef.current?.recognize();
+    setSwipeSuggestions([]);
+    manualPhysicsRef.current = seedCursorMotion(0.5, 0.5);
+    setCursorDisplay({ x: 0.5, y: 0.5 });
   };
 
   const manualDriving =
@@ -606,10 +676,7 @@ function App() {
   const signalTier = signalTierFromPct(signalPct);
   const signalStyle = signalTierStyles(signalTier);
 
-  const isComposing =
-    controlMode === "manual"
-      ? manualPenDown
-      : (decoderData?.pen_down ?? false);
+  const isComposing = clickActionPenDown;
 
   const displayConfidence =
     controlMode === "manual"
@@ -693,7 +760,7 @@ function App() {
         </div>
       </header>
 
-      <main className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[minmax(0,0.95fr)_minmax(0,1.2fr)_minmax(0,0.85fr)] gap-2 p-2 overflow-hidden">
+      <main className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[minmax(0,0.92fr)_minmax(0,1.35fr)] gap-2 p-2 overflow-hidden">
         {/* LEFT — decoder metrics + neural charts */}
         <aside className="order-2 lg:order-1 min-h-0 min-w-0 flex flex-col gap-2 overflow-hidden">
           <section className="shrink-0 rounded-xl border border-neutral-800/90 bg-gradient-to-b from-neutral-900/70 to-black/50 px-3 py-2.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
@@ -738,9 +805,15 @@ function App() {
                       : "—"}
                   </dd>
                 </div>
-                <div className="flex justify-between gap-1">
-                  <dt className="text-neutral-500">Pen</dt>
-                  <dd className="text-neutral-200 tabular-nums">{metricsPenDown ? "down" : "up"}</dd>
+                <div className="flex justify-between gap-1 col-span-2">
+                  <dt className="text-neutral-500">Click</dt>
+                  <dd
+                    className={`tabular-nums font-medium ${
+                      thoughtPanelIntent ? "text-emerald-400" : "text-neutral-500"
+                    }`}
+                  >
+                    {thoughtPanelIntent ? "Click Active" : "Click Idle"}
+                  </dd>
                 </div>
                 {controlMode === "automatic" && decoderData ? (
                   <>
@@ -819,7 +892,7 @@ function App() {
               controlMode={controlMode}
               manualBurst={manualNeuralBurst}
               totalChannels={totalChannels}
-              penDown={metricsPenDown}
+              penDown={thoughtPanelIntent}
               vx={metricsVx}
               vy={metricsVy}
               compact
@@ -827,135 +900,89 @@ function App() {
           </div>
         </aside>
 
-        {/* CENTER — square handwriting canvas */}
-        <section className="order-1 lg:order-2 min-h-0 min-w-0 flex flex-col items-center justify-center gap-2 overflow-hidden">
-          <div className="w-full max-w-full flex flex-col items-center shrink-0">
-            <p className="text-[10px] font-mono uppercase tracking-[0.18em] text-neutral-500 mb-1.5 self-start">
-              Handwriting canvas
-            </p>
-            <div
-              className="relative w-full aspect-square max-w-full"
-              style={{ maxHeight: "min(100%, calc(100vh - 11rem))" }}
-            >
-              <BCITrackpad
-                ref={trackpadRef}
-                className="absolute inset-0"
-                controlMode={controlMode}
-                cursorNorm={cursorDisplay}
-                vx={controlMode === "manual" ? manualCmd.vx : (decoderData?.vx ?? 0)}
-                vy={controlMode === "manual" ? manualCmd.vy : (decoderData?.vy ?? 0)}
-                penDown={metricsPenDown}
-                manualDriveRef={manualTrackpadDriveRef}
-                onRecognizeLetter={handleRecognizeLetter}
-                onRecognizeError={handleRecognizeError}
-                onCanvasCleared={handleCanvasCleared}
-              />
-            </div>
-
-            <div className="flex flex-wrap items-center justify-center gap-2 mt-3 w-full">
-              <button
-                type="button"
-                onClick={handleClearCanvas}
-                className="px-4 py-2 rounded-lg border border-red-500/40 bg-red-950/30 text-red-200 text-xs font-semibold hover:bg-red-950/50 transition-colors"
-              >
-                Clear canvas
-              </button>
-              <button
-                type="button"
-                onClick={handleRecognize}
-                className="px-4 py-2 rounded-lg border border-emerald-500/45 bg-emerald-950/40 text-emerald-200 text-xs font-semibold hover:bg-emerald-900/50 shadow-[0_0_20px_-8px_rgba(52,211,153,0.5)] transition-colors"
-              >
-                Recognize
-              </button>
-            </div>
-
-            <p className="mt-2 text-[10px] font-mono text-neutral-500 text-center leading-relaxed max-w-md">
-              Hover to move the stylus · click-drag to ink · Space = rest · arrow keys still steer in Manual
-            </p>
-            {controlMode === "automatic" && !decoderData && (
-              <p className="text-[10px] font-mono text-amber-500/80 mt-1">Waiting for decoder stream…</p>
-            )}
-          </div>
-        </section>
-
-        {/* RIGHT — thought-to-text output */}
-        <aside className="order-3 min-h-0 min-w-0 flex flex-col gap-2 overflow-hidden">
-          <section className="flex-1 min-h-0 flex flex-col rounded-xl border border-neutral-800/90 bg-gradient-to-b from-neutral-900/60 to-black/50 px-3 py-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
-            <div className="flex items-center justify-between gap-2 shrink-0 mb-3">
-              <h2 className="font-display text-[10px] font-semibold uppercase tracking-[0.2em] text-emerald-400/75">
-                Thought → Text
-              </h2>
-              {isComposing ? (
+        {/* CENTER — unified typing workspace */}
+        <section
+          ref={thoughtPanelRef}
+          className={`order-1 lg:order-2 flex-1 min-h-0 min-w-0 flex flex-col overflow-hidden ${DASHBOARD_PANEL}`}
+          onPointerEnter={onThoughtPanelPointerEnter}
+          onPointerLeave={onThoughtPanelPointerLeave}
+          onPointerCancel={() => setThoughtPanelIntentSynced(false)}
+        >
+          <div
+            className={`shrink-0 flex items-center justify-between gap-3 px-3 py-2.5 border-b ${DASHBOARD_DIVIDER}`}
+          >
+            <h2 className={DASHBOARD_PANEL_HEADER}>Thought → Text</h2>
+            <div className="flex items-center gap-2">
+              {thoughtPanelIntent ? (
                 <span className="text-[9px] font-mono font-medium text-emerald-400/95 uppercase tracking-wider animate-bci-pulse">
                   Live
                 </span>
               ) : (
-                <span className="text-[9px] font-mono text-neutral-600 uppercase tracking-wider">Standby</span>
+                <span className="text-[9px] font-mono text-neutral-500 uppercase tracking-wider">
+                  Standby
+                </span>
               )}
+              <button
+                type="button"
+                onClick={handleClearText}
+                disabled={fullText.length === 0}
+                className={`px-2.5 py-1 disabled:opacity-35 disabled:pointer-events-none ${DASHBOARD_BTN}`}
+              >
+                Clear
+              </button>
             </div>
+          </div>
 
-            <div className="shrink-0 mb-3">
-              <p className="text-[9px] font-mono font-semibold uppercase tracking-[0.18em] text-neutral-500 mb-1.5">
-                Current Letter
-              </p>
-              <div className={`relative rounded-lg border overflow-hidden flex items-center justify-center min-h-[4.5rem] px-3 py-2 ${
-                  recognizeError
-                    ? "border-amber-500/40 bg-amber-950/20"
-                    : "border-emerald-400/30 bg-emerald-950/20 shadow-[0_0_24px_-12px_rgba(52,211,153,0.35),inset_0_1px_0_rgba(255,255,255,0.05)]"
-                }`}>
-                <div className="absolute inset-0 bg-gradient-to-b from-emerald-500/[0.05] to-transparent pointer-events-none" />
-                <p
-                  className={`relative font-display font-bold tabular-nums leading-none select-none ${
-                    currentLetter != null
-                      ? "text-5xl sm:text-6xl text-emerald-50 tracking-tight"
-                      : "text-4xl text-neutral-600"
-                  } ${currentLetter === " " ? "underline decoration-emerald-400/50 decoration-2 underline-offset-[10px]" : ""}`}
-                  aria-live="polite"
-                  aria-atomic="true"
-                >
-                  {currentLetter ?? CURRENT_LETTER_IDLE}
-                </p>
-              </div>
-              {recognizeError ? (
-                <p className="mt-1.5 text-[9px] font-mono text-amber-400/90 leading-snug">{recognizeError}</p>
+          <div className={`shrink-0 h-[4.5rem] px-3 py-2 border-b ${DASHBOARD_DIVIDER} overflow-y-auto`}>
+            <p
+              className={`font-mono text-lg font-medium leading-snug tracking-tight break-words whitespace-pre-wrap ${
+                fullText.length === 0 ? "text-neutral-600 text-sm" : "text-neutral-100"
+              }`}
+              aria-live="polite"
+            >
+              {fullText.length === 0 ? FULL_TEXT_PLACEHOLDER : fullText}
+              {isComposing && fullText.length > 0 ? (
+                <span
+                  className="inline-block w-[2px] h-[0.85em] ml-0.5 align-middle rounded-sm bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)] animate-bci-caret"
+                  aria-hidden
+                />
               ) : null}
-            </div>
+            </p>
+          </div>
 
-            <div className="flex-1 min-h-0 flex flex-col">
-              <p className="text-[9px] font-mono font-semibold uppercase tracking-[0.18em] text-neutral-500 mb-1.5 shrink-0">
-                Full Text
-              </p>
-              <div className="relative flex-1 min-h-[7rem] rounded-lg border border-emerald-400/25 bg-black/40 overflow-hidden shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
-                <div className="absolute inset-0 bg-gradient-to-br from-emerald-500/[0.03] via-transparent to-transparent pointer-events-none" />
-                <div className="relative h-full overflow-y-auto px-3 py-3">
-                  <p
-                    className={`font-display text-lg sm:text-xl font-medium leading-relaxed tracking-tight break-words whitespace-pre-wrap ${
-                      fullText.length === 0 ? "text-neutral-600 italic text-base" : "text-neutral-100"
-                    }`}
-                    aria-live="polite"
-                  >
-                    {fullText.length === 0 ? FULL_TEXT_PLACEHOLDER : fullText}
-                    {isComposing && fullText.length > 0 ? (
-                      <span
-                        className="inline-block w-[2px] h-[0.9em] ml-0.5 align-middle rounded-sm bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)] animate-bci-caret"
-                        aria-hidden
-                      />
-                    ) : null}
-                  </p>
-                </div>
-              </div>
-            </div>
+          <div className={`relative flex-1 min-h-[14rem] w-full ${DASHBOARD_INNER_SURFACE}`}>
+            <BCITrackpad
+              ref={trackpadRef}
+              className="absolute inset-0"
+              controlMode={controlMode}
+              cursorNorm={cursorDisplay}
+              vx={controlMode === "manual" ? manualCmd.vx : (decoderData?.vx ?? 0)}
+              vy={controlMode === "manual" ? manualCmd.vy : (decoderData?.vy ?? 0)}
+              penDown={clickActionPenDown}
+              manualDriveRef={manualTrackpadDriveRef}
+              onKeyPress={handleKeyPress}
+              onSwipeComplete={handleSwipeComplete}
+              suggestions={suggestions}
+              onSuggestionSelect={handleSuggestionSelect}
+            />
+          </div>
 
+          <div
+            className={`shrink-0 flex items-center justify-end gap-2 px-3 py-2 border-t ${DASHBOARD_DIVIDER}`}
+          >
             <button
               type="button"
-              onClick={handleClearText}
-              disabled={fullText.length === 0}
-              className="mt-3 w-full shrink-0 rounded-lg border border-neutral-600/70 bg-neutral-950/80 px-3 py-2 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-500 hover:bg-neutral-900/90 disabled:opacity-40 disabled:pointer-events-none"
+              onClick={handleClearKeyboard}
+              className={`shrink-0 px-2.5 py-1 ${DASHBOARD_BTN}`}
             >
-              Clear Text
+              Reset cursor
             </button>
-          </section>
-        </aside>
+          </div>
+          {controlMode === "automatic" && !decoderData && (
+            <p className="shrink-0 px-3 pb-1.5 text-[10px] font-mono text-amber-500/80">Waiting for decoder stream…</p>
+          )}
+        </section>
+
       </main>
     </div>
   );

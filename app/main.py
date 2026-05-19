@@ -10,7 +10,6 @@ from pydantic import BaseModel, Field
 
 from app.decoder import (
     BciDecoder,
-    DecoderMode,
     RegressorKind,
     default_decoder_artifact_path,
     generate_training_data,
@@ -146,7 +145,6 @@ decoder = BciDecoder(
     channels=generator.num_channels,
     window_ms=200,
     exploration_prob=0.0,
-    output_mode="cursor",
     regressor=_decoder_reg,
 )
 _decoder_train_n = int(os.getenv("DECODER_TRAIN_SAMPLES", "25000"))
@@ -199,12 +197,6 @@ class ManualBurstRequest(BaseModel):
     duration_ms: float = Field(450.0, ge=50.0, le=1200.0)
 
 
-class SetDecoderModeRequest(BaseModel):
-    """Switch decoder output semantics (cursor vs handwriting pen lift)."""
-
-    mode: DecoderMode
-
-
 @app.get("/health")
 async def health() -> dict[str, object]:
     return {
@@ -212,7 +204,6 @@ async def health() -> dict[str, object]:
         "service": "neuralink-bci-sim-backend",
         "env": ENV,
         "decoder_trained": decoder.is_trained,
-        "decoder_mode": decoder.output_mode,
         "num_channels": generator.num_channels,
         "fs": generator.fs,
     }
@@ -227,7 +218,6 @@ async def decoder_info() -> dict[str, object]:
         "ensemble": "Ensemble(RandomForestRegressor + HistGradientBoostingRegressor)",
     }[decoder.regressor_kind]
     return {
-        "decoder_mode": decoder.output_mode,
         "regressor": decoder.regressor_kind,
         "model_type": _mt,
         "target_outputs": ["vx", "vy"],
@@ -252,13 +242,6 @@ async def health_redis() -> dict[str, object]:
 async def manual_neural_burst(body: ManualBurstRequest) -> dict[str, str]:
     generator.trigger_manual_burst(body.vx, body.vy, body.duration_ms)
     return {"status": "ok", "vx": str(body.vx), "vy": str(body.vy)}
-
-
-@app.post("/decoder/mode")
-async def set_decoder_mode(body: SetDecoderModeRequest) -> dict[str, str]:
-    """Runtime switch for handwriting vs cursor semantics (pen_down gating)."""
-    decoder.set_output_mode(body.mode)
-    return {"status": "ok", "mode": body.mode}
 
 
 @app.post("/decoder/reset")
@@ -325,7 +308,6 @@ async def decoder_stream(websocket: WebSocket):
                 packet["spikes"],
                 true_vx=generator.current_target_vx,
                 true_vy=generator.current_target_vy,
-                true_pen_down=generator.current_stream_pen_down,
             )
             out = decoded
             _log_i += 1

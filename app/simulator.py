@@ -51,7 +51,6 @@ class NeuralSignalGenerator:
 
         self.current_target_vx = 0.0
         self.current_target_vy = 0.0
-        self.current_stream_pen_down = True
         self._target_block_remaining = 0
 
         self._seg_start_vx = 0.0
@@ -104,7 +103,7 @@ class NeuralSignalGenerator:
         return extra.astype(np.float32)
 
     def _pick_new_velocity_endpoint(self) -> None:
-        """Sample a new segment endpoint ``(_seg_end_vx, _seg_end_vy)`` and pen state."""
+        """Sample a new segment endpoint ``(_seg_end_vx, _seg_end_vy)``."""
         if self.rng.random() < 0.2:
             self._seg_end_vx = float(self.rng.normal(0.0, 0.1))
             self._seg_end_vy = float(self.rng.normal(0.0, 0.1))
@@ -113,12 +112,6 @@ class NeuralSignalGenerator:
             mag = float(self.rng.uniform(0.2, 1.0))
             self._seg_end_vx = float(np.clip(mag * np.cos(ang), -1.0, 1.0))
             self._seg_end_vy = float(np.clip(mag * np.sin(ang), -1.0, 1.0))
-
-        speed = float(np.hypot(self._seg_end_vx, self._seg_end_vy))
-        if speed < 0.1:
-            self.current_stream_pen_down = bool(self.rng.random() < 0.45)
-        else:
-            self.current_stream_pen_down = bool(self.rng.random() < 0.82)
 
     async def stream(self) -> Dict[str, Any]:
         """Async generator that yields realistic 20 ms batches forever."""
@@ -148,12 +141,11 @@ class NeuralSignalGenerator:
             self.current_target_vx = float(np.clip(vx, -1.0, 1.0))
             self.current_target_vy = float(np.clip(vy, -1.0, 1.0))
 
-            pen = self.current_stream_pen_down
             self._stream_step += 1
             self._velocity_ring.append((self.current_target_vx, self.current_target_vy))
 
             multipliers = velocity_spike_multipliers(
-                self.current_target_vx, self.current_target_vy, pen, self.num_channels
+                self.current_target_vx, self.current_target_vy, True, self.num_channels
             )
             speed = float(np.hypot(self.current_target_vx, self.current_target_vy))
             multipliers = multipliers * float(1.0 + 0.28 * min(speed, 1.0))
@@ -165,10 +157,7 @@ class NeuralSignalGenerator:
             if self._stream_step % 50 == 0 and self._velocity_ring:
                 mvx = float(np.mean([p[0] for p in self._velocity_ring]))
                 mvy = float(np.mean([p[1] for p in self._velocity_ring]))
-                print(
-                    f"[simulator] rolling mean target v=({mvx:+.2f},{mvy:+.2f}) "
-                    f"pen={self.current_stream_pen_down}"
-                )
+                print(f"[simulator] rolling mean target v=({mvx:+.2f},{mvy:+.2f})")
 
             packet = SignalPacket(
                 timestamp_ms=time.time() * 1000,
