@@ -1,2 +1,0 @@
-# Large trained artifacts — store blobs in Git LFS, keep tiny pointer files in Git history.
-models/*.pkl filter=lfs diff=lfs merge=lfs -text
