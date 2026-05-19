@@ -1,11 +1,12 @@
-# Version control — keep .github out of the image; .git must stay in the *build context*
-# so the Dockerfile can run `git lfs pull` and materialize models/*.pkl (Railway, compose).
+# Version control — never send VCS metadata or LFS config into the image build context.
+.git
+.gitattributes
 .github
 
-# models/ must remain in context; only allow pickles under models/ (no stray multi-GB dumps).
-*.pkl
-!models/*.pkl
-!models/
+# Large decoder weights (~2 GB) — mount at runtime (docker-compose volume, Railway volume)
+# or set MODEL_PATH / DECODER_MODEL_PATH. Keeps build context small and fast.
+models/*.pkl
+models/**/*.pkl
 
 # Python caches and envs
 __pycache__
@@ -28,9 +29,7 @@ htmlcov
 .env.*
 
 # Frontend belongs to its own image
-frontend/node_modules
-frontend/dist
-frontend/.vite
+frontend/
 
 # Tests and CI-only files are not copied into the backend image
 tests
@@ -38,6 +37,7 @@ tests
 # Editor / OS noise
 .idea
 .vscode
+.cursor
 *.swp
 .DS_Store
 Thumbs.db

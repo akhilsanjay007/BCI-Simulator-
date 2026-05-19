@@ -13,7 +13,7 @@ from sklearn.preprocessing import StandardScaler
 
 RegressorKind = Literal["rf", "hgb", "ensemble"]
 
-# Default trained weights relative to repo root (Docker WORKDIR / app cwd). Tracked with Git LFS.
+# Default trained weights relative to repo root (Docker WORKDIR / app cwd). Mount or MODEL_PATH in prod.
 MODEL_PATH = "models/velocity_decoder.pkl"
 
 # Per-channel blocks in :func:`compute_window_features`: base 11 + tail(5,10,20) 3 + two deltas 2 + peer corr 1.
@@ -897,19 +897,19 @@ def default_decoder_artifact_path() -> Path:
 
 
 def velocity_decoder_missing_help(path: Path) -> str:
-    """Explain missing or unstaged LFS objects for operators (training + Git LFS + Docker)."""
+    """Explain missing weights for operators (local file, volume mount, or train)."""
     print(
-        "[decoder] Trained model missing or Git LFS pointer not materialized. Run: git lfs pull",
+        "[decoder] Trained model missing or Git LFS pointer not materialized.",
         file=sys.stderr,
         flush=True,
     )
     return (
         f"Velocity decoder weights are missing or not materialized at '{path}'. "
-        f"Expected file: `{MODEL_PATH}` (Git LFS). Run: git lfs pull "
-        "(repo root, or rebuild the image so the Dockerfile can run `git lfs pull`). "
-        "Also: `git lfs install` once per machine. "
-        "To train locally: `python -m app.offline_eval --retrain --artifact models/velocity_decoder.pkl`. "
-        "Override path with env `MODEL_PATH` or `DECODER_MODEL_PATH`."
+        f"Expected file: `{MODEL_PATH}`. "
+        "Docker: mount `./models` to `/app/models` (see docker-compose.yml) or set "
+        "`MODEL_PATH` / `DECODER_MODEL_PATH`. "
+        "If the file is a Git LFS pointer: `git lfs pull` at repo root. "
+        "To train locally: `python -m app.offline_eval --retrain --artifact models/velocity_decoder.pkl`."
     )
 
 

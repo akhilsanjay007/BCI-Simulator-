@@ -2,11 +2,8 @@
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
-# Git LFS: the root Dockerfile runs `git lfs pull` during the image build. The build context must
-# include `.git` and `models/*.pkl` pointers (see root `.dockerignore`). Railway’s Docker build
-# receives the repo checkout; keep Git LFS files tracked and ensure the remote (e.g. GitHub) has LFS
-# bandwidth/storage for ~2GB objects. Private repos: Railway must be able to reach your Git host over
-# HTTPS for LFS fetch (same as `git clone` / deploy hooks).
+# Decoder weights (~2 GB) are not baked into the image (see root `.dockerignore`). Attach a volume at
+# `/app/models` with `velocity_decoder.pkl`, or set `MODEL_PATH` / `DECODER_MODEL_PATH`.
 
 [deploy]
 healthcheckPath = "/health"
@@ -24,7 +21,7 @@ restartPolicyType = "ON_FAILURE"
 #   2. Attach to backend service
 #   3. Mount path: /app/models
 #   4. Upload models/velocity_decoder.pkl into the volume (e.g. railway ssh + copy, or one-off job)
-#      Mount replaces the image’s /app/models at runtime; baked-in LFS weights are hidden until the
+#      Mount provides /app/models at runtime; the image ships an empty models/ directory until the
 #      file exists on the volume.
 #   5. Set RAILWAY_RUN_UID=0 on the backend (image runs as non-root user `app`; volumes mount root-owned)
 #   6. ENV=production, REDIS_URL, FRONTEND_URL as below
