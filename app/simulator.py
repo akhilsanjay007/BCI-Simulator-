@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from collections import deque
-from typing import Any, Deque, Dict
+from typing import Any, Deque, Dict, Literal
 
 import numpy as np
 from pydantic import BaseModel, Field
@@ -15,6 +16,7 @@ from app.recording_replay import (
     RecordingReplay,
     ReplayTiming,
     create_replay_for_recording,
+    resolve_recording_file_path,
     try_create_replay,
 )
 from app.redis_client import get_redis_client
@@ -22,6 +24,9 @@ from app.redis_client import get_redis_client
 # Hold each velocity segment for many batches; within the segment we linearly ramp
 # start→end so firing rates change smoothly (continuous trajectory, not step targets).
 _VELOCITY_HOLD_BATCHES = 50  # 50 × 20 ms = 1.0 s at fs=1000, batch_size=fs//50
+
+
+SimulatorMode = Literal["live", "playback"]
 
 
 class SignalPacket(BaseModel):
@@ -71,6 +76,10 @@ class NeuralSignalGenerator:
         self._manual_burst_vy: float = 0.0
 
         self._replay: RecordingReplay | None = try_create_replay()
+        self._mode: SimulatorMode = "live"
+        self._playback_buffer_ms = float(
+            np.clip(float(os.environ.get("PLAYBACK_LATENCY_BUFFER_MS", "120.0")), 40.0, 300.0)
+        )
         self.replay_cursor_x = 0.5
         self.replay_cursor_y = 0.5
         self.current_pen_down = False
@@ -78,6 +87,14 @@ class NeuralSignalGenerator:
     @property
     def replay_active(self) -> bool:
         return self._replay is not None
+
+    @property
+    def mode(self) -> SimulatorMode:
+        return self._mode
+
+    @property
+    def playback_active(self) -> bool:
+        return self._mode == "playback" and self._replay is not None
 
     @property
     def replay_session_id(self) -> str | None:
@@ -90,9 +107,60 @@ class NeuralSignalGenerator:
         return self._replay.active_recording_id
 
     @property
+    def replay_recording_file(self) -> str | None:
+        rid = self.replay_recording_id
+        return f"{rid}.json" if rid else None
+
+    @property
     def replay_demo_id(self) -> str | None:
         """Legacy alias for ``replay_recording_id``."""
         return self.replay_recording_id
+
+    @property
+    def replay_paused(self) -> bool:
+        return self._replay.paused if self._replay is not None else False
+
+    @property
+    def replay_elapsed_ms(self) -> float:
+        return self._replay.elapsed_ms if self._replay is not None else 0.0
+
+    @property
+    def replay_duration_ms(self) -> float:
+        return self._replay.duration_ms if self._replay is not None else 0.0
+
+    @property
+    def replay_progress(self) -> float:
+        return self._replay.progress if self._replay is not None else 0.0
+
+    @property
+    def replay_speed(self) -> float:
+        return self._replay.speed if self._replay is not None else 1.0
+
+    def set_mode(self, mode: SimulatorMode) -> None:
+        if mode == "playback" and self._replay is None:
+            raise ValueError("Cannot enable playback mode without a loaded recording.")
+        self._mode = mode
+
+    def set_replay_recording_file(
+        self,
+        recording_file: str,
+        *,
+        timing: ReplayTiming = "original",
+    ) -> None:
+        """Load replay from an explicit ``recordings/*.json`` filename."""
+        batch_ms = (self.fs // 50) * self.dt * 1000.0
+        path = resolve_recording_file_path(recording_file)
+        self._replay = RecordingReplay([path], batch_ms=batch_ms, timing=timing)
+        self._mode = "playback"
+        self.replay_cursor_x = 0.5
+        self.replay_cursor_y = 0.5
+        self.current_pen_down = False
+        self.current_target_vx = 0.0
+        self.current_target_vy = 0.0
+        print(
+            f"[simulator] replay file={recording_file} timing={timing} "
+            f"session={self._replay.session_id}"
+        )
 
     def set_replay_recording(
         self,
@@ -107,6 +175,7 @@ class NeuralSignalGenerator:
             batch_ms=batch_ms,
             timing=timing,
         )
+        self._mode = "playback"
         self.replay_cursor_x = 0.5
         self.replay_cursor_y = 0.5
         self.current_pen_down = False
@@ -120,6 +189,33 @@ class NeuralSignalGenerator:
     def set_replay_demo(self, demo_id: str) -> None:
         """Legacy alias — same as ``set_replay_recording``."""
         self.set_replay_recording(demo_id)
+
+    def replay_play(self) -> None:
+        if self._replay is not None:
+            self._replay.play()
+
+    def replay_pause(self) -> None:
+        if self._replay is not None:
+            self._replay.pause()
+
+    def replay_restart(self) -> None:
+        if self._replay is not None:
+            self._replay.restart()
+            self.replay_cursor_x = 0.5
+            self.replay_cursor_y = 0.5
+            self.current_pen_down = False
+            self.current_target_vx = 0.0
+            self.current_target_vy = 0.0
+
+    def replay_seek(self, progress: float) -> None:
+        if self._replay is not None:
+            self._replay.seek_progress(progress)
+            self.current_target_vx = 0.0
+            self.current_target_vy = 0.0
+
+    def replay_set_speed(self, speed: float) -> None:
+        if self._replay is not None:
+            self._replay.set_speed(speed)
 
     def trigger_manual_burst(self, vx: float, vy: float, duration_ms: float) -> None:
         """
@@ -172,7 +268,7 @@ class NeuralSignalGenerator:
 
     def _advance_ground_truth(self, batch_ms: float) -> None:
         """Update ``current_target_*``, replay cursor, and pen from recording or random walk."""
-        if self._replay is not None:
+        if self.playback_active:
             frame = self._replay.advance(batch_ms)
             self.current_target_vx = frame.vx
             self.current_target_vy = frame.vy
@@ -199,10 +295,11 @@ class NeuralSignalGenerator:
 
     async def stream(self) -> Dict[str, Any]:
         """Async generator that yields realistic 20 ms batches forever."""
-        batch_size = self.fs // 50  # 20 ms batches → smooth real-time feel
-        batch_ms = batch_size * self.dt * 1000.0
+        base_batch_size = self.fs // 50  # 20 ms baseline when live
+        base_batch_ms = base_batch_size * self.dt * 1000.0
         t = 0.0
         redis_client = get_redis_client()
+        playback_emit_deadline_ms: float | None = None
 
         if self._replay is not None:
             print(
@@ -211,13 +308,18 @@ class NeuralSignalGenerator:
             )
 
         while True:
+            step_ms = base_batch_ms
+            if self.playback_active and self._replay is not None:
+                step_ms = max(8.0, self._replay.next_step_ms(base_batch_ms))
+            batch_size = max(1, int(round((step_ms / 1000.0) * self.fs)))
+
             noise = self.rng.normal(0, 1.0, size=(batch_size, self.num_channels))
             modulation = 0.3 * np.sin(2 * np.pi * self.freqs * t)  # vectorized
             lfp = (noise + modulation).tolist()
 
             base_prob = self.base_spike_rate * self.dt
 
-            self._advance_ground_truth(batch_ms)
+            self._advance_ground_truth(step_ms)
 
             self._stream_step += 1
             self._velocity_ring.append((self.current_target_vx, self.current_target_vy))
@@ -248,13 +350,31 @@ class NeuralSignalGenerator:
                 spikes=spikes,
             )
 
+            if self.playback_active:
+                source_ts_ms = packet.timestamp_ms
+                now_ms = time.time() * 1000.0
+                if playback_emit_deadline_ms is None:
+                    playback_emit_deadline_ms = now_ms + self._playback_buffer_ms
+                else:
+                    playback_emit_deadline_ms += step_ms
+                    if playback_emit_deadline_ms < now_ms:
+                        playback_emit_deadline_ms = now_ms
+                sleep_ms = playback_emit_deadline_ms - now_ms
+                if sleep_ms > 0.5:
+                    await asyncio.sleep(sleep_ms / 1000.0)
+                # Keep timestamp as source-generation time so clients can measure one-way latency.
+                packet.timestamp_ms = source_ts_ms
+            else:
+                playback_emit_deadline_ms = None
+
             dumped = packet.model_dump()
             if redis_client is not None:
                 await redis_client.publish_signal_packet(dumped)
             yield dumped
 
-            t += batch_size * self.dt
-            await asyncio.sleep(batch_size * self.dt)
+            t += step_ms / 1000.0
+            if not self.playback_active:
+                await asyncio.sleep(step_ms / 1000.0)
 
 
 generator = NeuralSignalGenerator(num_channels=32, fs=1000)

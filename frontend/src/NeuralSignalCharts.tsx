@@ -80,12 +80,14 @@ interface NeuralSignalChartsProps {
   compact?: boolean;
 }
 
-function buildColumnAutomatic(nowSec: number, nCh: number, penDown: boolean): boolean[] {
+function buildColumnAutomatic(nowSec: number, nCh: number, penDown: boolean, speed: number): boolean[] {
+  const drive = clamp(speed, 0, 1);
   return Array.from({ length: nCh }, (_, ch) => {
     let r = Math.min(
-      0.1,
+      0.14,
       0.016 +
-        0.045 * (0.5 + 0.5 * Math.sin(nowSec * 1.05 + ch * 0.37 + Math.sin(nowSec * 0.3))),
+        0.045 * (0.5 + 0.5 * Math.sin(nowSec * 1.05 + ch * 0.37 + Math.sin(nowSec * 0.3))) +
+        0.06 * drive,
     );
     if (penDown) {
       r = Math.min(0.16, r + 0.055 + 0.02 * Math.sin(nowSec * 6 + ch * 0.2));
@@ -482,10 +484,11 @@ export function NeuralSignalCharts({
         const { controlMode: mode, manualBurst: burst, displayCount: n, totalChannels: t, penDown: pd, vx, vy } =
           propsRef.current;
         const cols = columnsRef.current;
+        const speed = Math.hypot(vx, vy);
         const col =
           mode === "manual"
             ? buildColumnManual(Date.now(), burst, n, t, pd)
-            : buildColumnAutomatic(now / 1000, n, pd);
+            : buildColumnAutomatic(now / 1000, n, pd, speed);
         cols.push(col);
         cols.shift();
         penByColRef.current.push(pd);

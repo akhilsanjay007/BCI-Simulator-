@@ -18,10 +18,12 @@ from app.recording_replay import (
     recording_label_from_id,
     replay_enabled_from_env,
     resample_points_smooth_125hz,
+    resolve_recording_file_path,
     resolve_demo_path,
     resolve_recording_path,
     resolve_recording_paths,
     try_create_replay,
+    validate_recording_file,
 )
 
 
@@ -81,6 +83,16 @@ def test_resolve_paths_explicit(tmp_path: Path) -> None:
     _write_minimal_recording(path)
     found = resolve_recording_paths(explicit_path=str(path))
     assert found == [path]
+
+
+def test_validate_recording_file_accepts_json_name() -> None:
+    assert validate_recording_file("session_20250520_143022.json") == "session_20250520_143022.json"
+
+
+def test_resolve_recording_file_path(tmp_path: Path) -> None:
+    path = tmp_path / "session_a.json"
+    _write_minimal_recording(path)
+    assert resolve_recording_file_path("session_a.json", recordings_dir=tmp_path) == path
 
 
 def test_try_create_replay_disabled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -166,3 +178,34 @@ def test_resample_helper_uniform_step() -> None:
     out = resample_points_smooth_125hz(pts)
     assert len(out) >= 5
     assert out[1].t_ms - out[0].t_ms == pytest.approx(8.0)
+
+
+def test_load_recording_points_fallbacks_to_125hz_on_bad_timestamps(tmp_path: Path) -> None:
+    path = tmp_path / "session_test.json"
+    path.write_text(
+        json.dumps(
+            {
+                "session_id": "session_test",
+                "samples": [
+                    {"x": 0.5, "y": 0.5, "timestamp_ms": 1000, "clicked": False},
+                    {"x": 0.6, "y": 0.5, "timestamp_ms": 990, "clicked": False},
+                    {"x": 0.7, "y": 0.5, "timestamp_ms": 980, "clicked": True},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    _sid, pts = load_recording_points(path, timing="original")
+    assert pts[1].t_ms - pts[0].t_ms == pytest.approx(8.0)
+    assert pts[2].t_ms - pts[1].t_ms == pytest.approx(8.0)
+
+
+def test_next_step_ms_uses_recording_timestamps(tmp_path: Path) -> None:
+    path = tmp_path / "session_test.json"
+    _write_minimal_recording(path, n=5)
+    replay = RecordingReplay([path], batch_ms=20.0, timing="original")
+    step = replay.next_step_ms(20.0)
+    assert step == pytest.approx(40.0)
+    replay.advance(step)
+    step2 = replay.next_step_ms(20.0)
+    assert step2 == pytest.approx(40.0)
