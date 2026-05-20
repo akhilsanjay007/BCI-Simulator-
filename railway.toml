@@ -15,6 +15,11 @@ restartPolicyType = "ON_FAILURE"
 #   REDIS_URL=redis://...          # Railway Redis plugin or external
 #   FRONTEND_URL=https://<frontend>.up.railway.app
 # Optional: MODEL_PATH / DECODER_MODEL_PATH (default models/velocity_decoder.pkl → /app/models/…)
+# Recording replay (Automatic mode): demos ship in the image under /app/recordings.
+#   BCI_RECORDINGS_DIR=/app/recordings   (default when recordings/ is copied in Dockerfile)
+#   BCI_REPLAY=0                         disable replay on startup
+#   BCI_RECORDING_PATH=/path/to.json     force one file at startup
+# Optional volume: mount extra session JSON at /app/recordings (same path as decoder volume pattern).
 #
 # Persistent decoder weights (Railway UI — not supported in railway.toml yet):
 #   1. Create volume name: decoder-model

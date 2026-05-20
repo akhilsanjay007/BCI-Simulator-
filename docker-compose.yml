@@ -15,12 +15,15 @@ services:
       REDIS_STREAM_SIGNALS: bci:signals
       REDIS_STREAM_RETENTION_SECONDS: "20"
       REDIS_MAX_CONNECTIONS: "50"
+      # Automatic-mode replay: any recordings/*.json on the mounted volume.
+      BCI_RECORDINGS_DIR: /app/recordings
     depends_on:
       redis:
         condition: service_healthy
     # Decoder weights are excluded from the image (.dockerignore); bind-mount from the host.
     volumes:
       - ./models:/app/models:ro
+      - ./recordings:/app/recordings:ro
     restart: unless-stopped
 
   frontend:

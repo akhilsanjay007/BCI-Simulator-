@@ -53,9 +53,42 @@ const BACKEND_WS_ORIGIN = toWebSocketOrigin(BACKEND_HTTP_ORIGIN);
 const BACKEND_ENDPOINTS = {
   manualNeuralBurst: `${BACKEND_HTTP_ORIGIN}/manual-neural-burst`,
   simulatorConfig: `${BACKEND_HTTP_ORIGIN}/simulator/config`,
+  recordings: `${BACKEND_HTTP_ORIGIN}/api/recordings`,
+  selectRecording: `${BACKEND_HTTP_ORIGIN}/api/recordings/select`,
   decoderReset: `${BACKEND_HTTP_ORIGIN}/decoder/reset`,
   decoderWs: `${BACKEND_WS_ORIGIN}/ws/decoder`,
 } as const;
+
+type ReplayTiming = "original" | "smooth_125hz";
+
+interface SavedRecording {
+  recording_id: string;
+  label: string;
+  typed_text: string;
+  duration_ms: number;
+  sample_count: number;
+}
+
+interface RecordingsListResponse {
+  recordings?: SavedRecording[];
+  demos?: SavedRecording[];
+  selected_recording_id?: string | null;
+  selected_demo_id?: string | null;
+  replay_active: boolean;
+}
+
+function formatRecordingDuration(ms: number): string {
+  if (ms < 1000) return `${ms} ms`;
+  const sec = Math.round(ms / 1000);
+  return sec < 60 ? `${sec}s` : `${Math.floor(sec / 60)}m ${sec % 60}s`;
+}
+
+function recordingOptionLabel(r: SavedRecording): string {
+  const preview = r.typed_text.trim();
+  const suffix = preview ? ` — ${preview.length > 28 ? `${preview.slice(0, 28)}…` : preview}` : "";
+  const dur = r.duration_ms > 0 ? ` (${formatRecordingDuration(r.duration_ms)})` : "";
+  return `${r.label}${suffix}${dur}`;
+}
 
 /** Hint when the accumulated sentence is empty. */
 const FULL_TEXT_PLACEHOLDER = "Type with the BCI cursor on the keyboard…";
@@ -168,6 +201,10 @@ function App() {
   const [signalPct, setSignalPct] = useState(0);
   /** Pointer over the full Thought → Text panel (hover = decode intent). */
   const [thoughtPanelIntent, setThoughtPanelIntent] = useState(false);
+  const [savedRecordings, setSavedRecordings] = useState<SavedRecording[]>([]);
+  const [selectedRecordingId, setSelectedRecordingId] = useState<string | null>(null);
+  const [replayTiming, setReplayTiming] = useState<ReplayTiming>("original");
+  const [recordingSelectBusy, setRecordingSelectBusy] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const trackpadRef = useRef<BCITrackpadHandle | null>(null);
@@ -422,16 +459,90 @@ function App() {
     setManualNeuralBurst(null);
   }, []);
 
+  const refreshRecordings = useCallback(async () => {
+    try {
+      const r = await fetch(BACKEND_ENDPOINTS.recordings);
+      if (!r.ok) return;
+      const j = (await r.json()) as RecordingsListResponse;
+      const list = Array.isArray(j.recordings)
+        ? j.recordings
+        : Array.isArray(j.demos)
+          ? j.demos.map((d) => ({
+              ...d,
+              recording_id:
+                "recording_id" in d && typeof d.recording_id === "string"
+                  ? d.recording_id
+                  : (d as { demo_id?: string }).demo_id ?? "",
+            }))
+          : [];
+      if (list.length > 0) {
+        setSavedRecordings(list);
+      }
+      const selected =
+        typeof j.selected_recording_id === "string"
+          ? j.selected_recording_id
+          : typeof j.selected_demo_id === "string"
+            ? j.selected_demo_id
+            : null;
+      if (selected) {
+        setSelectedRecordingId(selected);
+      }
+    } catch {
+      /* backend may be offline */
+    }
+  }, []);
+
+  const selectRecording = useCallback(
+    async (recordingId: string, timing: ReplayTiming = replayTiming) => {
+      if (recordingSelectBusy || !recordingId) return;
+      setRecordingSelectBusy(true);
+      try {
+        const r = await fetch(BACKEND_ENDPOINTS.selectRecording, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ recording_id: recordingId, timing }),
+        });
+        const j = (await r.json()) as {
+          status?: string;
+          selected_recording_id?: string;
+          selected_demo_id?: string;
+        };
+        const picked = j.selected_recording_id ?? j.selected_demo_id;
+        if (r.ok && j.status === "ok" && typeof picked === "string") {
+          setSelectedRecordingId(picked);
+          setReplayTiming(timing);
+          trackpadRef.current?.clearKeyboard();
+        }
+      } catch {
+        /* ignore */
+      } finally {
+        setRecordingSelectBusy(false);
+      }
+    },
+    [recordingSelectBusy, replayTiming],
+  );
+
   useEffect(() => {
     void fetch(BACKEND_ENDPOINTS.simulatorConfig)
       .then((r) => (r.ok ? r.json() : null))
-      .then((j: { num_channels?: number } | null) => {
+      .then(
+        (j: {
+          num_channels?: number;
+          selected_recording_id?: string | null;
+          selected_demo_id?: string | null;
+        } | null) => {
         if (j && typeof j.num_channels === "number" && j.num_channels >= 1) {
           setTotalChannels(Math.floor(j.num_channels));
         }
-      })
+        const picked = j?.selected_recording_id ?? j?.selected_demo_id;
+        if (typeof picked === "string") {
+          setSelectedRecordingId(picked);
+        }
+      },
+      )
       .catch(() => {});
-  }, []);
+    void refreshRecordings();
+  }, [refreshRecordings]);
 
   useEffect(() => {
     const ws = new WebSocket(BACKEND_ENDPOINTS.decoderWs);
@@ -741,6 +852,50 @@ function App() {
             Manual
           </button>
         </div>
+
+        {controlMode === "automatic" && savedRecordings.length > 0 ? (
+          <div
+            className="flex items-center gap-2 min-w-0 max-w-[min(100%,42rem)] rounded-xl border border-neutral-700/80 bg-black/70 px-2.5 py-1.5"
+            aria-label="Recording replay"
+          >
+            <label className="sr-only" htmlFor="recording-select">
+              Recording
+            </label>
+            <select
+              id="recording-select"
+              value={selectedRecordingId ?? savedRecordings[0]?.recording_id ?? ""}
+              disabled={recordingSelectBusy}
+              title="Replay a saved trackpad session in Automatic mode"
+              className="min-w-0 flex-1 max-w-[18rem] sm:max-w-[22rem] rounded-lg border border-neutral-600/80 bg-neutral-950/90 px-2 py-1.5 text-xs font-medium text-neutral-100 outline-none focus:border-violet-500/60 disabled:opacity-50"
+              onChange={(e) => void selectRecording(e.target.value, replayTiming)}
+            >
+              {savedRecordings.map((rec) => (
+                <option key={rec.recording_id} value={rec.recording_id}>
+                  {recordingOptionLabel(rec)}
+                </option>
+              ))}
+            </select>
+            <label className="sr-only" htmlFor="replay-timing">
+              Replay timing
+            </label>
+            <select
+              id="replay-timing"
+              value={replayTiming}
+              disabled={recordingSelectBusy}
+              title="Original timing uses recorded timestamps; Smooth 125 Hz resamples to 8 ms steps"
+              className="shrink-0 rounded-lg border border-neutral-600/80 bg-neutral-950/90 px-2 py-1.5 text-[11px] font-mono text-neutral-300 outline-none focus:border-violet-500/60 disabled:opacity-50"
+              onChange={(e) => {
+                const timing = e.target.value as ReplayTiming;
+                setReplayTiming(timing);
+                const id = selectedRecordingId ?? savedRecordings[0]?.recording_id;
+                if (id) void selectRecording(id, timing);
+              }}
+            >
+              <option value="original">Original timing</option>
+              <option value="smooth_125hz">Smooth 125 Hz</option>
+            </select>
+          </div>
+        ) : null}
 
         <div
           className={`shrink-0 flex items-center gap-2 px-3 py-1.5 rounded-lg text-[11px] font-mono font-medium border ${
