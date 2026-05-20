@@ -49,7 +49,7 @@ CURSOR_NEAR_ZERO_EXTRA_DAMPING_PER_S = 4.5
 CURSOR_WEAK_CONF_DAMPING_PER_S = 3.5
 
 # EMA on regressed (vx, vy) before cursor integration (Neuralink-style temporal smoothing).
-VELOCITY_EMA_ALPHA = 0.30
+VELOCITY_EMA_ALPHA = 0.22
 # Trees used for prediction spread → confidence (cap for latency on large forests).
 CONFIDENCE_TREE_SAMPLE = 64
 # Click threshold on smoothed speed (keyboard select): below this ⇒ "lifted".
@@ -338,7 +338,7 @@ class BciDecoder:
         channels: int,
         window_ms: int = 200,
         exploration_prob: float = 0.08,
-        cursor_smooth_alpha: float = 0.24,
+        cursor_smooth_alpha: float = 0.18,
         regressor: RegressorKind = "ensemble",
     ) -> None:
         if fs <= 0:

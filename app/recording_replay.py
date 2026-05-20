@@ -20,6 +20,7 @@ DEFAULT_RECORDINGS_DIR = REPO_ROOT / "recordings"
 # Match simulator batch cadence: fs=1000, batch_size=fs//50 → 20 ms
 DEFAULT_BATCH_MS = 20.0
 SMOOTH_125HZ_STEP_MS = 8.0
+FALLBACK_125HZ_STEP_MS = 8.0
 
 ReplayTiming = Literal["original", "smooth_125hz"]
 
@@ -80,6 +81,19 @@ def validate_recording_id(recording_id: str) -> str:
     if not _ID_RE.fullmatch(cleaned):
         raise ValueError(f"Invalid recording id: {recording_id!r}")
     return cleaned
+
+
+def validate_recording_file(recording_file: str) -> str:
+    """Validate a recording filename like ``session_20250520_143022.json``."""
+    cleaned = recording_file.strip()
+    if not cleaned.lower().endswith(".json"):
+        raise ValueError(f"Recording file must end with .json: {recording_file!r}")
+    name = Path(cleaned).name
+    stem = name[:-5]
+    validate_recording_id(stem)
+    if name != cleaned:
+        raise ValueError(f"Recording file must not include directories: {recording_file!r}")
+    return name
 
 
 def recording_id_from_path(path: Path) -> str:
@@ -146,6 +160,24 @@ def resolve_recording_path(
         path.relative_to(root.resolve())
     except ValueError as e:
         raise FileNotFoundError(f"Recording not found: {cleaned}") from e
+    return path
+
+
+def resolve_recording_file_path(
+    recording_file: str,
+    *,
+    recordings_dir: Path | None = None,
+) -> Path:
+    """Resolve ``recordings/<recording_file>`` where file is ``*.json``."""
+    filename = validate_recording_file(recording_file)
+    root = recordings_root(recordings_dir)
+    path = (root / filename).resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Recording not found: {filename}")
+    try:
+        path.relative_to(root.resolve())
+    except ValueError as e:
+        raise FileNotFoundError(f"Recording not found: {filename}") from e
     return path
 
 
@@ -256,17 +288,34 @@ def load_recording_points(
     if not isinstance(raw_samples, list) or len(raw_samples) < 2:
         raise ValueError(f"Recording has too few samples: {path}")
 
-    t0 = int(raw_samples[0]["timestamp_ms"])
+    t0 = float(raw_samples[0]["timestamp_ms"])
     points: list[_ReplayPoint] = []
+    prev_t_ms = -1.0
+    invalid_timestamps = False
     for s in raw_samples:
+        t_ms = float(s["timestamp_ms"]) - t0
+        if not np.isfinite(t_ms) or t_ms < prev_t_ms:
+            invalid_timestamps = True
         points.append(
             _ReplayPoint(
-                t_ms=float(int(s["timestamp_ms"]) - t0),
+                t_ms=t_ms,
                 x=float(np.clip(float(s["x"]), 0.0, 1.0)),
                 y=float(np.clip(float(s["y"]), 0.0, 1.0)),
                 clicked=bool(s.get("clicked", False)),
             )
         )
+        prev_t_ms = t_ms
+    if invalid_timestamps or points[-1].t_ms <= 0.0:
+        # Fallback for malformed/non-monotonic timestamps: enforce 125 Hz timing.
+        points = [
+            _ReplayPoint(
+                t_ms=i * FALLBACK_125HZ_STEP_MS,
+                x=p.x,
+                y=p.y,
+                clicked=p.clicked,
+            )
+            for i, p in enumerate(points)
+        ]
     if timing == "smooth_125hz":
         points = resample_points_smooth_125hz(points)
     return session_id, points
@@ -297,27 +346,73 @@ class RecordingReplay:
         ]
         self._session_idx = 0
         self._points = self._sessions[0][1]
+        self._point_times = np.asarray([p.t_ms for p in self._points], dtype=np.float64)
         self._duration_ms = self._points[-1].t_ms
         self._elapsed_ms = 0.0
         self._prev_x = self._points[0].x
         self._prev_y = self._points[0].y
+        self._prev_t_ms = self._points[0].t_ms
+        self._paused = False
+        self._speed = 1.0
         self.session_id = self._sessions[0][0]
 
     @property
     def active(self) -> bool:
         return True
 
+    @property
+    def paused(self) -> bool:
+        return self._paused
+
+    @property
+    def speed(self) -> float:
+        return self._speed
+
+    @property
+    def duration_ms(self) -> float:
+        return float(self._duration_ms)
+
+    @property
+    def elapsed_ms(self) -> float:
+        return float(self._elapsed_ms)
+
+    @property
+    def progress(self) -> float:
+        if self._duration_ms <= 1e-6:
+            return 0.0
+        return float(np.clip(self._elapsed_ms / self._duration_ms, 0.0, 1.0))
+
     def _load_session(self, idx: int) -> None:
         self._session_idx = idx % len(self._sessions)
         self.session_id, self._points = self._sessions[self._session_idx]
+        self._point_times = np.asarray([p.t_ms for p in self._points], dtype=np.float64)
         self._duration_ms = self._points[-1].t_ms
         self._elapsed_ms = 0.0
         self._prev_x = self._points[0].x
         self._prev_y = self._points[0].y
+        self._prev_t_ms = self._points[0].t_ms
 
     def restart(self) -> None:
         """Rewind the current session to t=0 (used when switching recordings)."""
         self._load_session(self._session_idx)
+        self._paused = False
+
+    def play(self) -> None:
+        self._paused = False
+
+    def pause(self) -> None:
+        self._paused = True
+
+    def set_speed(self, speed: float) -> None:
+        self._speed = float(np.clip(speed, 0.25, 3.0))
+
+    def seek_progress(self, progress: float) -> None:
+        """Seek current session by normalized progress in [0, 1]."""
+        frac = float(np.clip(progress, 0.0, 1.0))
+        self._elapsed_ms = frac * self._duration_ms
+        x, y, _clicked = self._sample_at(self._elapsed_ms)
+        self._prev_x, self._prev_y = x, y
+        self._prev_t_ms = self._elapsed_ms
 
     @property
     def active_recording_id(self) -> str | None:
@@ -331,21 +426,49 @@ class RecordingReplay:
     def _interp_at(self, t_ms: float) -> tuple[float, float, bool]:
         return _interp_points_at(self._points, t_ms)
 
+    def _sample_at(self, t_ms: float) -> tuple[float, float, bool]:
+        if self._timing != "original":
+            return self._interp_at(t_ms)
+        idx = int(np.searchsorted(self._point_times, t_ms, side="right") - 1)
+        idx = int(np.clip(idx, 0, len(self._points) - 1))
+        p = self._points[idx]
+        return p.x, p.y, p.clicked
+
+    def next_step_ms(self, default_ms: float) -> float:
+        """Recommended real-time step to follow recording timestamps smoothly."""
+        if self._paused:
+            return float(max(default_ms, 1.0))
+        idx = int(np.searchsorted(self._point_times, self._elapsed_ms, side="right"))
+        if idx >= len(self._point_times):
+            return float(max(default_ms, 1.0))
+        step = float(self._point_times[idx] - self._elapsed_ms)
+        if not np.isfinite(step) or step <= 0.5:
+            return float(max(default_ms, 1.0))
+        return float(np.clip(step, 1.0, 250.0))
+
     def advance(self, dt_ms: float | None = None) -> ReplayFrame:
         """Step replay clock and return ground-truth cursor + velocity for this batch."""
         step = self._batch_ms if dt_ms is None else float(dt_ms)
-        self._elapsed_ms += step
+        effective_step = step * self._speed
+        if not self._paused:
+            self._elapsed_ms += effective_step
 
         if self._elapsed_ms > self._duration_ms:
             next_idx = (self._session_idx + 1) % len(self._sessions)
             self._load_session(next_idx)
 
-        x, y, clicked = self._interp_at(self._elapsed_ms)
-        dt_s = max(step / 1000.0, 1e-6)
-        scale = max(CURSOR_MAX_SPEED_PER_S, 1e-6)
-        vx = float(np.clip((x - self._prev_x) / dt_s / scale, -1.0, 1.0))
-        vy = float(np.clip((y - self._prev_y) / dt_s / scale, -1.0, 1.0))
+        x, y, clicked = self._sample_at(self._elapsed_ms)
+        dt_ms = max(self._elapsed_ms - self._prev_t_ms, effective_step)
+        dt_s = max(dt_ms / 1000.0, 1e-6)
+        if self._paused:
+            vx = 0.0
+            vy = 0.0
+        else:
+            scale = max(CURSOR_MAX_SPEED_PER_S, 1e-6)
+            vx = float(np.clip((x - self._prev_x) / dt_s / scale, -1.0, 1.0))
+            vy = float(np.clip((y - self._prev_y) / dt_s / scale, -1.0, 1.0))
         self._prev_x, self._prev_y = x, y
+        self._prev_t_ms = self._elapsed_ms
         return ReplayFrame(x=x, y=y, clicked=clicked, vx=vx, vy=vy)
 
 

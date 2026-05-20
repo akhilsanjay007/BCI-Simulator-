@@ -12,14 +12,13 @@ import {
   type MutableRefObject,
 } from "react";
 import {
-  drawKeyboard,
-  drawSuggestions,
   drawSwipeTrail,
   hitKey,
-  hitSuggestion,
   type KeyDef,
   type SwipeTrailPoint,
 } from "./keyboardLayout";
+import { drawKeyboard } from "./Keyboard";
+import { drawSuggestionBar, hitSuggestion } from "./SuggestionBar";
 import { DASHBOARD_THEME } from "./dashboardTheme";
 import { idleManualTrackpadDrive, type ManualTrackpadDrive } from "./manualTrackpad";
 
@@ -302,23 +301,23 @@ export const BCITrackpad = forwardRef<BCITrackpadHandle, BCITrackpadProps>(funct
     const pressedChipIndex =
       pressing && swipeState.chipHandled && hoveredChip ? hoveredChip.index : null;
     const pressedKeyId = swipingKeys && hoveredKey ? hoveredKey.id : null;
-    drawSuggestions(
+    drawSuggestionBar({
       ctx,
       plotW,
       plotH,
       words,
-      hoveredChip?.index ?? null,
-      pressedChipIndex,
-    );
-    drawKeyboard(
+      hoveredIndex: hoveredChip?.index ?? null,
+      pressedIndex: pressedChipIndex,
+    });
+    drawKeyboard({
       ctx,
       plotW,
       plotH,
-      hoveredKey?.id ?? null,
-      pressedKeyId,
+      hoveredId: hoveredKey?.id ?? null,
+      pressedId: pressedKeyId,
       dpr,
       swipedIds,
-    );
+    });
     if (swipingKeys) {
       const src = swipePointsRef.current;
       const head = M.cursorNorm;

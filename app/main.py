@@ -1,8 +1,9 @@
 import asyncio
 import os
 import re
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from app.decoder import (
     BciDecoder,
+    DecoderPacket,
     RegressorKind,
     default_decoder_artifact_path,
     generate_training_data,
@@ -17,11 +19,7 @@ from app.decoder import (
     velocity_decoder_missing_help,
 )
 from app.redis_client import get_redis_client
-from app.recording_replay import (
-    ReplayTiming,
-    list_recordings,
-    validate_recording_id,
-)
+from app.recording_replay import ReplayTiming, list_recordings, validate_recording_id
 from app.simulator import generator
 
 ENV = os.getenv("ENV", "development").lower()
@@ -287,11 +285,17 @@ async def reset_decoder() -> dict[str, object]:
 
 
 class SelectRecordingRequest(BaseModel):
-    recording_id: str = Field(
-        ...,
+    recording_file: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        description="Recording filename in recordings/, e.g. session_20250520_143022.json",
+    )
+    recording_id: str | None = Field(
+        default=None,
         min_length=1,
         max_length=128,
-        description="Recording stem, e.g. demo_1 or session_20260520_012021",
+        description="Legacy stem alias, e.g. demo_1 or session_20260520_012021",
     )
     timing: ReplayTiming = Field(
         default="original",
@@ -307,6 +311,37 @@ class RecordingResponse(BaseModel):
     sample_count: int
 
 
+class ReplayPlaybackCommand(BaseModel):
+    action: Literal["play", "pause", "restart", "seek", "set_speed"]
+    progress: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Required when action=seek. Normalized replay progress [0,1].",
+    )
+    speed: float | None = Field(
+        default=None,
+        ge=0.25,
+        le=3.0,
+        description="Required when action=set_speed. Replay speed multiplier.",
+    )
+
+
+def replay_playback_payload() -> dict[str, object]:
+    return {
+        "mode": generator.mode,
+        "replay_active": generator.playback_active,
+        "replay_loaded": generator.replay_active,
+        "paused": generator.replay_paused,
+        "elapsed_ms": round(generator.replay_elapsed_ms, 2),
+        "duration_ms": round(generator.replay_duration_ms, 2),
+        "progress": round(generator.replay_progress, 6),
+        "speed": round(generator.replay_speed, 3),
+        "selected_recording_id": generator.replay_recording_id,
+        "recording_file": generator.replay_recording_file,
+    }
+
+
 @app.get("/api/recordings")
 async def list_recordings_endpoint() -> dict[str, object]:
     """Selectable ``recordings/*.json`` files for automatic-mode replay."""
@@ -314,13 +349,16 @@ async def list_recordings_endpoint() -> dict[str, object]:
     selected = generator.replay_recording_id
     return {
         "recordings": [
-            RecordingResponse(
-                recording_id=r.recording_id,
-                label=r.label,
-                typed_text=r.typed_text,
-                duration_ms=r.duration_ms,
-                sample_count=r.sample_count,
-            ).model_dump()
+            {
+                **RecordingResponse(
+                    recording_id=r.recording_id,
+                    label=r.label,
+                    typed_text=r.typed_text,
+                    duration_ms=r.duration_ms,
+                    sample_count=r.sample_count,
+                ).model_dump(),
+                "recording_file": f"{r.recording_id}.json",
+            }
             for r in items
         ],
         "selected_recording_id": selected,
@@ -341,17 +379,59 @@ async def list_recordings_endpoint() -> dict[str, object]:
     }
 
 
+@app.get("/api/recordings/playback")
+async def get_replay_playback() -> dict[str, object]:
+    return replay_playback_payload()
+
+
+@app.post("/api/recordings/playback")
+async def set_replay_playback(body: ReplayPlaybackCommand) -> dict[str, object]:
+    if not generator.playback_active:
+        return {"status": "error", "message": "Replay is not active."}
+
+    if body.action == "play":
+        generator.replay_play()
+    elif body.action == "pause":
+        generator.replay_pause()
+    elif body.action == "restart":
+        generator.replay_restart()
+        decoder.reset()
+        reset_event = decoder.build_reset_event(num_channels=generator.num_channels)
+        await decoder_ws_hub.broadcast_json(reset_event.model_dump())
+    elif body.action == "seek":
+        if body.progress is None:
+            return {"status": "error", "message": "progress is required for seek action."}
+        generator.replay_seek(body.progress)
+        decoder.reset()
+        reset_event = decoder.build_reset_event(num_channels=generator.num_channels)
+        await decoder_ws_hub.broadcast_json(reset_event.model_dump())
+    else:  # set_speed
+        if body.speed is None:
+            return {"status": "error", "message": "speed is required for set_speed action."}
+        generator.replay_set_speed(body.speed)
+
+    return {"status": "ok", **replay_playback_payload()}
+
+
 @app.post("/api/recordings/select")
 async def select_recording(body: SelectRecordingRequest) -> dict[str, object]:
-    """Switch replay recording, reset decoder, and notify connected dashboards."""
-    try:
-        recording_id = validate_recording_id(body.recording_id)
-    except ValueError as e:
-        return {"status": "error", "message": str(e)}
+    """Switch playback to a selected recording file and notify connected dashboards."""
+    recording_file = (body.recording_file or "").strip()
+    if not recording_file:
+        if not body.recording_id:
+            return {
+                "status": "error",
+                "message": "recording_file is required (or recording_id for legacy clients).",
+            }
+        try:
+            recording_id = validate_recording_id(body.recording_id)
+        except ValueError as e:
+            return {"status": "error", "message": str(e)}
+        recording_file = f"{recording_id}.json"
 
     try:
-        generator.set_replay_recording(recording_id, timing=body.timing)
-    except FileNotFoundError as e:
+        generator.set_replay_recording_file(recording_file, timing=body.timing)
+    except (FileNotFoundError, ValueError) as e:
         return {"status": "error", "message": str(e)}
 
     decoder.reset()
@@ -361,13 +441,15 @@ async def select_recording(body: SelectRecordingRequest) -> dict[str, object]:
     reset_event = decoder.build_reset_event(num_channels=generator.num_channels)
     clients_notified = await decoder_ws_hub.broadcast_json(reset_event.model_dump())
     print(
-        f"[recordings/select] recording={recording_id} timing={body.timing} "
+        f"[recordings/select] file={recording_file} timing={body.timing} "
         f"redis_cleared={redis_cleared} ws_clients_notified={clients_notified}"
     )
     return {
         "status": "ok",
-        "selected_recording_id": recording_id,
-        "selected_demo_id": recording_id,
+        "mode": generator.mode,
+        "recording_file": generator.replay_recording_file,
+        "selected_recording_id": generator.replay_recording_id,
+        "selected_demo_id": generator.replay_recording_id,
         "replay_session_id": generator.replay_session_id,
         "redis_cleared": redis_cleared,
         "ws_clients_notified": clients_notified,
@@ -380,8 +462,10 @@ async def simulator_config() -> dict[str, int | bool | str | None]:
     return {
         "num_channels": generator.num_channels,
         "fs": generator.fs,
+        "mode": generator.mode,
         "replay_active": generator.replay_active,
         "replay_session_id": generator.replay_session_id,
+        "recording_file": generator.replay_recording_file,
         "selected_recording_id": generator.replay_recording_id,
         "selected_demo_id": generator.replay_recording_id,
     }
@@ -417,23 +501,26 @@ async def decoder_stream(websocket: WebSocket):
     _log_i = 0
     try:
         async for packet in generator.stream():
-            decoded = decoder.predict(
-                packet["spikes"],
-                true_vx=generator.current_target_vx,
-                true_vy=generator.current_target_vy,
-            )
-            if generator.replay_active:
-                out = decoded.model_copy(
-                    update={
-                        "vx": generator.current_target_vx,
-                        "vy": generator.current_target_vy,
-                        "pen_down": generator.current_pen_down,
-                        "cursor_x": generator.replay_cursor_x,
-                        "cursor_y": generator.replay_cursor_y,
-                    }
+            if generator.playback_active:
+                out = DecoderPacket(
+                    timestamp_ms=float(packet.get("timestamp_ms", time.time() * 1000.0)),
+                    vx=generator.current_target_vx,
+                    vy=generator.current_target_vy,
+                    pen_down=generator.current_pen_down,
+                    confidence=0.96,
+                    latency_ms=0.2,
+                    accuracy=1.0,
+                    session_accuracy=1.0,
+                    cursor_x=generator.replay_cursor_x,
+                    cursor_y=generator.replay_cursor_y,
+                    num_channels=generator.num_channels,
                 )
             else:
-                out = decoded
+                out = decoder.predict(
+                    packet["spikes"],
+                    true_vx=generator.current_target_vx,
+                    true_vy=generator.current_target_vy,
+                )
             _log_i += 1
             if _log_i % 50 == 0:
                 print(

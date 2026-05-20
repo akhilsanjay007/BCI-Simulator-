@@ -8,20 +8,14 @@ import {
 import { BCITrackpad, type BCITrackpadHandle } from "./BCITrackpad";
 import { idleManualTrackpadDrive, type ManualTrackpadDrive } from "./manualTrackpad";
 import { NeuralSignalCharts, type ManualNeuralBurstPayload } from "./NeuralSignalCharts";
+import { DecoderMetrics } from "./DecoderMetrics";
+import { ThoughtToText } from "./ThoughtToText";
 import {
   computeInstantSignalQuality,
-  signalTierFromPct,
   signalTierStyles,
   stepSignalSmooth,
   type SignalQualityInput,
 } from "./signalQuality";
-import {
-  DASHBOARD_BTN,
-  DASHBOARD_DIVIDER,
-  DASHBOARD_INNER_SURFACE,
-  DASHBOARD_PANEL,
-  DASHBOARD_PANEL_HEADER,
-} from "./dashboardTheme";
 import {
   applyWordSuggestion,
   getWordSuggestions,
@@ -55,39 +49,30 @@ const BACKEND_ENDPOINTS = {
   simulatorConfig: `${BACKEND_HTTP_ORIGIN}/simulator/config`,
   recordings: `${BACKEND_HTTP_ORIGIN}/api/recordings`,
   selectRecording: `${BACKEND_HTTP_ORIGIN}/api/recordings/select`,
+  playback: `${BACKEND_HTTP_ORIGIN}/api/recordings/playback`,
   decoderReset: `${BACKEND_HTTP_ORIGIN}/decoder/reset`,
   decoderWs: `${BACKEND_WS_ORIGIN}/ws/decoder`,
 } as const;
 
-type ReplayTiming = "original" | "smooth_125hz";
-
-interface SavedRecording {
+interface RecordingOption {
   recording_id: string;
   label: string;
-  typed_text: string;
-  duration_ms: number;
-  sample_count: number;
+  recording_file: string;
 }
 
-interface RecordingsListResponse {
-  recordings?: SavedRecording[];
-  demos?: SavedRecording[];
+interface RecordingsResponse {
+  recordings?: RecordingOption[];
   selected_recording_id?: string | null;
-  selected_demo_id?: string | null;
-  replay_active: boolean;
 }
 
-function formatRecordingDuration(ms: number): string {
-  if (ms < 1000) return `${ms} ms`;
-  const sec = Math.round(ms / 1000);
-  return sec < 60 ? `${sec}s` : `${Math.floor(sec / 60)}m ${sec % 60}s`;
-}
-
-function recordingOptionLabel(r: SavedRecording): string {
-  const preview = r.typed_text.trim();
-  const suffix = preview ? ` — ${preview.length > 28 ? `${preview.slice(0, 28)}…` : preview}` : "";
-  const dur = r.duration_ms > 0 ? ` (${formatRecordingDuration(r.duration_ms)})` : "";
-  return `${r.label}${suffix}${dur}`;
+interface PlaybackStatusResponse {
+  paused?: boolean;
+  progress?: number;
+  duration_ms?: number;
+  speed?: number;
+  replay_active?: boolean;
+  replay_loaded?: boolean;
+  recording_file?: string | null;
 }
 
 /** Hint when the accumulated sentence is empty. */
@@ -123,21 +108,6 @@ function isDecoderResetEvent(data: unknown): data is DecoderResetEvent {
   );
 }
 
-function formatDecoderVelocity(vx: number, vy: number): string {
-  const mag = Math.hypot(vx, vy);
-  return `vx ${vx >= 0 ? "+" : ""}${vx.toFixed(2)} · vy ${vy >= 0 ? "+" : ""}${vy.toFixed(2)} · |v| ${mag.toFixed(2)}`;
-}
-
-function velocityHueClass(vx: number, vy: number): string {
-  const mag = Math.hypot(vx, vy);
-  if (mag < 0.06) return "text-cyan-400/90";
-  const ang = (Math.atan2(vy, vx) * 180) / Math.PI;
-  if (ang >= -45 && ang < 45) return "text-red-400";
-  if (ang >= 45 && ang < 135) return "text-yellow-400";
-  if (ang >= -135 && ang < -45) return "text-green-400";
-  return "text-blue-400";
-}
-
 type ControlMode = "automatic" | "manual";
 
 type DirectionKey = "left" | "right" | "up" | "down";
@@ -161,19 +131,17 @@ function netVelocityFromHeld(held: Set<DirectionKey>): { vx: number; vy: number 
   return { vx: vx / n, vy: vy / n };
 }
 
-function formatSessionClock(totalSeconds: number): string {
-  const h = Math.floor(totalSeconds / 3600);
-  const m = Math.floor((totalSeconds % 3600) / 60);
-  const s = totalSeconds % 60;
-  if (h > 0) {
-    return `${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}`;
-  }
-  return `${m}:${s.toString().padStart(2, "0")}`;
-}
-
 const SPIKE_CONFIDENCE_MIN = 0.75;
 const SPIKE_CONFIDENCE_MAX = 0.99;
 const SPIKE_PULSE_DECAY_PER_S = 5.4;
+const AUTO_CURSOR_SMOOTH_PER_S = 13.5;
+const AUTO_CURSOR_DEADZONE_NORM = 0.0008;
+const AUTO_CURSOR_VELOCITY_BOOST_MAX = 0.85;
+const AUTO_TARGET_SMOOTH_PER_S = 21;
+const AUTO_TARGET_DEADZONE_NORM = 0.0012;
+const AUTO_TARGET_JUMP_SNAP_NORM = 0.24;
+const SIGNAL_DISPLAY_GAIN = 1.15;
+const SIGNAL_DISPLAY_BIAS = 0.06;
 
 function sampleSpikeConfidence(): number {
   return SPIKE_CONFIDENCE_MIN + Math.random() * (SPIKE_CONFIDENCE_MAX - SPIKE_CONFIDENCE_MIN);
@@ -185,9 +153,7 @@ function App() {
   const [decoderData, setDecoderData] = useState<DecoderPacket | null>(null);
   const [cursorDisplay, setCursorDisplay] = useState({ x: 0.5, y: 0.5 });
   const [controlMode, setControlMode] = useState<ControlMode>("manual");
-  const [manualVelocityLabel, setManualVelocityLabel] = useState("rest");
   const [manualCmd, setManualCmd] = useState({ vx: 0, vy: 0 });
-  const [sessionElapsedSec, setSessionElapsedSec] = useState(0);
   const [latestSpikeCommandConfidence, setLatestSpikeCommandConfidence] = useState<number | null>(
     null,
   );
@@ -201,10 +167,12 @@ function App() {
   const [signalPct, setSignalPct] = useState(0);
   /** Pointer over the full Thought → Text panel (hover = decode intent). */
   const [thoughtPanelIntent, setThoughtPanelIntent] = useState(false);
-  const [savedRecordings, setSavedRecordings] = useState<SavedRecording[]>([]);
-  const [selectedRecordingId, setSelectedRecordingId] = useState<string | null>(null);
-  const [replayTiming, setReplayTiming] = useState<ReplayTiming>("original");
-  const [recordingSelectBusy, setRecordingSelectBusy] = useState(false);
+  const [recordings, setRecordings] = useState<RecordingOption[]>([]);
+  const [selectedRecordingFile, setSelectedRecordingFile] = useState<string | null>(null);
+  const [replayLoaded, setReplayLoaded] = useState(false);
+  const [replayPaused, setReplayPaused] = useState(true);
+  const [replayBusy, setReplayBusy] = useState(false);
+  const [replaySpeed, setReplaySpeed] = useState(1);
 
   const wsRef = useRef<WebSocket | null>(null);
   const trackpadRef = useRef<BCITrackpadHandle | null>(null);
@@ -225,6 +193,11 @@ function App() {
   const signalSmoothRef = useRef(0);
   const penUpSinceRef = useRef(0);
   const spikeStrengthRef = useRef(0);
+  const autoCursorTargetRef = useRef({ x: 0.5, y: 0.5 });
+  const autoTargetTimestampRef = useRef<number | null>(null);
+  const signalPenDownPrevRef = useRef(false);
+  const latencyEmaRef = useRef<number | null>(null);
+  const lastPacketAtMsRef = useRef<number | null>(null);
 
   useEffect(() => {
     penUpSinceRef.current = performance.now();
@@ -329,9 +302,7 @@ function App() {
   const syncManualVelocityFromHeld = useCallback(() => {
     const v = netVelocityFromHeld(manualDirectionsHeldRef.current);
     manualVelocityRef.current = v;
-    const n = Math.hypot(v.vx, v.vy);
     setManualCmd(v);
-    setManualVelocityLabel(n < 1e-6 ? "rest" : formatDecoderVelocity(v.vx, v.vy));
   }, []);
 
   const fireManualVelocitySpike = useCallback((vx: number, vy: number) => {
@@ -374,7 +345,6 @@ function App() {
     manualVelocityRef.current = { vx: 0, vy: 0 };
     manualTrackpadDriveRef.current = idleManualTrackpadDrive();
     setManualCmd({ vx: 0, vy: 0 });
-    setManualVelocityLabel("rest");
     setManualPenDown(false);
     setManualTrackpadActive(false);
     latestSpikeConfidenceRef.current = null;
@@ -393,7 +363,6 @@ function App() {
         manualVelocityRef.current = { vx: 0, vy: 0 };
         setManualCmd({ vx: 0, vy: 0 });
         setManualPenDown(false);
-        setManualVelocityLabel("rest");
         lastManualPadSpeedRef.current = 0;
         return;
       }
@@ -401,9 +370,7 @@ function App() {
       manualVelocityRef.current = { vx: pad.vx, vy: pad.vy };
       setManualCmd({ vx: pad.vx, vy: pad.vy });
       setManualPenDown(pad.penDown);
-
       const n = Math.hypot(pad.vx, pad.vy);
-      setManualVelocityLabel(n < 1e-6 ? "rest" : formatDecoderVelocity(pad.vx, pad.vy));
 
       manualPhysicsRef.current = {
         ...manualPhysicsRef.current,
@@ -434,6 +401,8 @@ function App() {
       }
       setDecoderData(null);
       manualPhysicsRef.current = seedCursorMotion(cx, cy);
+      autoCursorTargetRef.current = { x: cx, y: cy };
+      autoTargetTimestampRef.current = null;
       setCursorDisplay({ x: cx, y: cy });
       applyManualRest();
       manualTrackpadDriveRef.current = idleManualTrackpadDrive();
@@ -442,6 +411,8 @@ function App() {
       signalSmoothRef.current = 0;
       setSignalPct(0);
       penUpSinceRef.current = performance.now();
+      latencyEmaRef.current = null;
+      lastPacketAtMsRef.current = null;
     },
     [applyManualRest],
   );
@@ -463,63 +434,78 @@ function App() {
     try {
       const r = await fetch(BACKEND_ENDPOINTS.recordings);
       if (!r.ok) return;
-      const j = (await r.json()) as RecordingsListResponse;
-      const list = Array.isArray(j.recordings)
-        ? j.recordings
-        : Array.isArray(j.demos)
-          ? j.demos.map((d) => ({
-              ...d,
-              recording_id:
-                "recording_id" in d && typeof d.recording_id === "string"
-                  ? d.recording_id
-                  : (d as { demo_id?: string }).demo_id ?? "",
-            }))
-          : [];
-      if (list.length > 0) {
-        setSavedRecordings(list);
+      const j = (await r.json()) as RecordingsResponse;
+      const next = Array.isArray(j.recordings) ? j.recordings : [];
+      setRecordings(next);
+      if (!selectedRecordingFile && next.length > 0) {
+        setSelectedRecordingFile(next[0].recording_file);
       }
-      const selected =
-        typeof j.selected_recording_id === "string"
-          ? j.selected_recording_id
-          : typeof j.selected_demo_id === "string"
-            ? j.selected_demo_id
-            : null;
-      if (selected) {
-        setSelectedRecordingId(selected);
+      if (typeof j.selected_recording_id === "string") {
+        const selected = next.find((item) => item.recording_id === j.selected_recording_id);
+        if (selected) {
+          setSelectedRecordingFile(selected.recording_file);
+        }
       }
     } catch {
-      /* backend may be offline */
+      /* ignore */
+    }
+  }, [selectedRecordingFile]);
+
+  const refreshPlaybackStatus = useCallback(async () => {
+    try {
+      const r = await fetch(BACKEND_ENDPOINTS.playback);
+      if (!r.ok) return;
+      const j = (await r.json()) as PlaybackStatusResponse;
+      setReplayPaused(Boolean(j.paused));
+      setReplaySpeed(typeof j.speed === "number" ? j.speed : 1);
+      setReplayLoaded(Boolean(j.replay_loaded ?? j.replay_active));
+      if (typeof j.recording_file === "string" && j.recording_file.length > 0) {
+        setSelectedRecordingFile(j.recording_file);
+      }
+    } catch {
+      /* ignore */
     }
   }, []);
 
-  const selectRecording = useCallback(
-    async (recordingId: string, timing: ReplayTiming = replayTiming) => {
-      if (recordingSelectBusy || !recordingId) return;
-      setRecordingSelectBusy(true);
+  const sendReplayPlaybackCommand = useCallback(
+    async (
+      action: "play" | "pause" | "restart" | "set_speed",
+      payload?: { speed?: number },
+    ) => {
+      setReplayBusy(true);
       try {
-        const r = await fetch(BACKEND_ENDPOINTS.selectRecording, {
+        const body: { action: string; speed?: number; progress?: number } = { action };
+        if (action === "set_speed" && typeof payload?.speed === "number") {
+          body.speed = payload.speed;
+        }
+        const r = await fetch(BACKEND_ENDPOINTS.playback, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ recording_id: recordingId, timing }),
+          body: JSON.stringify(body),
         });
-        const j = (await r.json()) as {
-          status?: string;
-          selected_recording_id?: string;
-          selected_demo_id?: string;
-        };
-        const picked = j.selected_recording_id ?? j.selected_demo_id;
-        if (r.ok && j.status === "ok" && typeof picked === "string") {
-          setSelectedRecordingId(picked);
-          setReplayTiming(timing);
-          trackpadRef.current?.clearKeyboard();
+        if (!r.ok) return;
+        const j = (await r.json()) as PlaybackStatusResponse & { status?: string };
+        if (j.status && j.status !== "ok") return;
+        if (action === "pause") {
+          setReplayPaused(true);
+        } else if (action === "play") {
+          setReplayPaused(false);
+        } else if (action === "set_speed" && typeof payload?.speed === "number") {
+          setReplaySpeed(payload.speed);
+        } else if (action === "restart") {
+          setReplayPaused(false);
         }
+        if (typeof j.recording_file === "string" && j.recording_file.length > 0) {
+          setSelectedRecordingFile(j.recording_file);
+        }
+        setReplayLoaded(Boolean(j.replay_loaded ?? j.replay_active));
       } catch {
         /* ignore */
       } finally {
-        setRecordingSelectBusy(false);
+        setReplayBusy(false);
       }
     },
-    [recordingSelectBusy, replayTiming],
+    [],
   );
 
   useEffect(() => {
@@ -528,21 +514,24 @@ function App() {
       .then(
         (j: {
           num_channels?: number;
-          selected_recording_id?: string | null;
-          selected_demo_id?: string | null;
         } | null) => {
         if (j && typeof j.num_channels === "number" && j.num_channels >= 1) {
           setTotalChannels(Math.floor(j.num_channels));
-        }
-        const picked = j?.selected_recording_id ?? j?.selected_demo_id;
-        if (typeof picked === "string") {
-          setSelectedRecordingId(picked);
         }
       },
       )
       .catch(() => {});
     void refreshRecordings();
-  }, [refreshRecordings]);
+    void refreshPlaybackStatus();
+  }, [refreshPlaybackStatus, refreshRecordings]);
+
+  useEffect(() => {
+    if (controlMode !== "automatic") return;
+    const id = window.setInterval(() => {
+      void refreshPlaybackStatus();
+    }, 250);
+    return () => window.clearInterval(id);
+  }, [controlMode, refreshPlaybackStatus]);
 
   useEffect(() => {
     const ws = new WebSocket(BACKEND_ENDPOINTS.decoderWs);
@@ -560,18 +549,58 @@ function App() {
           applyDecoderReset(raw);
           return;
         }
-        const data = raw as DecoderPacket;
+        let data = raw as DecoderPacket;
         if (typeof data.num_channels === "number" && data.num_channels >= 1) {
           setTotalChannels(Math.floor(data.num_channels));
         }
         if (controlModeRef.current !== "automatic") {
           return;
         }
+        const nowMs = Date.now();
+        const sentLatency = nowMs - data.timestamp_ms;
+        const interPacket =
+          lastPacketAtMsRef.current == null ? null : nowMs - lastPacketAtMsRef.current;
+        lastPacketAtMsRef.current = nowMs;
+        const rawLatencyMs =
+          Number.isFinite(sentLatency) && sentLatency >= 0 && sentLatency <= 5000
+            ? sentLatency
+            : interPacket;
+        if (rawLatencyMs != null) {
+          const prev = latencyEmaRef.current;
+          const next = prev == null ? rawLatencyMs : prev * 0.82 + rawLatencyMs * 0.18;
+          latencyEmaRef.current = Math.min(Math.max(next, 0), 999);
+          data = {
+            ...data,
+            latency_ms: latencyEmaRef.current,
+          };
+        }
         setDecoderData(data);
-        setCursorDisplay({
+        const rawTarget = {
           x: data.cursor_x ?? 0.5,
           y: data.cursor_y ?? 0.5,
-        });
+        };
+        const prevTarget = autoCursorTargetRef.current;
+        const dx = rawTarget.x - prevTarget.x;
+        const dy = rawTarget.y - prevTarget.y;
+        const dist = Math.hypot(dx, dy);
+        const packetTs = data.timestamp_ms;
+        const prevTs = autoTargetTimestampRef.current;
+        autoTargetTimestampRef.current = packetTs;
+        const dt =
+          prevTs != null && packetTs > prevTs ? Math.min((packetTs - prevTs) / 1000, 0.08) : 1 / 60;
+
+        if (dist <= AUTO_TARGET_DEADZONE_NORM) {
+          return;
+        }
+        if (dist >= AUTO_TARGET_JUMP_SNAP_NORM) {
+          autoCursorTargetRef.current = rawTarget;
+          return;
+        }
+        const alpha = 1 - Math.exp(-AUTO_TARGET_SMOOTH_PER_S * dt);
+        autoCursorTargetRef.current = {
+          x: prevTarget.x + dx * alpha,
+          y: prevTarget.y + dy * alpha,
+        };
       } catch (error) {
         console.error("Error parsing decoder data:", error);
       }
@@ -593,17 +622,49 @@ function App() {
   }, [applyDecoderReset]);
 
   useEffect(() => {
-    const id = window.setInterval(() => {
-      setSessionElapsedSec((s) => s + 1);
-    }, 1000);
-    return () => window.clearInterval(id);
-  }, []);
-
-  useEffect(() => {
     if (controlMode === "manual") {
       const { x, y } = cursorDisplayRef.current;
       manualPhysicsRef.current = seedCursorMotion(x, y);
+    } else {
+      const { x, y } = cursorDisplayRef.current;
+      autoCursorTargetRef.current = { x, y };
+      autoTargetTimestampRef.current = null;
     }
+  }, [controlMode]);
+
+  useEffect(() => {
+    if (controlMode !== "automatic") return;
+
+    let frameId = 0;
+    let last = performance.now();
+    const deadzoneSq = AUTO_CURSOR_DEADZONE_NORM * AUTO_CURSOR_DEADZONE_NORM;
+
+    const loop = (now: number) => {
+      const dt = Math.min((now - last) / 1000, 0.064);
+      last = now;
+      const target = autoCursorTargetRef.current;
+      const curr = cursorDisplayRef.current;
+      const dx = target.x - curr.x;
+      const dy = target.y - curr.y;
+      const distSq = dx * dx + dy * dy;
+      if (distSq > deadzoneSq) {
+        const pkt = decoderDataRef.current;
+        const speed = pkt ? Math.hypot(pkt.vx, pkt.vy) : 0;
+        const boost = 1 + Math.min(1, speed) * AUTO_CURSOR_VELOCITY_BOOST_MAX;
+        const alpha = 1 - Math.exp(-AUTO_CURSOR_SMOOTH_PER_S * boost * dt);
+        const next = {
+          x: curr.x + dx * alpha,
+          y: curr.y + dy * alpha,
+        };
+        cursorDisplayRef.current = next;
+        setCursorDisplay(next);
+      }
+
+      frameId = requestAnimationFrame(loop);
+    };
+
+    frameId = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(frameId);
   }, [controlMode]);
 
   useEffect(() => {
@@ -699,12 +760,6 @@ function App() {
     controlMode === "manual" ? manualPenDown : (decoderData?.pen_down ?? false);
 
   useEffect(() => {
-    if (!thoughtPanelIntent) {
-      penUpSinceRef.current = performance.now();
-    }
-  }, [thoughtPanelIntent]);
-
-  useEffect(() => {
     let frameId = 0;
     let last = performance.now();
 
@@ -713,7 +768,14 @@ function App() {
       last = now;
 
       const mode = controlModeRef.current;
-      const penDown = thoughtPanelIntentRef.current;
+      const penDown =
+        mode === "manual"
+          ? manualPenDownRef.current
+          : (decoderDataRef.current?.pen_down ?? false);
+      if (!penDown && signalPenDownPrevRef.current) {
+        penUpSinceRef.current = now;
+      }
+      signalPenDownPrevRef.current = penDown;
       const penUpIdleSec = penDown ? 0 : (now - penUpSinceRef.current) / 1000;
 
       let confidence: number;
@@ -745,7 +807,8 @@ function App() {
       };
       const target = computeInstantSignalQuality(input);
       signalSmoothRef.current = stepSignalSmooth(signalSmoothRef.current, target, dt);
-      setSignalPct(Math.round(signalSmoothRef.current * 100));
+      const boosted = Math.min(1, signalSmoothRef.current * SIGNAL_DISPLAY_GAIN + SIGNAL_DISPLAY_BIAS);
+      setSignalPct(Math.round(boosted * 100));
 
       frameId = requestAnimationFrame(loop);
     };
@@ -782,10 +845,7 @@ function App() {
     controlMode === "manual" && (manualPenDown || manualTrackpadActive);
   const metricsVx = manualDriving ? manualCmd.vx : (decoderData?.vx ?? 0);
   const metricsVy = manualDriving ? manualCmd.vy : (decoderData?.vy ?? 0);
-  const metricsMoving = Math.hypot(metricsVx, metricsVy) > 1e-6;
-
-  const signalTier = signalTierFromPct(signalPct);
-  const signalStyle = signalTierStyles(signalTier);
+  const signalStyle = signalTierStyles(signalPct >= 67 ? "good" : signalPct >= 34 ? "medium" : "poor");
 
   const isComposing = clickActionPenDown;
 
@@ -796,12 +856,43 @@ function App() {
         : MANUAL_CONTROL_CONFIDENCE
       : (decoderData?.confidence ?? 0);
 
-  const velocityLabel =
-    controlMode === "manual"
-      ? manualVelocityLabel
-      : decoderData
-        ? formatDecoderVelocity(decoderData.vx, decoderData.vy)
-        : "—";
+  const handleToggleReplayPlayback = () => {
+    void sendReplayPlaybackCommand(replayPaused ? "play" : "pause");
+  };
+
+  const handleSelectRecording = (recordingFile: string) => {
+    if (!recordingFile) return;
+    setReplayBusy(true);
+    void fetch(BACKEND_ENDPOINTS.selectRecording, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ recording_file: recordingFile, timing: "original" }),
+    })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j: { status?: string; recording_file?: string; selected_recording_id?: string } | null) => {
+        if (!j || j.status !== "ok") return;
+        if (typeof j.recording_file === "string") {
+          setSelectedRecordingFile(j.recording_file);
+        } else if (typeof j.selected_recording_id === "string") {
+          setSelectedRecordingFile(`${j.selected_recording_id}.json`);
+        }
+        setReplayPaused(false);
+      })
+      .catch(() => {})
+      .finally(() => {
+        setReplayBusy(false);
+        void refreshRecordings();
+        void refreshPlaybackStatus();
+      });
+  };
+
+  const handleRestartReplayPlayback = () => {
+    void sendReplayPlaybackCommand("restart");
+  };
+
+  const handleReplaySpeedChange = (speed: number) => {
+    void sendReplayPlaybackCommand("set_speed", { speed });
+  };
 
   return (
     <div className="h-screen min-h-0 flex flex-col overflow-hidden bg-neuralink-bg text-neuralink-text">
@@ -853,50 +944,6 @@ function App() {
           </button>
         </div>
 
-        {controlMode === "automatic" && savedRecordings.length > 0 ? (
-          <div
-            className="flex items-center gap-2 min-w-0 max-w-[min(100%,42rem)] rounded-xl border border-neutral-700/80 bg-black/70 px-2.5 py-1.5"
-            aria-label="Recording replay"
-          >
-            <label className="sr-only" htmlFor="recording-select">
-              Recording
-            </label>
-            <select
-              id="recording-select"
-              value={selectedRecordingId ?? savedRecordings[0]?.recording_id ?? ""}
-              disabled={recordingSelectBusy}
-              title="Replay a saved trackpad session in Automatic mode"
-              className="min-w-0 flex-1 max-w-[18rem] sm:max-w-[22rem] rounded-lg border border-neutral-600/80 bg-neutral-950/90 px-2 py-1.5 text-xs font-medium text-neutral-100 outline-none focus:border-violet-500/60 disabled:opacity-50"
-              onChange={(e) => void selectRecording(e.target.value, replayTiming)}
-            >
-              {savedRecordings.map((rec) => (
-                <option key={rec.recording_id} value={rec.recording_id}>
-                  {recordingOptionLabel(rec)}
-                </option>
-              ))}
-            </select>
-            <label className="sr-only" htmlFor="replay-timing">
-              Replay timing
-            </label>
-            <select
-              id="replay-timing"
-              value={replayTiming}
-              disabled={recordingSelectBusy}
-              title="Original timing uses recorded timestamps; Smooth 125 Hz resamples to 8 ms steps"
-              className="shrink-0 rounded-lg border border-neutral-600/80 bg-neutral-950/90 px-2 py-1.5 text-[11px] font-mono text-neutral-300 outline-none focus:border-violet-500/60 disabled:opacity-50"
-              onChange={(e) => {
-                const timing = e.target.value as ReplayTiming;
-                setReplayTiming(timing);
-                const id = selectedRecordingId ?? savedRecordings[0]?.recording_id;
-                if (id) void selectRecording(id, timing);
-              }}
-            >
-              <option value="original">Original timing</option>
-              <option value="smooth_125hz">Smooth 125 Hz</option>
-            </select>
-          </div>
-        ) : null}
-
         <div
           className={`shrink-0 flex items-center gap-2 px-3 py-1.5 rounded-lg text-[11px] font-mono font-medium border ${
             status === "connected"
@@ -918,136 +965,23 @@ function App() {
       <main className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-[minmax(0,0.92fr)_minmax(0,1.35fr)] gap-2 p-2 overflow-hidden">
         {/* LEFT — decoder metrics + neural charts */}
         <aside className="order-2 lg:order-1 min-h-0 min-w-0 flex flex-col gap-2 overflow-hidden">
-          <section className="shrink-0 rounded-xl border border-neutral-800/90 bg-gradient-to-b from-neutral-900/70 to-black/50 px-3 py-2.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
-            <div className="flex items-center justify-between gap-2 mb-2">
-              <h2 className="text-[10px] font-mono font-semibold uppercase tracking-[0.2em] text-neutral-400">
-                Decoder metrics
-              </h2>
-              <span
-                className={`text-[9px] font-mono uppercase tracking-wider px-1.5 py-px rounded border ${
-                  controlMode === "manual"
-                    ? "text-amber-300 border-amber-500/35 bg-amber-950/40"
-                    : "text-emerald-300 border-emerald-500/35 bg-emerald-950/40"
-                }`}
-              >
-                {controlMode === "manual" ? "Manual" : "Decoder"}
-              </span>
-            </div>
-
-            <div className="space-y-2">
-              <p
-                className={`text-sm font-bold font-mono leading-snug tracking-tight ${
-                  metricsMoving ? velocityHueClass(metricsVx, metricsVy) : "text-cyan-400/90"
-                }`}
-              >
-                {controlMode === "manual"
-                  ? manualVelocityLabel !== "rest"
-                    ? manualVelocityLabel
-                    : "REST"
-                  : velocityLabel}
-              </p>
-
-              <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-[10px] font-mono">
-                <div className="flex justify-between gap-1 col-span-2 border-b border-white/[0.06] pb-1">
-                  <dt className="text-neutral-500">Confidence</dt>
-                  <dd className="text-neutral-100 tabular-nums">{(displayConfidence * 100).toFixed(0)}%</dd>
-                </div>
-                <div className="flex justify-between gap-1">
-                  <dt className="text-neutral-500">Latency</dt>
-                  <dd className="text-emerald-400 tabular-nums">
-                    {controlMode === "automatic" && decoderData
-                      ? `${decoderData.latency_ms.toFixed(0)} ms`
-                      : "—"}
-                  </dd>
-                </div>
-                <div className="flex justify-between gap-1 col-span-2">
-                  <dt className="text-neutral-500">Click</dt>
-                  <dd
-                    className={`tabular-nums font-medium ${
-                      thoughtPanelIntent ? "text-emerald-400" : "text-neutral-500"
-                    }`}
-                  >
-                    {thoughtPanelIntent ? "Click Active" : "Click Idle"}
-                  </dd>
-                </div>
-                {controlMode === "automatic" && decoderData ? (
-                  <>
-                    <div className="flex justify-between gap-1">
-                      <dt className="text-neutral-500">A20</dt>
-                      <dd className="text-emerald-400/95 tabular-nums">
-                        {(decoderData.accuracy * 100).toFixed(0)}%
-                      </dd>
-                    </div>
-                    <div className="flex justify-between gap-1">
-                      <dt className="text-neutral-500">Session</dt>
-                      <dd className="text-emerald-300/95 tabular-nums">
-                        {(decoderData.session_accuracy * 100).toFixed(1)}%
-                      </dd>
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <div className="flex justify-between gap-1">
-                      <dt className="text-neutral-500">Spike</dt>
-                      <dd className="text-amber-200 tabular-nums">{(spikeStrength * 100).toFixed(0)}%</dd>
-                    </div>
-                    <div className="flex justify-between gap-1">
-                      <dt className="text-neutral-500">Sess</dt>
-                      <dd className="text-amber-100 tabular-nums">{formatSessionClock(sessionElapsedSec)}</dd>
-                    </div>
-                  </>
-                )}
-              </dl>
-
-              <div>
-                <div className="flex items-center justify-between gap-2 mb-1">
-                  <span className="text-[9px] font-mono uppercase tracking-wider text-neutral-500">
-                    Signal
-                  </span>
-                  <span className={`text-[10px] font-mono font-semibold tabular-nums ${signalStyle.text}`}>
-                    {signalPct}%
-                  </span>
-                </div>
-                <div
-                  className={`h-1.5 rounded-full bg-neutral-950 border overflow-hidden ${signalStyle.border}`}
-                  title="Smoothed neural signal quality"
-                >
-                  <div
-                    className={`h-full rounded-full bg-gradient-to-r transition-[width] duration-75 ${signalStyle.bar}`}
-                    style={{ width: `${signalPct}%` }}
-                  />
-                </div>
-                <p className="mt-1 text-[9px] font-mono text-neutral-600 flex items-center gap-1.5">
-                  <span className={`inline-block w-1.5 h-1.5 rounded-full ${signalStyle.dot}`} />
-                  {signalTier === "good" ? "Strong coupling" : signalTier === "medium" ? "Moderate" : "Weak"}
-                </p>
-              </div>
-
-              <div className="grid grid-cols-2 gap-1 text-[9px] font-mono text-neutral-500">
-                <div className="rounded border border-neutral-800/80 px-1.5 py-0.5">
-                  X <span className="text-neutral-200 tabular-nums">{cursorDisplay.x.toFixed(3)}</span>
-                </div>
-                <div className="rounded border border-neutral-800/80 px-1.5 py-0.5">
-                  Y <span className="text-neutral-200 tabular-nums">{cursorDisplay.y.toFixed(3)}</span>
-                </div>
-              </div>
-
-              <button
-                type="button"
-                onClick={() => void resetDecoderState()}
-                className="w-full py-1.5 rounded-lg border border-neutral-600/80 text-neutral-300 text-[10px] font-medium hover:bg-neutral-800/80 transition-colors"
-              >
-                Reset decoder
-              </button>
-            </div>
-          </section>
+          <DecoderMetrics
+            metricsVx={metricsVx}
+            metricsVy={metricsVy}
+            displayConfidence={displayConfidence}
+            clickActive={clickActionPenDown}
+            decoderData={decoderData}
+            signalPct={signalPct}
+            signalStyle={signalStyle}
+            onResetDecoder={() => void resetDecoderState()}
+          />
 
           <div className="flex-1 min-h-0 flex flex-col overflow-hidden rounded-xl border border-emerald-900/25 bg-black/30">
             <NeuralSignalCharts
               controlMode={controlMode}
               manualBurst={manualNeuralBurst}
               totalChannels={totalChannels}
-              penDown={thoughtPanelIntent}
+              penDown={clickActionPenDown}
               vx={metricsVx}
               vy={metricsVy}
               compact
@@ -1056,87 +990,95 @@ function App() {
         </aside>
 
         {/* CENTER — unified typing workspace */}
-        <section
+        <ThoughtToText
           ref={thoughtPanelRef}
-          className={`order-1 lg:order-2 flex-1 min-h-0 min-w-0 flex flex-col overflow-hidden ${DASHBOARD_PANEL}`}
+          fullText={fullText}
+          placeholder={FULL_TEXT_PLACEHOLDER}
+          thoughtPanelIntent={thoughtPanelIntent}
+          isComposing={isComposing}
+          onClearText={handleClearText}
           onPointerEnter={onThoughtPanelPointerEnter}
           onPointerLeave={onThoughtPanelPointerLeave}
           onPointerCancel={() => setThoughtPanelIntentSynced(false)}
+          onClearKeyboard={handleClearKeyboard}
+          showWaitingDecoder={controlMode === "automatic" && !decoderData}
+          footerControls={
+            controlMode === "automatic" ? (
+              <div className="flex items-center gap-2 rounded-lg border border-neutral-700/80 bg-black/60 px-2 py-1">
+                <label className="sr-only" htmlFor="recording-select">
+                  Replay recording
+                </label>
+                <select
+                  id="recording-select"
+                  value={selectedRecordingFile ?? recordings[0]?.recording_file ?? ""}
+                  onChange={(e) => handleSelectRecording(e.target.value)}
+                  disabled={replayBusy || recordings.length === 0}
+                  className="w-32 rounded-md border border-neutral-700/80 bg-neutral-950/90 px-2 py-1 text-[11px] font-mono text-neutral-200 outline-none focus:border-neuralink-accent/60 disabled:opacity-45"
+                >
+                  {recordings.length === 0 ? (
+                    <option value="">No recordings</option>
+                  ) : (
+                    recordings.map((recording) => (
+                      <option key={recording.recording_file} value={recording.recording_file}>
+                        {recording.label}
+                      </option>
+                    ))
+                  )}
+                </select>
+                <button
+                  type="button"
+                  onClick={handleToggleReplayPlayback}
+                  disabled={replayBusy || !replayLoaded}
+                  className="rounded-md border border-neutral-700/80 bg-neutral-950/90 px-2 py-1 text-[11px] font-semibold text-neutral-200 transition-colors hover:bg-neutral-800/80 disabled:opacity-45"
+                >
+                  {replayPaused ? "Play" : "Pause"}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleRestartReplayPlayback}
+                  disabled={replayBusy || !replayLoaded}
+                  className="rounded-md border border-neutral-700/80 bg-neutral-950/90 px-2 py-1 text-[11px] font-semibold text-neutral-200 transition-colors hover:bg-neutral-800/80 disabled:opacity-45"
+                >
+                  Restart
+                </button>
+                {[
+                  { speed: 1, label: "Normal" },
+                  { speed: 0.5, label: "2x slow" },
+                  { speed: 1 / 3, label: "3x slow" },
+                ].map(({ speed, label }) => (
+                  <button
+                    key={speed}
+                    type="button"
+                    onClick={() => handleReplaySpeedChange(speed)}
+                    disabled={replayBusy || !replayLoaded}
+                    className={`rounded-md border px-2 py-1 text-[11px] font-semibold transition-colors disabled:opacity-45 ${
+                      Math.abs(replaySpeed - speed) < 0.05
+                        ? "border-neuralink-accent/65 bg-neuralink-accent/20 text-neuralink-accent"
+                        : "border-neutral-700/80 bg-neutral-950/90 text-neutral-200 hover:bg-neutral-800/80"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            ) : null
+          }
         >
-          <div
-            className={`shrink-0 flex items-center justify-between gap-3 px-3 py-2.5 border-b ${DASHBOARD_DIVIDER}`}
-          >
-            <h2 className={DASHBOARD_PANEL_HEADER}>Thought → Text</h2>
-            <div className="flex items-center gap-2">
-              {thoughtPanelIntent ? (
-                <span className="text-[9px] font-mono font-medium text-emerald-400/95 uppercase tracking-wider animate-bci-pulse">
-                  Live
-                </span>
-              ) : (
-                <span className="text-[9px] font-mono text-neutral-500 uppercase tracking-wider">
-                  Standby
-                </span>
-              )}
-              <button
-                type="button"
-                onClick={handleClearText}
-                disabled={fullText.length === 0}
-                className={`px-2.5 py-1 disabled:opacity-35 disabled:pointer-events-none ${DASHBOARD_BTN}`}
-              >
-                Clear
-              </button>
-            </div>
-          </div>
-
-          <div className={`shrink-0 h-[4.5rem] px-3 py-2 border-b ${DASHBOARD_DIVIDER} overflow-y-auto`}>
-            <p
-              className={`font-mono text-lg font-medium leading-snug tracking-tight break-words whitespace-pre-wrap ${
-                fullText.length === 0 ? "text-neutral-600 text-sm" : "text-neutral-100"
-              }`}
-              aria-live="polite"
-            >
-              {fullText.length === 0 ? FULL_TEXT_PLACEHOLDER : fullText}
-              {isComposing && fullText.length > 0 ? (
-                <span
-                  className="inline-block w-[2px] h-[0.85em] ml-0.5 align-middle rounded-sm bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)] animate-bci-caret"
-                  aria-hidden
-                />
-              ) : null}
-            </p>
-          </div>
-
-          <div className={`relative flex-1 min-h-[14rem] w-full ${DASHBOARD_INNER_SURFACE}`}>
-            <BCITrackpad
-              ref={trackpadRef}
-              className="absolute inset-0"
-              controlMode={controlMode}
-              cursorNorm={cursorDisplay}
-              vx={controlMode === "manual" ? manualCmd.vx : (decoderData?.vx ?? 0)}
-              vy={controlMode === "manual" ? manualCmd.vy : (decoderData?.vy ?? 0)}
-              penDown={clickActionPenDown}
-              manualDriveRef={manualTrackpadDriveRef}
-              onKeyPress={handleKeyPress}
-              onSwipeComplete={handleSwipeComplete}
-              suggestions={suggestions}
-              onSuggestionSelect={handleSuggestionSelect}
-            />
-          </div>
-
-          <div
-            className={`shrink-0 flex items-center justify-end gap-2 px-3 py-2 border-t ${DASHBOARD_DIVIDER}`}
-          >
-            <button
-              type="button"
-              onClick={handleClearKeyboard}
-              className={`shrink-0 px-2.5 py-1 ${DASHBOARD_BTN}`}
-            >
-              Reset cursor
-            </button>
-          </div>
-          {controlMode === "automatic" && !decoderData && (
-            <p className="shrink-0 px-3 pb-1.5 text-[10px] font-mono text-amber-500/80">Waiting for decoder stream…</p>
-          )}
-        </section>
+          <BCITrackpad
+            ref={trackpadRef}
+            className="absolute inset-0"
+            controlMode={controlMode}
+            cursorNorm={cursorDisplay}
+            vx={controlMode === "manual" ? manualCmd.vx : (decoderData?.vx ?? 0)}
+            vy={controlMode === "manual" ? manualCmd.vy : (decoderData?.vy ?? 0)}
+            penDown={clickActionPenDown}
+            manualDriveRef={manualTrackpadDriveRef}
+            onKeyPress={handleKeyPress}
+            onSwipeComplete={handleSwipeComplete}
+            suggestions={suggestions}
+            onSuggestionSelect={handleSuggestionSelect}
+          />
+        </ThoughtToText>
 
       </main>
     </div>
