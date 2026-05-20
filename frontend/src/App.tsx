@@ -521,8 +521,11 @@ function App() {
       },
       )
       .catch(() => {});
-    void refreshRecordings();
-    void refreshPlaybackStatus();
+    const bootstrapTimer = window.setTimeout(() => {
+      void refreshRecordings();
+      void refreshPlaybackStatus();
+    }, 0);
+    return () => window.clearTimeout(bootstrapTimer);
   }, [refreshPlaybackStatus, refreshRecordings]);
 
   useEffect(() => {
