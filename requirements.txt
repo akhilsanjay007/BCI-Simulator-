@@ -1,4 +1,5 @@
 # Production runtime (Docker / Railway backend). Install dev extras: pip install -r requirements-dev.txt
+# Recording replay uses stdlib json + numpy (no extra packages).
 fastapi==0.115.0
 uvicorn[standard]==0.32.0
 numpy==2.1.2

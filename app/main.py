@@ -17,6 +17,11 @@ from app.decoder import (
     velocity_decoder_missing_help,
 )
 from app.redis_client import get_redis_client
+from app.recording_replay import (
+    ReplayTiming,
+    list_recordings,
+    validate_recording_id,
+)
 from app.simulator import generator
 
 ENV = os.getenv("ENV", "development").lower()
@@ -281,10 +286,105 @@ async def reset_decoder() -> dict[str, object]:
     }
 
 
+class SelectRecordingRequest(BaseModel):
+    recording_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description="Recording stem, e.g. demo_1 or session_20260520_012021",
+    )
+    timing: ReplayTiming = Field(
+        default="original",
+        description="original = sample timestamps; smooth_125hz = uniform 8 ms resample",
+    )
+
+
+class RecordingResponse(BaseModel):
+    recording_id: str
+    label: str
+    typed_text: str
+    duration_ms: int
+    sample_count: int
+
+
+@app.get("/api/recordings")
+async def list_recordings_endpoint() -> dict[str, object]:
+    """Selectable ``recordings/*.json`` files for automatic-mode replay."""
+    items = list_recordings()
+    selected = generator.replay_recording_id
+    return {
+        "recordings": [
+            RecordingResponse(
+                recording_id=r.recording_id,
+                label=r.label,
+                typed_text=r.typed_text,
+                duration_ms=r.duration_ms,
+                sample_count=r.sample_count,
+            ).model_dump()
+            for r in items
+        ],
+        "selected_recording_id": selected,
+        "replay_active": generator.replay_active,
+        # Legacy fields for older dashboards
+        "demos": [
+            RecordingResponse(
+                recording_id=r.recording_id,
+                label=r.label,
+                typed_text=r.typed_text,
+                duration_ms=r.duration_ms,
+                sample_count=r.sample_count,
+            ).model_dump()
+            for r in items
+            if r.recording_id.startswith("demo_")
+        ],
+        "selected_demo_id": selected,
+    }
+
+
+@app.post("/api/recordings/select")
+async def select_recording(body: SelectRecordingRequest) -> dict[str, object]:
+    """Switch replay recording, reset decoder, and notify connected dashboards."""
+    try:
+        recording_id = validate_recording_id(body.recording_id)
+    except ValueError as e:
+        return {"status": "error", "message": str(e)}
+
+    try:
+        generator.set_replay_recording(recording_id, timing=body.timing)
+    except FileNotFoundError as e:
+        return {"status": "error", "message": str(e)}
+
+    decoder.reset()
+    redis_cleared = False
+    if redis_client is not None:
+        redis_cleared = await redis_client.clear_signal_stream()
+    reset_event = decoder.build_reset_event(num_channels=generator.num_channels)
+    clients_notified = await decoder_ws_hub.broadcast_json(reset_event.model_dump())
+    print(
+        f"[recordings/select] recording={recording_id} timing={body.timing} "
+        f"redis_cleared={redis_cleared} ws_clients_notified={clients_notified}"
+    )
+    return {
+        "status": "ok",
+        "selected_recording_id": recording_id,
+        "selected_demo_id": recording_id,
+        "replay_session_id": generator.replay_session_id,
+        "redis_cleared": redis_cleared,
+        "ws_clients_notified": clients_notified,
+    }
+
+
 @app.get("/simulator/config")
-async def simulator_config() -> dict[str, int]:
+async def simulator_config() -> dict[str, int | bool | str | None]:
     """Implements the same channel count as the live generator / decoder (for dashboard bootstrap)."""
-    return {"num_channels": generator.num_channels, "fs": generator.fs}
+    return {
+        "num_channels": generator.num_channels,
+        "fs": generator.fs,
+        "replay_active": generator.replay_active,
+        "replay_session_id": generator.replay_session_id,
+        "selected_recording_id": generator.replay_recording_id,
+        "selected_demo_id": generator.replay_recording_id,
+    }
 
 
 @app.websocket("/ws/bci-stream")
@@ -322,7 +422,18 @@ async def decoder_stream(websocket: WebSocket):
                 true_vx=generator.current_target_vx,
                 true_vy=generator.current_target_vy,
             )
-            out = decoded
+            if generator.replay_active:
+                out = decoded.model_copy(
+                    update={
+                        "vx": generator.current_target_vx,
+                        "vy": generator.current_target_vy,
+                        "pen_down": generator.current_pen_down,
+                        "cursor_x": generator.replay_cursor_x,
+                        "cursor_y": generator.replay_cursor_y,
+                    }
+                )
+            else:
+                out = decoded
             _log_i += 1
             if _log_i % 50 == 0:
                 print(

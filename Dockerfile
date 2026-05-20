@@ -41,6 +41,9 @@ RUN mkdir -p /app/models \
     && chown -R app:app /app/models
 
 COPY app/ ./app/
+# Shipped demo replays (override at runtime with a volume on /app/recordings).
+COPY recordings/ ./recordings/
+RUN chown -R app:app /app/recordings
 
 USER app
 

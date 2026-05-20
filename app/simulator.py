@@ -11,6 +11,12 @@ import numpy as np
 from pydantic import BaseModel, Field
 
 from app.decoder import velocity_spike_multipliers
+from app.recording_replay import (
+    RecordingReplay,
+    ReplayTiming,
+    create_replay_for_recording,
+    try_create_replay,
+)
 from app.redis_client import get_redis_client
 
 # Hold each velocity segment for many batches; within the segment we linearly ramp
@@ -64,6 +70,57 @@ class NeuralSignalGenerator:
         self._manual_burst_vx: float = 0.0
         self._manual_burst_vy: float = 0.0
 
+        self._replay: RecordingReplay | None = try_create_replay()
+        self.replay_cursor_x = 0.5
+        self.replay_cursor_y = 0.5
+        self.current_pen_down = False
+
+    @property
+    def replay_active(self) -> bool:
+        return self._replay is not None
+
+    @property
+    def replay_session_id(self) -> str | None:
+        return self._replay.session_id if self._replay is not None else None
+
+    @property
+    def replay_recording_id(self) -> str | None:
+        if self._replay is None:
+            return None
+        return self._replay.active_recording_id
+
+    @property
+    def replay_demo_id(self) -> str | None:
+        """Legacy alias for ``replay_recording_id``."""
+        return self.replay_recording_id
+
+    def set_replay_recording(
+        self,
+        recording_id: str,
+        *,
+        timing: ReplayTiming = "original",
+    ) -> None:
+        """Switch automatic-mode ground truth to a saved ``recordings/*.json`` file."""
+        batch_ms = (self.fs // 50) * self.dt * 1000.0
+        self._replay = create_replay_for_recording(
+            recording_id,
+            batch_ms=batch_ms,
+            timing=timing,
+        )
+        self.replay_cursor_x = 0.5
+        self.replay_cursor_y = 0.5
+        self.current_pen_down = False
+        self.current_target_vx = 0.0
+        self.current_target_vy = 0.0
+        print(
+            f"[simulator] replay recording id={recording_id} timing={timing} "
+            f"session={self._replay.session_id}"
+        )
+
+    def set_replay_demo(self, demo_id: str) -> None:
+        """Legacy alias — same as ``set_replay_recording``."""
+        self.set_replay_recording(demo_id)
+
     def trigger_manual_burst(self, vx: float, vy: float, duration_ms: float) -> None:
         """
         Short additive spike burst shaped by continuous velocity ``(vx, vy)`` in [-1, 1].
@@ -113,11 +170,45 @@ class NeuralSignalGenerator:
             self._seg_end_vx = float(np.clip(mag * np.cos(ang), -1.0, 1.0))
             self._seg_end_vy = float(np.clip(mag * np.sin(ang), -1.0, 1.0))
 
+    def _advance_ground_truth(self, batch_ms: float) -> None:
+        """Update ``current_target_*``, replay cursor, and pen from recording or random walk."""
+        if self._replay is not None:
+            frame = self._replay.advance(batch_ms)
+            self.current_target_vx = frame.vx
+            self.current_target_vy = frame.vy
+            self.replay_cursor_x = frame.x
+            self.replay_cursor_y = frame.y
+            self.current_pen_down = frame.clicked
+            return
+
+        if self._target_block_remaining <= 0:
+            self._seg_start_vx = float(self._seg_end_vx)
+            self._seg_start_vy = float(self._seg_end_vy)
+            self._pick_new_velocity_endpoint()
+            self._target_block_remaining = _VELOCITY_HOLD_BATCHES
+
+        self._target_block_remaining -= 1
+        n_hold = float(_VELOCITY_HOLD_BATCHES)
+        frac = (n_hold - float(self._target_block_remaining)) / n_hold
+        frac = float(np.clip(frac, 0.0, 1.0))
+        vx = (1.0 - frac) * self._seg_start_vx + frac * self._seg_end_vx
+        vy = (1.0 - frac) * self._seg_start_vy + frac * self._seg_end_vy
+        self.current_target_vx = float(np.clip(vx, -1.0, 1.0))
+        self.current_target_vy = float(np.clip(vy, -1.0, 1.0))
+        self.current_pen_down = True
+
     async def stream(self) -> Dict[str, Any]:
         """Async generator that yields realistic 20 ms batches forever."""
         batch_size = self.fs // 50  # 20 ms batches → smooth real-time feel
+        batch_ms = batch_size * self.dt * 1000.0
         t = 0.0
         redis_client = get_redis_client()
+
+        if self._replay is not None:
+            print(
+                f"[simulator] replay active session={self._replay.session_id} "
+                f"(recordings-driven ground truth)"
+            )
 
         while True:
             noise = self.rng.normal(0, 1.0, size=(batch_size, self.num_channels))
@@ -126,26 +217,16 @@ class NeuralSignalGenerator:
 
             base_prob = self.base_spike_rate * self.dt
 
-            if self._target_block_remaining <= 0:
-                self._seg_start_vx = float(self._seg_end_vx)
-                self._seg_start_vy = float(self._seg_end_vy)
-                self._pick_new_velocity_endpoint()
-                self._target_block_remaining = _VELOCITY_HOLD_BATCHES
-
-            self._target_block_remaining -= 1
-            n_hold = float(_VELOCITY_HOLD_BATCHES)
-            frac = (n_hold - float(self._target_block_remaining)) / n_hold
-            frac = float(np.clip(frac, 0.0, 1.0))
-            vx = (1.0 - frac) * self._seg_start_vx + frac * self._seg_end_vx
-            vy = (1.0 - frac) * self._seg_start_vy + frac * self._seg_end_vy
-            self.current_target_vx = float(np.clip(vx, -1.0, 1.0))
-            self.current_target_vy = float(np.clip(vy, -1.0, 1.0))
+            self._advance_ground_truth(batch_ms)
 
             self._stream_step += 1
             self._velocity_ring.append((self.current_target_vx, self.current_target_vy))
 
             multipliers = velocity_spike_multipliers(
-                self.current_target_vx, self.current_target_vy, True, self.num_channels
+                self.current_target_vx,
+                self.current_target_vy,
+                self.current_pen_down,
+                self.num_channels,
             )
             speed = float(np.hypot(self.current_target_vx, self.current_target_vy))
             multipliers = multipliers * float(1.0 + 0.28 * min(speed, 1.0))

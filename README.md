@@ -1,14 +1,16 @@
 # neuralink-bci-sim
 
-Synthetic neural-style signals over WebSocket (LFP traces + sparse spikes), a trained **velocity decoder**, and an optional **React** dashboard for continuous handwriting and thought-to-text prototyping—without implant hardware.
+Synthetic neural-style signals over WebSocket (LFP traces + sparse spikes), a trained **velocity decoder**, and a **React** dashboard with a virtual-keyboard trackpad (Automatic decoder control + Manual pointer/keys)—without implant hardware.
 
 | Component | Role |
 |-----------|------|
-| `app/simulator.py` | `NeuralSignalGenerator` — ground-truth velocity + channel spikes |
+| `app/simulator.py` | `NeuralSignalGenerator` — ground-truth velocity + channel spikes; optional recording replay |
+| `app/recording_replay.py` | Load `recordings/*.json` and drive cursor `(x, y)` + `clicked` → `pen_down` |
 | `app/decoder.py` | Sliding-window `BciDecoder` — `vx`/`vy`, pen-down, cursor integration |
 | `app/redis_client.py` | Optional Redis Streams buffer (`bci:signals`, ~20s retention) |
-| `app/main.py` | FastAPI — REST, `/ws/bci-stream`, `/ws/decoder` |
-| `frontend/` | Vite + React + Tailwind BCI dashboard |
+| `app/main.py` | FastAPI — REST, `/ws/bci-stream`, `/ws/decoder`, recording APIs |
+| `frontend/` | Vite + React + Tailwind BCI dashboard (`BCITrackpad`, keyboard layout) |
+| `recordings/` | Saved trackpad sessions (`demo_*.json`, `session_*.json`) for Automatic replay |
 
 ## Requirements
 
@@ -83,26 +85,41 @@ docker compose up --build
 | Frontend | [http://127.0.0.1:3000](http://127.0.0.1:3000) | nginx static SPA |
 | Redis | `localhost:6379` | Streams buffer for raw packets |
 
+`docker compose` bind-mounts `./recordings` → `/app/recordings` so demo/session JSON is available without rebuilding the backend image.
+
 The frontend image is built with `VITE_BACKEND_URL=http://localhost:8000` (see `docker-compose.yml` `frontend.build.args`). Change this when the browser must call a different API origin.
 
 ## Dashboard
 
-Three-column layout (large square handwriting canvas, decoder metrics left, thought-to-text right):
+Two-column layout: decoder metrics + neural charts (left), virtual-keyboard trackpad + **Thought → Text** (right).
 
-- **Manual / Automatic** — keyboard + trackpad vs live decoder WebSocket
-- **Handwriting canvas** — draw strokes; **Recognize** appends a letter to **Full Text**
-- **Thought → Text** — **Current Letter** (last glyph) + scrollable **Full Text** + **Clear Text**
+- **Manual** — pointer/keys on the canvas trackpad; optional `POST /manual-neural-burst` for synthetic spikes
+- **Automatic** — live `/ws/decoder` drives cursor + `pen_down` (key select / click on the QWERTY keyboard)
+- **Recording replay** (Automatic only) — header dropdown picks any `recordings/*.json`; timing **Original** (recorded timestamps) or **Smooth 125 Hz** (8 ms resample)
+- **Thought → Text** — typed output from BCI cursor on the keyboard; **Clear** / **Reset cursor**
 - **Decoder metrics** — confidence, latency, signal quality, velocity, session stats
 - **Neural signals** — multi-channel raster sized from `num_channels`
+
+### Recording trackpad sessions (optional)
+
+Local Tk recorder (not required for the dashboard; gitignored under `tools/`):
+
+```powershell
+$env:PYTHONPATH = "."
+python -m tools.record_trackpad
+```
+
+Save → `recordings/session_YYYYMMDD_HHMMSS.json` (normalized `x`, `y`, `timestamp_ms`, `clicked`). Shipped demos: `recordings/demo_1.json`, `demo_2.json`.
 
 ### API used by the UI
 
 | Endpoint | Purpose |
 |----------|---------|
 | `ws://…/ws/decoder` | Live `DecoderPacket` JSON; `type: "decoder_reset"` on reset |
-| `GET /api/decoder/info` | Mode, regressor, `fs_hz`, `n_features`, training status |
-| `GET /simulator/config` | `num_channels`, `fs` |
-| `POST /decoder/mode` | `{ "mode": "cursor" \| "handwriting" }` |
+| `GET /api/decoder/info` | Regressor, `fs_hz`, `n_features`, training status |
+| `GET /simulator/config` | `num_channels`, `fs`, `replay_active`, `selected_recording_id` |
+| `GET /api/recordings` | List `recordings/*.json` metadata for the replay dropdown |
+| `POST /api/recordings/select` | `{ "recording_id", "timing": "original" \| "smooth_125hz" }` — switch replay + decoder reset |
 | `POST /decoder/reset` | Clears decoder + Redis stream; broadcasts reset to WS clients |
 | `POST /manual-neural-burst` | `{ "vx", "vy", "duration_ms" }` — manual-mode cortical burst |
 | `GET /health` | Liveness + decoder/simulator summary |
@@ -139,6 +156,9 @@ Root [`Dockerfile`](Dockerfile): Python 3.11, `pip install -r requirements.txt`,
 | `REDIS_STREAM_SIGNALS` | Stream name (default `bci:signals`) |
 | `REDIS_STREAM_RETENTION_SECONDS` | Trim window (default `20`) |
 | `FRONTEND_URL` / `CORS_ALLOWED_ORIGINS` | Allowed browser origins (comma-separated) |
+| `BCI_REPLAY` | Set `0` / `false` / `off` to disable startup replay (default: on when JSON exists) |
+| `BCI_RECORDINGS_DIR` | Directory for `*.json` sessions (default `recordings/` at repo root; Docker: `/app/recordings`) |
+| `BCI_RECORDING_PATH` | Force a single JSON file at startup (overrides directory scan) |
 
 ### Frontend (Docker / Railway)
 
@@ -192,13 +212,17 @@ JSON per batch: `timestamp_ms`, `fs`, `channels`, `lfp`, `spikes`.
 
 ### Decoder — `ws://host/ws/decoder`
 
-JSON per step: `timestamp_ms`, `vx`, `vy`, `pen_down`, `confidence`, `mode`, `latency_ms`, `accuracy`, `session_accuracy`, `cursor_x`, `cursor_y`, `num_channels`.
+JSON per step: `timestamp_ms`, `vx`, `vy`, `pen_down`, `confidence`, `latency_ms`, `accuracy`, `session_accuracy`, `cursor_x`, `cursor_y`, `num_channels`.
+
+When replay is active, the server overrides `vx`, `vy`, `pen_down`, `cursor_x`, and `cursor_y` from the selected recording so the UI matches saved cursor motion.
 
 Reset broadcast: `{ "type": "decoder_reset", "cursor_x", "cursor_y", "num_channels", … }`.
 
 ## Velocity ground truth
 
-The simulator holds piecewise-constant targets `(vx, vy)` and `pen_down` for many consecutive batches (~200 ms windows) so offline training and live decode stay aligned. Channel firing rates follow direction/speed tuning (`velocity_spike_multipliers` in `app/decoder.py`).
+**Live (no recording):** the simulator holds piecewise-constant targets `(vx, vy)` for ~1 s segments; `pen_down` follows decode-style speed thresholds.
+
+**Recording replay:** ground truth comes from interpolated samples in `recordings/*.json` (`x`, `y`, `clicked` → velocity + `pen_down`). Channel firing uses `velocity_spike_multipliers` in `app/decoder.py`.
 
 ## Tests and offline evaluation
 
@@ -217,19 +241,21 @@ Manual smoke scripts (not collected by pytest): `python tests/test_client.py`, `
 ```
 neuralink-bci-sim/
 ├── app/
-│   ├── main.py           # FastAPI app
-│   ├── simulator.py      # NeuralSignalGenerator
-│   ├── decoder.py        # BciDecoder + artifacts
-│   ├── redis_client.py   # Redis Streams
-│   └── offline_eval.py   # Training / metrics
-├── frontend/             # React dashboard
-├── models/               # velocity_decoder.pkl (Git LFS)
+│   ├── main.py              # FastAPI app
+│   ├── simulator.py         # NeuralSignalGenerator
+│   ├── recording_replay.py  # recordings/*.json replay driver
+│   ├── decoder.py           # BciDecoder + artifacts
+│   ├── redis_client.py      # Redis Streams
+│   └── offline_eval.py      # Training / metrics
+├── recordings/              # demo_*.json, session_*.json (replay source)
+├── frontend/                # React dashboard
+├── models/                  # velocity_decoder.pkl (Git LFS)
 ├── tests/
-├── Dockerfile            # Backend image
-├── docker-compose.yml    # backend + frontend + redis
+├── Dockerfile               # Backend image
+├── docker-compose.yml       # backend + frontend + redis
 ├── railway.toml
-├── requirements.txt      # Production Python deps
-├── requirements-dev.txt  # + pytest for dev/CI
+├── requirements.txt         # Production Python deps
+├── requirements-dev.txt     # + pytest for dev/CI
 ├── .env.example
 └── README.md
 ```
