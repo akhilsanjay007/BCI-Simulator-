@@ -22,17 +22,28 @@ import {
   predictSwipeWords,
 } from "./wordSuggestions";
 
+function normalizeBackendUrl(value: string | undefined | null): string | null {
+  const normalized = (value ?? "").trim().replace(/\/$/, "");
+  return normalized.length > 0 ? normalized : null;
+}
+
 function resolveBackendUrl(): string {
-  const configured = (import.meta.env.VITE_BACKEND_URL as string | undefined)?.trim();
-  if (configured) {
-    return configured.replace(/\/$/, "");
+  const runtimeConfigured = normalizeBackendUrl(window.__APP_CONFIG__?.VITE_BACKEND_URL);
+  if (runtimeConfigured) {
+    return runtimeConfigured;
+  }
+
+  const buildConfigured = normalizeBackendUrl(import.meta.env.VITE_BACKEND_URL);
+  if (buildConfigured) {
+    return buildConfigured;
   }
 
   if (import.meta.env.DEV) {
     return "http://localhost:8000";
   }
 
-  throw new Error("VITE_BACKEND_URL must be set for production builds.");
+  // Fallback for same-origin deployments when a runtime env var is not set.
+  return window.location.origin.replace(/\/$/, "");
 }
 
 function toWebSocketOrigin(httpOrigin: string): string {
