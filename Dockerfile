@@ -49,6 +49,7 @@ USER app
 
 EXPOSE 8000
 
-# Multiple workers: suitable for CPU-bound work offloaded from the event loop.
-# Note: each worker is a separate process; global simulator state is per-worker.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+# Run a single process in container runtimes (e.g. Railway). The decoder model
+# is loaded in-process, so multi-worker mode multiplies memory usage and can
+# trigger worker restart loops on small instances.
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
