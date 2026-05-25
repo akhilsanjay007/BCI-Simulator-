@@ -21,12 +21,6 @@ neuralink-bci-sim/
 │       └── ci-cd.yml
 ├── app/
 │   ├── __init__.py
-│   ├── main.py                 # compatibility entrypoint -> app/core/main.py
-│   ├── simulator.py            # compatibility export -> app/core/simulator.py
-│   ├── decoder.py              # compatibility export -> app/core/decoder.py
-│   ├── redis_client.py         # compatibility export -> app/core/redis_client.py
-│   ├── recording_replay.py     # compatibility export -> app/core/recording_replay.py
-│   ├── offline_eval.py         # compatibility export -> app/core/offline_eval.py
 │   └── core/
 │       ├── __init__.py
 │       ├── main.py             # FastAPI API surface + WebSocket streams

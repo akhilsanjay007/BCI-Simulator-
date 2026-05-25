@@ -1,6 +1,6 @@
 """Offline evaluation suite for the decoder (pytest; no live server)."""
 
-from app.offline_eval import evaluate_decoder_offline, velocity_error_histogram_offline
+from app.core.offline_eval import evaluate_decoder_offline, velocity_error_histogram_offline
 
 
 def test_offline_accuracy_above_chance() -> None:

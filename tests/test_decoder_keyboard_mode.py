@@ -2,8 +2,8 @@
 
 from fastapi.testclient import TestClient
 
-from app.decoder import BciDecoder, DecoderPacket
-from app.main import app
+from app.core.decoder import BciDecoder, DecoderPacket
+from app.core.main import app
 
 
 def test_decoder_packet_has_no_mode_field() -> None:

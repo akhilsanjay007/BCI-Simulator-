@@ -52,7 +52,7 @@ docker-compose.override.yml
 # Optional local tooling
 tools/
 .envrc
-# Trained decoder weights (retrain: python -m app.offline_eval --retrain)
+# Trained decoder weights (retrain: python -m app.core.offline_eval --retrain)
 models/*.pkl
 *.pkl
 

@@ -6,8 +6,8 @@ import asyncio
 
 from fastapi.testclient import TestClient
 
-from app.decoder import DecoderPacket
-from app.main import app, decoder, generator
+from app.core.decoder import DecoderPacket
+from app.core.main import app, decoder, generator
 
 
 def test_ws_decoder_replay_uses_predict_metrics(monkeypatch) -> None:

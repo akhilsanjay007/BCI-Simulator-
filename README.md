@@ -60,9 +60,9 @@ This keeps long sessions predictable and memory behavior stable.
 
 Manual control is not a fake UI bypass. It routes velocity hints through decoder prediction endpoints so confidence, latency, and accuracy remain meaningful during interaction.
 
-### 4) Compatibility-preserving refactor for maintainability
+### 4) Core-module organization for maintainability
 
-Backend logic is organized under `app/core/` and frontend logic under `frontend/src/components`, `frontend/src/utils`, and `frontend/src/styles`, while compatibility entrypoints keep existing commands and tests stable.
+Backend logic is organized under `app/core/` and frontend logic under `frontend/src/components`, `frontend/src/utils`, and `frontend/src/styles`, keeping runtime and import surfaces explicit.
 
 ---
 
@@ -126,7 +126,7 @@ python -m venv venv
 .\venv\Scripts\Activate.ps1
 pip install -r requirements-dev.txt
 $env:PYTHONPATH = "."
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn app.core.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 ### 2) Frontend
@@ -195,6 +195,26 @@ npm run lint
 npm run build
 ```
 
+### Offline model training (velocity decoder)
+
+Train and export a decoder artifact locally (written to `models/velocity_decoder.pkl` by default):
+
+```powershell
+python -m app.core.offline_eval --mode velocity --model ensemble --samples 150000 --retrain
+```
+
+Run offline train+eval only (no artifact write) for a quick quality check:
+
+```powershell
+python -m app.core.offline_eval --mode velocity --model ensemble --samples 50000
+```
+
+Useful flags:
+
+- `--artifact models/velocity_decoder.pkl` to choose output path
+- `--model rf|hgb|ensemble` to select regressor
+- `--channels`, `--fs`, `--window-ms` to match your target runtime setup
+
 ---
 
 ## Project Structure
@@ -208,12 +228,6 @@ app/
     redis_client.py
     recording_replay.py
     offline_eval.py
-  main.py                (compat entrypoint)
-  simulator.py           (compat export)
-  decoder.py             (compat export)
-  redis_client.py        (compat export)
-  recording_replay.py    (compat export)
-  offline_eval.py        (compat export)
 
 frontend/src/
   components/

@@ -53,4 +53,4 @@ EXPOSE 8000
 # is loaded in-process, so multi-worker mode multiplies memory usage and can
 # trigger worker restart loops on small instances. Reload stays disabled because
 # we do not pass --reload in production startup commands.
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips='*'"]
+CMD ["sh", "-c", "uvicorn app.core.main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips='*'"]

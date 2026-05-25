@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from app.decoder import DecoderPacket
-from app.main import app, generator, manual_decoder
+from app.core.decoder import DecoderPacket
+from app.core.main import app, generator, manual_decoder
 
 
 def test_manual_decoder_predict_uses_real_decoder(monkeypatch) -> None:

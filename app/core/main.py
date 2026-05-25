@@ -285,6 +285,17 @@ async def health() -> dict[str, object]:
     }
 
 
+@app.get("/")
+async def root() -> dict[str, object]:
+    """
+    Railway shared healthcheck compatibility.
+
+    This repo deploys backend + frontend from one config where healthcheck path is
+    shared. Returning 200 here keeps backend healthy when healthcheckPath is "/".
+    """
+    return {"status": "ok", "service": "neuralink-bci-sim-backend", "docs": "/docs"}
+
+
 @app.get("/api/decoder/info")
 async def decoder_info() -> dict[str, object]:
     """Decoder configuration and model type (for dashboards / ops)."""
@@ -712,7 +723,7 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
-        "app.main:app",
+        "app.core.main:app",
         host="0.0.0.0",
         port=int(os.getenv("PORT", "8000")),
         reload=not IS_PRODUCTION,
