@@ -80,7 +80,16 @@ class DecoderPacket(BaseModel):
         description="True when decoded speed implies a key select / click (keyboard mode).",
     )
     confidence: float = Field(..., ge=0.0, le=1.0)
-    latency_ms: float = Field(..., ge=0.0)
+    decode_latency_ms: float = Field(
+        ...,
+        ge=0.0,
+        description="Pure decoder inference latency in milliseconds (perf_counter around predict path).",
+    )
+    end_to_end_latency_ms: float = Field(
+        ...,
+        ge=0.0,
+        description="Backend-side packet age in milliseconds from simulator packet timestamp to WS emit.",
+    )
     accuracy: float = Field(
         ...,
         ge=0.0,
@@ -774,7 +783,8 @@ class BciDecoder:
             vy=vy_out,
             pen_down=pen_down,
             confidence=float(np.clip(confidence, 0.0, 1.0)),
-            latency_ms=latency_ms,
+            decode_latency_ms=latency_ms,
+            end_to_end_latency_ms=latency_ms,
             accuracy=accuracy,
             session_accuracy=session_accuracy,
             cursor_x=cx,

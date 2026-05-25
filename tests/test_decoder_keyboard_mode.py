@@ -11,7 +11,11 @@ def test_decoder_packet_has_no_mode_field() -> None:
     spikes = [[0] * 8 for _ in range(20)]
     pkt = decoder.predict(spikes, true_vx=0.5, true_vy=0.0)
     assert isinstance(pkt, DecoderPacket)
-    assert "mode" not in pkt.model_dump()
+    body = pkt.model_dump()
+    assert "mode" not in body
+    assert "decode_latency_ms" in body
+    assert "end_to_end_latency_ms" in body
+    assert "latency_ms" not in body
 
 
 def test_post_decoder_mode_removed() -> None:

@@ -2,7 +2,6 @@ import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } fr
 import {
   stepCursorMotion,
   seedCursorMotion,
-  MANUAL_CONTROL_CONFIDENCE,
   type CursorMotionState,
 } from "./cursorPhysics";
 import { BCITrackpad, type BCITrackpadHandle } from "./BCITrackpad";
@@ -56,8 +55,10 @@ const BACKEND_HTTP_ORIGIN = resolveBackendUrl();
 const BACKEND_WS_ORIGIN = toWebSocketOrigin(BACKEND_HTTP_ORIGIN);
 
 const BACKEND_ENDPOINTS = {
-  manualNeuralBurst: `${BACKEND_HTTP_ORIGIN}/manual-neural-burst`,
+  manualDecoderPredict: `${BACKEND_HTTP_ORIGIN}/manual-decoder-predict`,
   simulatorConfig: `${BACKEND_HTTP_ORIGIN}/simulator/config`,
+  healthRedis: `${BACKEND_HTTP_ORIGIN}/health/redis`,
+  decoderInfo: `${BACKEND_HTTP_ORIGIN}/api/decoder/info`,
   recordings: `${BACKEND_HTTP_ORIGIN}/api/recordings`,
   selectRecording: `${BACKEND_HTTP_ORIGIN}/api/recordings/select`,
   playback: `${BACKEND_HTTP_ORIGIN}/api/recordings/playback`,
@@ -86,6 +87,17 @@ interface PlaybackStatusResponse {
   recording_file?: string | null;
 }
 
+interface RedisHealthResponse {
+  status?: "ok" | "error" | "disabled" | string;
+  stream?: string;
+}
+
+interface DecoderInfoResponse {
+  is_trained?: boolean;
+  model_type?: string;
+  regressor?: string;
+}
+
 /** Hint when the accumulated sentence is empty. */
 const FULL_TEXT_PLACEHOLDER = "Type with the BCI cursor on the keyboard…";
 
@@ -95,7 +107,8 @@ interface DecoderPacket {
   vy: number;
   pen_down: boolean;
   confidence: number;
-  latency_ms: number;
+  decode_latency_ms: number;
+  end_to_end_latency_ms: number;
   accuracy: number;
   session_accuracy: number;
   cursor_x?: number;
@@ -109,6 +122,13 @@ interface DecoderResetEvent {
   cursor_x: number;
   cursor_y: number;
   num_channels: number;
+}
+
+interface ReplayLatencyStats {
+  meanEmitIntervalMs: number;
+  p95EmitIntervalMs: number;
+  meanSourceLagMs: number;
+  p95SourceLagMs: number;
 }
 
 function isDecoderResetEvent(data: unknown): data is DecoderResetEvent {
@@ -145,29 +165,57 @@ function netVelocityFromHeld(held: Set<DirectionKey>): { vx: number; vy: number 
 const SPIKE_CONFIDENCE_MIN = 0.75;
 const SPIKE_CONFIDENCE_MAX = 0.99;
 const SPIKE_PULSE_DECAY_PER_S = 5.4;
-const AUTO_CURSOR_SMOOTH_PER_S = 13.5;
+const AUTO_CURSOR_SMOOTH_PER_S = 24;
 const AUTO_CURSOR_DEADZONE_NORM = 0.0008;
 const AUTO_CURSOR_VELOCITY_BOOST_MAX = 0.85;
-const AUTO_TARGET_SMOOTH_PER_S = 21;
+const AUTO_TARGET_SMOOTH_PER_S = 36;
 const AUTO_TARGET_DEADZONE_NORM = 0.0012;
-const AUTO_TARGET_JUMP_SNAP_NORM = 0.24;
+const AUTO_TARGET_JUMP_SNAP_NORM = 0.16;
+const AUTO_REPLAY_SMOOTH_BOOST = 1.2;
+const AUTO_REPLAY_DEADZONE_SCALE = 0.55;
 const SIGNAL_DISPLAY_GAIN = 1.15;
 const SIGNAL_DISPLAY_BIAS = 0.06;
+const FETCH_TIMEOUT_MS = 5000;
+const REPLAY_STATS_WINDOW = 180;
+const MANUAL_DECODE_MIN_INTERVAL_MS = 20;
 
 function sampleSpikeConfidence(): number {
   return SPIKE_CONFIDENCE_MIN + Math.random() * (SPIKE_CONFIDENCE_MAX - SPIKE_CONFIDENCE_MIN);
 }
 
+async function fetchWithTimeout(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
+function summarizeWindow(samples: number[]): { mean: number; p95: number } {
+  if (samples.length === 0) {
+    return { mean: 0, p95: 0 };
+  }
+  const mean = samples.reduce((acc, value) => acc + value, 0) / samples.length;
+  const sorted = [...samples].sort((a, b) => a - b);
+  const p95Index = Math.max(0, Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1));
+  return { mean, p95: sorted[p95Index] };
+}
+
 function App() {
   const [status, setStatus] = useState<"connected" | "disconnected">("disconnected");
+  const [redisStatus, setRedisStatus] = useState<"checking" | "ok" | "error" | "disabled">("checking");
+  const [redisStream, setRedisStream] = useState<string | null>(null);
+  const [modelStatus, setModelStatus] = useState<"checking" | "ready" | "fallback" | "error">(
+    "checking",
+  );
+  const [modelLabel, setModelLabel] = useState<string>("Unknown model");
   const [totalChannels, setTotalChannels] = useState(32);
   const [decoderData, setDecoderData] = useState<DecoderPacket | null>(null);
   const [cursorDisplay, setCursorDisplay] = useState({ x: 0.5, y: 0.5 });
-  const [controlMode, setControlMode] = useState<ControlMode>("manual");
+  const [controlMode, setControlMode] = useState<ControlMode>("automatic");
   const [manualCmd, setManualCmd] = useState({ vx: 0, vy: 0 });
-  const [latestSpikeCommandConfidence, setLatestSpikeCommandConfidence] = useState<number | null>(
-    null,
-  );
   const [spikeStrength, setSpikeStrength] = useState(0);
   const [manualNeuralBurst, setManualNeuralBurst] = useState<ManualNeuralBurstPayload | null>(null);
   const [manualPenDown, setManualPenDown] = useState(false);
@@ -183,13 +231,13 @@ function App() {
   const [replayLoaded, setReplayLoaded] = useState(false);
   const [replayPaused, setReplayPaused] = useState(true);
   const [replayBusy, setReplayBusy] = useState(false);
-  const [replaySpeed, setReplaySpeed] = useState(1);
+  const [replayLatencyStats, setReplayLatencyStats] = useState<ReplayLatencyStats | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const trackpadRef = useRef<BCITrackpadHandle | null>(null);
   const thoughtPanelRef = useRef<HTMLElement | null>(null);
   const thoughtPanelIntentRef = useRef(false);
-  const controlModeRef = useRef<ControlMode>("manual");
+  const controlModeRef = useRef<ControlMode>("automatic");
   const cursorDisplayRef = useRef(cursorDisplay);
   const decoderDataRef = useRef<DecoderPacket | null>(null);
   const manualPenDownRef = useRef(false);
@@ -207,8 +255,13 @@ function App() {
   const autoCursorTargetRef = useRef({ x: 0.5, y: 0.5 });
   const autoTargetTimestampRef = useRef<number | null>(null);
   const signalPenDownPrevRef = useRef(false);
-  const latencyEmaRef = useRef<number | null>(null);
-  const lastPacketAtMsRef = useRef<number | null>(null);
+  const replayLoadedRef = useRef(false);
+  const pendingRecordingSelectionRef = useRef<string | null>(null);
+  const replayEmitIntervalsRef = useRef<number[]>([]);
+  const replaySourceLagsRef = useRef<number[]>([]);
+  const lastDecoderPacketArrivalMsRef = useRef<number | null>(null);
+  const manualDecodeInFlightRef = useRef(false);
+  const manualDecodeLastSentAtRef = useRef(0);
 
   useEffect(() => {
     penUpSinceRef.current = performance.now();
@@ -220,7 +273,8 @@ function App() {
     decoderDataRef.current = decoderData;
     manualPenDownRef.current = manualPenDown;
     spikeStrengthRef.current = spikeStrength;
-  }, [controlMode, cursorDisplay, decoderData, manualPenDown, spikeStrength]);
+    replayLoadedRef.current = replayLoaded;
+  }, [controlMode, cursorDisplay, decoderData, manualPenDown, replayLoaded, spikeStrength]);
 
   const handleKeyPress = useCallback((keyId: string) => {
     setSwipeSuggestions([]);
@@ -320,16 +374,44 @@ function App() {
     const c = sampleSpikeConfidence();
     latestSpikeConfidenceRef.current = c;
     spikePulseEnvelopeRef.current = 1;
-    setLatestSpikeCommandConfidence(c);
     const duration = 300 + Math.random() * 300;
     const start = Date.now();
     setManualNeuralBurst({ startMs: start, endMs: start + duration, vx, vy });
-    void fetch(BACKEND_ENDPOINTS.manualNeuralBurst, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ vx, vy, duration_ms: duration }),
-    }).catch(() => {});
   }, []);
+
+  const requestManualDecoderMetrics = useCallback(
+    async (vx: number, vy: number, penDown: boolean) => {
+      if (manualDecodeInFlightRef.current) return;
+      const now = performance.now();
+      if (now - manualDecodeLastSentAtRef.current < MANUAL_DECODE_MIN_INTERVAL_MS) return;
+      manualDecodeInFlightRef.current = true;
+      manualDecodeLastSentAtRef.current = now;
+      try {
+        const response = await fetch(BACKEND_ENDPOINTS.manualDecoderPredict, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            vx,
+            vy,
+            pen_down: penDown,
+            batch_samples: 20,
+          }),
+        });
+        if (!response.ok) return;
+        const packet = (await response.json()) as DecoderPacket;
+        if (typeof packet.num_channels === "number" && packet.num_channels >= 1) {
+          setTotalChannels(Math.floor(packet.num_channels));
+        }
+        if (controlModeRef.current !== "manual") return;
+        setDecoderData(packet);
+      } catch {
+        /* ignore */
+      } finally {
+        manualDecodeInFlightRef.current = false;
+      }
+    },
+    [],
+  );
 
   const applyManualDirectionDown = useCallback(
     (dir: DirectionKey) => {
@@ -360,10 +442,10 @@ function App() {
     setManualTrackpadActive(false);
     latestSpikeConfidenceRef.current = null;
     spikePulseEnvelopeRef.current = 0;
-    setLatestSpikeCommandConfidence(null);
     setSpikeStrength(0);
     setManualNeuralBurst(null);
     lastManualPadSpeedRef.current = 0;
+    manualDecodeInFlightRef.current = false;
   }, []);
 
   const absorbManualTrackpadFrame = useCallback(
@@ -422,24 +504,33 @@ function App() {
       signalSmoothRef.current = 0;
       setSignalPct(0);
       penUpSinceRef.current = performance.now();
-      latencyEmaRef.current = null;
-      lastPacketAtMsRef.current = null;
+      replayEmitIntervalsRef.current = [];
+      replaySourceLagsRef.current = [];
+      lastDecoderPacketArrivalMsRef.current = null;
+      setReplayLatencyStats(null);
     },
     [applyManualRest],
   );
+
+  const resetReplayLatencyStats = useCallback(() => {
+    replayEmitIntervalsRef.current = [];
+    replaySourceLagsRef.current = [];
+    lastDecoderPacketArrivalMsRef.current = null;
+    setReplayLatencyStats(null);
+  }, []);
 
   const selectControlMode = useCallback((mode: ControlMode) => {
     controlModeRef.current = mode;
     setControlMode(mode);
     if (mode === "manual") {
       setDecoderData(null);
+      resetReplayLatencyStats();
       latestSpikeConfidenceRef.current = null;
       spikePulseEnvelopeRef.current = 0;
-      setLatestSpikeCommandConfidence(null);
       setSpikeStrength(0);
     }
     setManualNeuralBurst(null);
-  }, []);
+  }, [resetReplayLatencyStats]);
 
   const refreshRecordings = useCallback(async () => {
     try {
@@ -468,13 +559,60 @@ function App() {
       if (!r.ok) return;
       const j = (await r.json()) as PlaybackStatusResponse;
       setReplayPaused(Boolean(j.paused));
-      setReplaySpeed(typeof j.speed === "number" ? j.speed : 1);
       setReplayLoaded(Boolean(j.replay_loaded ?? j.replay_active));
       if (typeof j.recording_file === "string" && j.recording_file.length > 0) {
+        const pending = pendingRecordingSelectionRef.current;
+        if (pending && j.recording_file !== pending) {
+          return;
+        }
+        if (pending && j.recording_file === pending) {
+          pendingRecordingSelectionRef.current = null;
+        }
         setSelectedRecordingFile(j.recording_file);
       }
     } catch {
       /* ignore */
+    }
+  }, []);
+
+  const refreshRedisStatus = useCallback(async () => {
+    try {
+      const r = await fetch(BACKEND_ENDPOINTS.healthRedis);
+      if (!r.ok) {
+        setRedisStatus("error");
+        setRedisStream(null);
+        return;
+      }
+      const j = (await r.json()) as RedisHealthResponse;
+      const nextStatus = j.status === "ok" || j.status === "disabled" ? j.status : "error";
+      setRedisStatus(nextStatus);
+      setRedisStream(typeof j.stream === "string" && j.stream.length > 0 ? j.stream : null);
+    } catch {
+      setRedisStatus("error");
+      setRedisStream(null);
+    }
+  }, []);
+
+  const refreshModelStatus = useCallback(async () => {
+    try {
+      const r = await fetch(BACKEND_ENDPOINTS.decoderInfo);
+      if (!r.ok) {
+        setModelStatus("error");
+        setModelLabel("Unknown model");
+        return;
+      }
+      const j = (await r.json()) as DecoderInfoResponse;
+      const nextLabel =
+        typeof j.model_type === "string" && j.model_type.trim().length > 0
+          ? j.model_type
+          : typeof j.regressor === "string" && j.regressor.trim().length > 0
+            ? j.regressor
+            : "Unknown model";
+      setModelLabel(nextLabel);
+      setModelStatus(j.is_trained ? "ready" : "fallback");
+    } catch {
+      setModelStatus("error");
+      setModelLabel("Unknown model");
     }
   }, []);
 
@@ -489,7 +627,7 @@ function App() {
         if (action === "set_speed" && typeof payload?.speed === "number") {
           body.speed = payload.speed;
         }
-        const r = await fetch(BACKEND_ENDPOINTS.playback, {
+        const r = await fetchWithTimeout(BACKEND_ENDPOINTS.playback, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
@@ -501,8 +639,6 @@ function App() {
           setReplayPaused(true);
         } else if (action === "play") {
           setReplayPaused(false);
-        } else if (action === "set_speed" && typeof payload?.speed === "number") {
-          setReplaySpeed(payload.speed);
         } else if (action === "restart") {
           setReplayPaused(false);
         }
@@ -535,9 +671,19 @@ function App() {
     const bootstrapTimer = window.setTimeout(() => {
       void refreshRecordings();
       void refreshPlaybackStatus();
+      void refreshRedisStatus();
+      void refreshModelStatus();
     }, 0);
     return () => window.clearTimeout(bootstrapTimer);
-  }, [refreshPlaybackStatus, refreshRecordings]);
+  }, [refreshModelStatus, refreshPlaybackStatus, refreshRecordings, refreshRedisStatus]);
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      void refreshRedisStatus();
+      void refreshModelStatus();
+    }, 10000);
+    return () => window.clearInterval(id);
+  }, [refreshModelStatus, refreshRedisStatus]);
 
   useEffect(() => {
     if (controlMode !== "automatic") return;
@@ -563,32 +709,39 @@ function App() {
           applyDecoderReset(raw);
           return;
         }
-        let data = raw as DecoderPacket;
+        const data = raw as DecoderPacket;
         if (typeof data.num_channels === "number" && data.num_channels >= 1) {
           setTotalChannels(Math.floor(data.num_channels));
         }
         if (controlModeRef.current !== "automatic") {
           return;
         }
-        const nowMs = Date.now();
-        const sentLatency = nowMs - data.timestamp_ms;
-        const interPacket =
-          lastPacketAtMsRef.current == null ? null : nowMs - lastPacketAtMsRef.current;
-        lastPacketAtMsRef.current = nowMs;
-        const rawLatencyMs =
-          Number.isFinite(sentLatency) && sentLatency >= 0 && sentLatency <= 5000
-            ? sentLatency
-            : interPacket;
-        if (rawLatencyMs != null) {
-          const prev = latencyEmaRef.current;
-          const next = prev == null ? rawLatencyMs : prev * 0.82 + rawLatencyMs * 0.18;
-          latencyEmaRef.current = Math.min(Math.max(next, 0), 999);
-          data = {
-            ...data,
-            latency_ms: latencyEmaRef.current,
-          };
-        }
         setDecoderData(data);
+        const arrivalMs = performance.now();
+        const previousArrivalMs = lastDecoderPacketArrivalMsRef.current;
+        if (previousArrivalMs != null) {
+          const emitIntervalMs = Math.max(0, arrivalMs - previousArrivalMs);
+          replayEmitIntervalsRef.current.push(emitIntervalMs);
+          if (replayEmitIntervalsRef.current.length > REPLAY_STATS_WINDOW) {
+            replayEmitIntervalsRef.current.shift();
+          }
+        }
+        lastDecoderPacketArrivalMsRef.current = arrivalMs;
+        const sourceLagMs = Math.max(0, Date.now() - data.timestamp_ms);
+        replaySourceLagsRef.current.push(sourceLagMs);
+        if (replaySourceLagsRef.current.length > REPLAY_STATS_WINDOW) {
+          replaySourceLagsRef.current.shift();
+        }
+        if (replayEmitIntervalsRef.current.length >= 8 && replaySourceLagsRef.current.length >= 8) {
+          const emit = summarizeWindow(replayEmitIntervalsRef.current);
+          const lag = summarizeWindow(replaySourceLagsRef.current);
+          setReplayLatencyStats({
+            meanEmitIntervalMs: emit.mean,
+            p95EmitIntervalMs: emit.p95,
+            meanSourceLagMs: lag.mean,
+            p95SourceLagMs: lag.p95,
+          });
+        }
         const rawTarget = {
           x: data.cursor_x ?? 0.5,
           y: data.cursor_y ?? 0.5,
@@ -597,20 +750,22 @@ function App() {
         const dx = rawTarget.x - prevTarget.x;
         const dy = rawTarget.y - prevTarget.y;
         const dist = Math.hypot(dx, dy);
+        const replayBoost = replayLoadedRef.current ? AUTO_REPLAY_SMOOTH_BOOST : 1;
+        const targetDeadzone = AUTO_TARGET_DEADZONE_NORM * (replayLoadedRef.current ? 0.5 : 1);
         const packetTs = data.timestamp_ms;
         const prevTs = autoTargetTimestampRef.current;
         autoTargetTimestampRef.current = packetTs;
         const dt =
           prevTs != null && packetTs > prevTs ? Math.min((packetTs - prevTs) / 1000, 0.08) : 1 / 60;
 
-        if (dist <= AUTO_TARGET_DEADZONE_NORM) {
+        if (dist <= targetDeadzone) {
           return;
         }
         if (dist >= AUTO_TARGET_JUMP_SNAP_NORM) {
           autoCursorTargetRef.current = rawTarget;
           return;
         }
-        const alpha = 1 - Math.exp(-AUTO_TARGET_SMOOTH_PER_S * dt);
+        const alpha = 1 - Math.exp(-AUTO_TARGET_SMOOTH_PER_S * replayBoost * dt);
         autoCursorTargetRef.current = {
           x: prevTarget.x + dx * alpha,
           y: prevTarget.y + dy * alpha,
@@ -651,11 +806,14 @@ function App() {
 
     let frameId = 0;
     let last = performance.now();
-    const deadzoneSq = AUTO_CURSOR_DEADZONE_NORM * AUTO_CURSOR_DEADZONE_NORM;
 
     const loop = (now: number) => {
       const dt = Math.min((now - last) / 1000, 0.064);
       last = now;
+      const replayBoost = replayLoadedRef.current ? AUTO_REPLAY_SMOOTH_BOOST : 1;
+      const deadzoneScale = replayLoadedRef.current ? AUTO_REPLAY_DEADZONE_SCALE : 1;
+      const deadzoneSq =
+        (AUTO_CURSOR_DEADZONE_NORM * deadzoneScale) * (AUTO_CURSOR_DEADZONE_NORM * deadzoneScale);
       const target = autoCursorTargetRef.current;
       const curr = cursorDisplayRef.current;
       const dx = target.x - curr.x;
@@ -665,7 +823,7 @@ function App() {
         const pkt = decoderDataRef.current;
         const speed = pkt ? Math.hypot(pkt.vx, pkt.vy) : 0;
         const boost = 1 + Math.min(1, speed) * AUTO_CURSOR_VELOCITY_BOOST_MAX;
-        const alpha = 1 - Math.exp(-AUTO_CURSOR_SMOOTH_PER_S * boost * dt);
+        const alpha = 1 - Math.exp(-AUTO_CURSOR_SMOOTH_PER_S * replayBoost * boost * dt);
         const next = {
           x: curr.x + dx * alpha,
           y: curr.y + dy * alpha,
@@ -701,14 +859,15 @@ function App() {
 
       if (pad.active) {
         absorbManualTrackpadFrame(pad, now);
+        void requestManualDecoderMetrics(pad.vx, pad.vy, pad.penDown);
       } else {
         setManualTrackpadActive((prev) => (prev ? false : prev));
         if (keysHeld) {
           const { vx: cmdVx, vy: cmdVy } = manualVelocityRef.current;
-          let effectiveConfidence = 0;
-          if (Math.hypot(cmdVx, cmdVy) > 1e-6 && latestSpikeConfidenceRef.current != null) {
-            effectiveConfidence = latestSpikeConfidenceRef.current * spikePulseEnvelopeRef.current;
-          }
+          const effectiveConfidence =
+            Math.hypot(cmdVx, cmdVy) > 1e-6 && latestSpikeConfidenceRef.current != null
+              ? latestSpikeConfidenceRef.current * spikePulseEnvelopeRef.current
+              : 0;
 
           manualPhysicsRef.current = stepCursorMotion(
             manualPhysicsRef.current,
@@ -719,12 +878,9 @@ function App() {
           );
           const { xSmooth, ySmooth } = manualPhysicsRef.current;
           setCursorDisplay({ x: xSmooth, y: ySmooth });
+          void requestManualDecoderMetrics(cmdVx, cmdVy, manualPenDownRef.current);
 
-          let strengthVisual = 0;
-          if (Math.hypot(cmdVx, cmdVy) > 1e-6 && latestSpikeConfidenceRef.current != null) {
-            strengthVisual = latestSpikeConfidenceRef.current * spikePulseEnvelopeRef.current;
-          }
-          setSpikeStrength(strengthVisual);
+          setSpikeStrength(effectiveConfidence);
         } else {
           manualVelocityRef.current = { vx: 0, vy: 0 };
           setSpikeStrength(0);
@@ -736,7 +892,7 @@ function App() {
 
     frameId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(frameId);
-  }, [controlMode, absorbManualTrackpadFrame]);
+  }, [controlMode, absorbManualTrackpadFrame, requestManualDecoderMetrics]);
 
   useEffect(() => {
     if (controlMode !== "manual") return;
@@ -799,12 +955,10 @@ function App() {
       if (mode === "manual") {
         const pad = manualTrackpadDriveRef.current;
         const cmd = manualVelocityRef.current;
-        velocityMag = pad.active ? Math.hypot(pad.vx, pad.vy) : Math.hypot(cmd.vx, cmd.vy);
-        confidence =
-          latestSpikeConfidenceRef.current != null
-            ? latestSpikeConfidenceRef.current
-            : MANUAL_CONTROL_CONFIDENCE;
-        spike = spikeStrengthRef.current;
+        const pkt = decoderDataRef.current;
+        velocityMag = pkt ? Math.hypot(pkt.vx, pkt.vy) : pad.active ? Math.hypot(pad.vx, pad.vy) : Math.hypot(cmd.vx, cmd.vy);
+        confidence = pkt?.confidence ?? 0;
+        spike = pkt?.confidence ?? spikeStrengthRef.current;
       } else {
         const pkt = decoderDataRef.current;
         velocityMag = pkt ? Math.hypot(pkt.vx, pkt.vy) : 0;
@@ -857,18 +1011,13 @@ function App() {
 
   const manualDriving =
     controlMode === "manual" && (manualPenDown || manualTrackpadActive);
-  const metricsVx = manualDriving ? manualCmd.vx : (decoderData?.vx ?? 0);
-  const metricsVy = manualDriving ? manualCmd.vy : (decoderData?.vy ?? 0);
+  const metricsVx = decoderData?.vx ?? (manualDriving ? manualCmd.vx : 0);
+  const metricsVy = decoderData?.vy ?? (manualDriving ? manualCmd.vy : 0);
   const signalStyle = signalTierStyles(signalPct >= 67 ? "good" : signalPct >= 34 ? "medium" : "poor");
 
   const isComposing = clickActionPenDown;
 
-  const displayConfidence =
-    controlMode === "manual"
-      ? latestSpikeCommandConfidence != null
-        ? latestSpikeCommandConfidence
-        : MANUAL_CONTROL_CONFIDENCE
-      : (decoderData?.confidence ?? 0);
+  const displayConfidence = decoderData?.confidence ?? 0;
 
   const handleToggleReplayPlayback = () => {
     void sendReplayPlaybackCommand(replayPaused ? "play" : "pause");
@@ -876,8 +1025,11 @@ function App() {
 
   const handleSelectRecording = (recordingFile: string) => {
     if (!recordingFile) return;
+    resetReplayLatencyStats();
+    pendingRecordingSelectionRef.current = recordingFile;
+    setSelectedRecordingFile(recordingFile);
     setReplayBusy(true);
-    void fetch(BACKEND_ENDPOINTS.selectRecording, {
+    void fetchWithTimeout(BACKEND_ENDPOINTS.selectRecording, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ recording_file: recordingFile, timing: "original" }),
@@ -894,6 +1046,9 @@ function App() {
       })
       .catch(() => {})
       .finally(() => {
+        if (pendingRecordingSelectionRef.current === recordingFile) {
+          pendingRecordingSelectionRef.current = null;
+        }
         setReplayBusy(false);
         void refreshRecordings();
         void refreshPlaybackStatus();
@@ -904,24 +1059,14 @@ function App() {
     void sendReplayPlaybackCommand("restart");
   };
 
-  const handleReplaySpeedChange = (speed: number) => {
-    void sendReplayPlaybackCommand("set_speed", { speed });
-  };
-
   return (
     <div className="h-screen min-h-0 flex flex-col overflow-hidden bg-neuralink-bg text-neuralink-text">
       <header className="shrink-0 flex items-center justify-between gap-3 px-4 py-2.5 border-b border-neutral-800/90 bg-black/60 backdrop-blur-md">
         <div className="flex items-center gap-2.5 min-w-0">
-          <div className="w-9 h-9 shrink-0 rounded-full bg-neuralink-accent flex items-center justify-center text-black font-bold text-lg shadow-[0_0_24px_rgba(0,255,159,0.35)]">
-            N
-          </div>
           <div className="min-w-0">
             <h1 className="font-display text-sm sm:text-base font-semibold tracking-tight text-neutral-100 truncate">
-              Neuralink BCI
+              BCI Implant Dashboard
             </h1>
-            <p className="text-[10px] text-neutral-500 font-mono uppercase tracking-[0.2em]">
-              Implant dashboard
-            </p>
           </div>
         </div>
 
@@ -958,21 +1103,67 @@ function App() {
           </button>
         </div>
 
-        <div
-          className={`shrink-0 flex items-center gap-2 px-3 py-1.5 rounded-lg text-[11px] font-mono font-medium border ${
-            status === "connected"
-              ? "border-emerald-500/40 text-emerald-300 bg-emerald-500/10"
-              : "border-red-500/35 text-red-400 bg-red-500/5"
-          }`}
-        >
-          <span
-            className={`w-2 h-2 rounded-full ${
+        <div className="shrink-0 flex items-center gap-2">
+          <div
+            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-[11px] font-mono font-medium border ${
               status === "connected"
-                ? "bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.85)] animate-bci-pulse"
-                : "bg-red-400"
+                ? "border-emerald-500/40 text-emerald-300 bg-emerald-500/10"
+                : "border-red-500/35 text-red-400 bg-red-500/5"
             }`}
-          />
-          {status === "connected" ? "Live" : "Offline"}
+          >
+            <span
+              className={`w-2 h-2 rounded-full ${
+                status === "connected"
+                  ? "bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.85)] animate-bci-pulse"
+                  : "bg-red-400"
+              }`}
+            />
+            {status === "connected" ? "Live" : "Offline"}
+          </div>
+
+          <div
+            className={`hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-lg text-[11px] font-mono font-medium border ${
+              redisStatus === "ok"
+                ? "border-emerald-500/40 text-emerald-300 bg-emerald-500/10"
+                : redisStatus === "disabled"
+                  ? "border-amber-500/35 text-amber-300 bg-amber-500/10"
+                  : redisStatus === "checking"
+                    ? "border-neutral-500/35 text-neutral-300 bg-neutral-500/10"
+                    : "border-red-500/35 text-red-400 bg-red-500/5"
+            }`}
+            title={redisStream ? `Stream: ${redisStream}` : "Redis health status"}
+          >
+            Redis:{" "}
+            {redisStatus === "ok"
+              ? "Ready"
+              : redisStatus === "disabled"
+                ? "Disabled"
+                : redisStatus === "checking"
+                  ? "Checking"
+                  : "Error"}
+          </div>
+
+          <div
+            className={`hidden md:flex items-center gap-2 px-3 py-1.5 rounded-lg text-[11px] font-mono font-medium border ${
+              modelStatus === "ready"
+                ? "border-emerald-500/40 text-emerald-300 bg-emerald-500/10"
+                : modelStatus === "fallback"
+                  ? "border-amber-500/35 text-amber-300 bg-amber-500/10"
+                  : modelStatus === "checking"
+                    ? "border-neutral-500/35 text-neutral-300 bg-neutral-500/10"
+                    : "border-red-500/35 text-red-400 bg-red-500/5"
+            }`}
+            title={modelLabel}
+          >
+            Model:{" "}
+            {modelStatus === "ready"
+              ? "Loaded"
+              : modelStatus === "fallback"
+                ? "Fallback"
+                : modelStatus === "checking"
+                  ? "Checking"
+                  : "Error"}
+          </div>
         </div>
       </header>
 
@@ -985,6 +1176,7 @@ function App() {
             displayConfidence={displayConfidence}
             clickActive={clickActionPenDown}
             decoderData={decoderData}
+            replayLatencyStats={replayLatencyStats}
             signalPct={signalPct}
             signalStyle={signalStyle}
             onResetDecoder={() => void resetDecoderState()}
@@ -1026,7 +1218,7 @@ function App() {
                   id="recording-select"
                   value={selectedRecordingFile ?? recordings[0]?.recording_file ?? ""}
                   onChange={(e) => handleSelectRecording(e.target.value)}
-                  disabled={replayBusy || recordings.length === 0}
+                  disabled={recordings.length === 0}
                   className="w-32 rounded-md border border-neutral-700/80 bg-neutral-950/90 px-2 py-1 text-[11px] font-mono text-neutral-200 outline-none focus:border-neuralink-accent/60 disabled:opacity-45"
                 >
                   {recordings.length === 0 ? (
@@ -1055,25 +1247,6 @@ function App() {
                 >
                   Restart
                 </button>
-                {[
-                  { speed: 1, label: "Normal" },
-                  { speed: 0.5, label: "2x slow" },
-                  { speed: 1 / 3, label: "3x slow" },
-                ].map(({ speed, label }) => (
-                  <button
-                    key={speed}
-                    type="button"
-                    onClick={() => handleReplaySpeedChange(speed)}
-                    disabled={replayBusy || !replayLoaded}
-                    className={`rounded-md border px-2 py-1 text-[11px] font-semibold transition-colors disabled:opacity-45 ${
-                      Math.abs(replaySpeed - speed) < 0.05
-                        ? "border-neuralink-accent/65 bg-neuralink-accent/20 text-neuralink-accent"
-                        : "border-neutral-700/80 bg-neutral-950/90 text-neutral-200 hover:bg-neutral-800/80"
-                    }`}
-                  >
-                    {label}
-                  </button>
-                ))}
               </div>
             ) : null
           }

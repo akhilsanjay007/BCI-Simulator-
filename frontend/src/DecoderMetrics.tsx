@@ -1,5 +1,15 @@
 interface DecoderMetricsPacket {
-  latency_ms: number;
+  decode_latency_ms: number;
+  end_to_end_latency_ms: number;
+  accuracy: number;
+  session_accuracy: number;
+}
+
+interface ReplayLatencyStats {
+  meanEmitIntervalMs: number;
+  p95EmitIntervalMs: number;
+  meanSourceLagMs: number;
+  p95SourceLagMs: number;
 }
 
 interface DecoderMetricsProps {
@@ -8,6 +18,7 @@ interface DecoderMetricsProps {
   displayConfidence: number;
   clickActive: boolean;
   decoderData: DecoderMetricsPacket | null;
+  replayLatencyStats: ReplayLatencyStats | null;
   signalPct: number;
   signalStyle: {
     text: string;
@@ -29,6 +40,7 @@ export function DecoderMetrics({
   displayConfidence,
   clickActive,
   decoderData,
+  replayLatencyStats,
   signalPct,
   signalStyle,
   onResetDecoder,
@@ -38,52 +50,90 @@ export function DecoderMetrics({
     metricsVy >= 0 ? "+" : ""
   }${metricsVy.toFixed(2)}  |v| ${velocityMag.toFixed(2)}`;
   const confidencePct = Math.round(displayConfidence * 100);
-  const latencyText = decoderData ? `${decoderData.latency_ms.toFixed(0)} ms` : "—";
+  const decodeLatencyText = decoderData ? `${decoderData.decode_latency_ms.toFixed(0)} ms` : "—";
+  const e2eLatencyText = decoderData ? `${decoderData.end_to_end_latency_ms.toFixed(0)} ms` : "—";
+  const accuracyText = decoderData ? `${(decoderData.accuracy * 100).toFixed(1)}%` : "—";
+  const sessionAccuracyText = decoderData ? `${(decoderData.session_accuracy * 100).toFixed(1)}%` : "—";
   const strengthLabel = signalStrengthLabel(signalPct);
+  const clickText = clickActive ? "Click Active" : "Click Idle";
+  const clickClass = clickActive ? "text-emerald-300" : "text-neutral-400";
 
   return (
-    <section className="shrink-0 basis-[42%] min-h-0 rounded-xl border border-neutral-800/90 bg-gradient-to-b from-neutral-900/85 to-black/65 px-3 py-2.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
-      <div className="mb-2 flex items-center justify-between gap-2">
+    <section className="shrink-0 basis-[44%] min-h-0 rounded-xl border border-neutral-800/90 bg-gradient-to-b from-neutral-900/85 to-black/65 px-3 py-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
+      <div className="mb-1.5 flex items-center justify-between gap-2">
         <h2 className="text-[10px] font-mono font-semibold uppercase tracking-[0.2em] text-neutral-400">
           Decoder metrics
         </h2>
       </div>
 
-      <div className="space-y-2">
-        <div className="rounded-lg border border-neutral-800/90 bg-black/35 px-2.5 py-2">
+      <div className="space-y-1.5">
+        <div className="rounded-lg border border-neutral-800/90 bg-black/35 px-2.5 py-1.5">
           <p className="text-[9px] font-mono uppercase tracking-[0.14em] text-neutral-500">vx / vy / |v|</p>
-          <p className="mt-0.5 text-[13px] font-mono font-semibold tracking-tight text-cyan-300 tabular-nums">
+          <p className="mt-0.5 text-[12px] font-mono font-semibold tracking-tight text-cyan-300 tabular-nums">
             {velocityText}
           </p>
         </div>
 
-        <div className="rounded-lg border border-neutral-800/90 bg-black/35 px-2.5 py-2">
-          <p className="text-[9px] font-mono uppercase tracking-[0.14em] text-neutral-500">Confidence</p>
-          <p className="mt-0.5 text-2xl font-semibold leading-none tracking-tight text-emerald-300 tabular-nums">
-            {confidencePct}%
-          </p>
+        <div className="grid grid-cols-3 gap-1.5">
+          <div className="rounded-lg border border-neutral-800/90 bg-black/35 px-2 py-1.5">
+            <p className="text-[8px] font-mono uppercase tracking-[0.14em] text-neutral-500">Confidence</p>
+            <p className="mt-0.5 text-[22px] font-semibold leading-none tracking-tight text-emerald-300 tabular-nums">
+              {confidencePct}%
+            </p>
+          </div>
+          <div className="rounded-lg border border-neutral-800/90 bg-black/35 px-2 py-1.5">
+            <p className="text-[8px] font-mono uppercase tracking-[0.14em] text-neutral-500">Accuracy</p>
+            <div className="mt-0.5 grid grid-cols-1 gap-0.5 text-[10px] font-mono tabular-nums">
+              <p className="text-neutral-300">R20 {accuracyText}</p>
+              <p className="text-neutral-300">Sess {sessionAccuracyText}</p>
+            </div>
+          </div>
+          <div className="rounded-lg border border-neutral-800/90 bg-black/35 px-2 py-1.5">
+            <p className="text-[8px] font-mono uppercase tracking-[0.14em] text-neutral-500">Click</p>
+            <p className={`mt-1 text-[11px] font-mono font-semibold ${clickClass}`}>{clickText}</p>
+          </div>
         </div>
 
-        <dl className="grid grid-cols-2 gap-2 text-[10px] font-mono">
-          <div className="rounded-lg border border-neutral-800/90 bg-black/30 px-2.5 py-1.5">
-            <dt className="uppercase tracking-[0.14em] text-neutral-500">Latency</dt>
-            <dd className="mt-0.5 tabular-nums text-neutral-200">{latencyText}</dd>
+        <div className="rounded-lg border border-neutral-800/90 bg-black/30 px-2 py-1.5">
+          <p className="text-[9px] font-mono uppercase tracking-[0.14em] text-neutral-500">Latencies</p>
+          <div className="mt-1 grid grid-cols-3 gap-1 text-[10px] font-mono tabular-nums">
+            <div className="rounded border border-neutral-800/70 bg-black/30 px-1.5 py-1">
+              <p className="text-neutral-500">Decode</p>
+              <p className="text-neutral-200">{decodeLatencyText}</p>
+            </div>
+            <div className="rounded border border-neutral-800/70 bg-black/30 px-1.5 py-1">
+              <p className="text-neutral-500">End-to-end</p>
+              <p className="text-neutral-200">{e2eLatencyText}</p>
+            </div>
+            <div className="rounded border border-neutral-800/70 bg-black/30 px-1.5 py-1">
+              <p className="text-neutral-500">Mean emit</p>
+              <p className="text-neutral-200">
+                {replayLatencyStats ? `${replayLatencyStats.meanEmitIntervalMs.toFixed(2)} ms` : "—"}
+              </p>
+            </div>
+            <div className="rounded border border-neutral-800/70 bg-black/30 px-1.5 py-1">
+              <p className="text-neutral-500">P95 emit</p>
+              <p className="text-neutral-200">
+                {replayLatencyStats ? `${replayLatencyStats.p95EmitIntervalMs.toFixed(2)} ms` : "—"}
+              </p>
+            </div>
+            <div className="rounded border border-neutral-800/70 bg-black/30 px-1.5 py-1">
+              <p className="text-neutral-500">Mean source lag</p>
+              <p className="text-neutral-200">
+                {replayLatencyStats ? `${replayLatencyStats.meanSourceLagMs.toFixed(2)} ms` : "—"}
+              </p>
+            </div>
+            <div className="rounded border border-neutral-800/70 bg-black/30 px-1.5 py-1">
+              <p className="text-neutral-500">P95 source lag</p>
+              <p className="text-neutral-200">
+                {replayLatencyStats ? `${replayLatencyStats.p95SourceLagMs.toFixed(2)} ms` : "—"}
+              </p>
+            </div>
           </div>
+        </div>
 
-          <div className="rounded-lg border border-neutral-800/90 bg-black/30 px-2.5 py-1.5">
-            <dt className="uppercase tracking-[0.14em] text-neutral-500">Click</dt>
-            <dd
-              className={`mt-0.5 font-semibold ${
-                clickActive ? "text-emerald-300" : "text-neutral-400"
-              }`}
-            >
-              {clickActive ? "Click Active" : "Click Idle"}
-            </dd>
-          </div>
-        </dl>
-
-        <div className="rounded-lg border border-neutral-800/90 bg-black/30 px-2.5 py-1.5">
-          <div className="mb-1 flex items-center justify-between gap-2">
+        <div className="rounded-lg border border-neutral-800/90 bg-black/30 px-2 py-1">
+          <div className="mb-0.5 flex items-center justify-between gap-2">
             <span className="text-[9px] font-mono uppercase tracking-[0.14em] text-neutral-500">
               Signal strength
             </span>
@@ -100,14 +150,14 @@ export function DecoderMetrics({
               style={{ width: `${signalPct}%` }}
             />
           </div>
-          <p className="mt-1 text-[10px] font-mono font-semibold text-neutral-300">{strengthLabel}</p>
+          <p className="mt-0.5 text-[9px] font-mono font-semibold text-neutral-300">{strengthLabel}</p>
         </div>
 
         <div className="pt-0.5">
           <button
             type="button"
             onClick={onResetDecoder}
-            className="w-full rounded-lg border border-neutral-600/80 py-1.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-neutral-200 transition-colors hover:bg-neutral-800/80"
+            className="w-full rounded-lg border border-neutral-600/80 py-1 text-[9px] font-semibold uppercase tracking-[0.14em] text-neutral-200 transition-colors hover:bg-neutral-800/80"
           >
             Reset decoder
           </button>

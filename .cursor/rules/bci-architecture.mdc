@@ -57,11 +57,11 @@ The live dashboard path is **in-process** from generator to decoder to WebSocket
 | Mode | Where | Behavior |
 | --- | --- | --- |
 | **Keyboard** | `BCITrackpad` + `keyboardLayout.ts` | Virtual QWERTY on canvas; velocity drives cursor; `pen_down` rising edge types the key under the cursor. |
-| **Automatic / Manual** | `App.tsx` | **Automatic**: decoder WS drives cursor + click. **Manual**: pointer hover/click or arrow keys + synthetic burst via `POST /manual-neural-burst`. |
+| **Automatic / Manual** | `App.tsx` | **Automatic**: decoder WS drives cursor + click. **Manual**: local pointer/keyboard keeps direct cursor feel, but sends `(vx, vy, pen_down)` to `POST /manual-decoder-predict` so metrics come from real `BciDecoder.predict`. |
 
 `pen_down` on `DecoderPacket` means **key select / click** (speed-derived in automatic mode).
 
-**Dashboard control** — `App.tsx`: **Automatic** (decoder packets drive cursor + pen) vs **Manual** (local velocity from keyboard / trackpad pad, synthetic burst to backend via `POST /manual-neural-burst`).
+**Dashboard control** — `App.tsx`: **Automatic** (decoder packets drive cursor + pen) vs **Manual** (local velocity from keyboard / trackpad pad, direct cursor feel, metrics from backend `POST /manual-decoder-predict`).
 
 ---
 
@@ -98,7 +98,8 @@ type DecoderPacket = {
   vy: number;
   pen_down: boolean;
   confidence: number;
-  latency_ms: number;
+  decode_latency_ms: number;
+  end_to_end_latency_ms: number;
   accuracy: number;
   session_accuracy: number;
   cursor_x: number;
@@ -107,7 +108,7 @@ type DecoderPacket = {
 };
 ```
 
-**REST** — `GET /api/decoder/info`, `GET /simulator/config`, `POST /decoder/reset`, `POST /manual-neural-burst`, `GET /health`, `GET /health/redis`.
+**REST** — `GET /api/decoder/info`, `GET /simulator/config`, `POST /decoder/reset`, `POST /manual-decoder-predict`, `POST /manual-neural-burst`, `GET /health`, `GET /health/redis`.
 
 Any shape change → update Pydantic models, TS types in `App.tsx`, tests, and the changelog below.
 
@@ -117,7 +118,7 @@ Any shape change → update Pydantic models, TS types in `App.tsx`, tests, and t
 
 | Metric | p50 target | p95 target | Hard ceiling |
 | --- | --- | --- | --- |
-| `latency_ms` | ≤ 10 ms | ≤ 25 ms | 50 ms |
+| `decode_latency_ms` | ≤ 10 ms | ≤ 25 ms | 50 ms |
 | Decode packet rate | ≥ 50 Hz | — | — |
 | Generator batch work | ≤ 2 ms | ≤ 5 ms | 10 ms |
 | Trackpad / main UI frame | ≤ 16.7 ms | ≤ 33 ms | 50 ms |
@@ -149,6 +150,8 @@ Report p50/p95 over ~30 s steady state for perf-sensitive PRs.
 
 ## 8. Changelog (contract / pipeline)
 
+- **2026-05-24** — Manual mode metrics now run through real decoder inference: `POST /manual-decoder-predict` synthesizes velocity-driven spikes and returns `DecoderPacket` from `BciDecoder.predict` (confidence/latency/accuracy now authentic in Manual).
+- **2026-05-22** — `DecoderPacket` latency split into `decode_latency_ms` (model inference only) and `end_to_end_latency_ms` (backend packet age), replacing ambiguous `latency_ms`.
 - **2026-05-18** — Handwriting removed; pure Keyboard Mode UI (`keyboardLayout.ts`, `BCITrackpad`); `pen_down` = click/select; removed `mode` from `DecoderPacket` and `POST /decoder/mode`.
 - **2026-05-13** — Rules refresh: document optional Redis side-buffer from simulator; React trackpad surface (`BCITrackpad`); clarify decoder still reads in-process `generator.stream()`.
 - **2026-05-11** — Continuous velocity regression (`vx`, `vy`), `pen_down`, `mode`; ensemble/RF/HGB regressors; `GET /api/decoder/info`, `POST /decoder/mode`; manual burst `{ vx, vy, duration_ms }`.

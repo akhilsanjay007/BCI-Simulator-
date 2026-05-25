@@ -510,7 +510,14 @@ def try_create_replay(
     explicit = os.environ.get("BCI_RECORDING_PATH", "").strip() or None
     rec_dir = recordings_dir
     try:
-        paths = resolve_recording_paths(recordings_dir=rec_dir, explicit_path=explicit)
+        if explicit is None:
+            try:
+                demo_path = resolve_recording_file_path("demo_1.json", recordings_dir=rec_dir)
+                paths = [demo_path]
+            except FileNotFoundError:
+                paths = resolve_recording_paths(recordings_dir=rec_dir, explicit_path=explicit)
+        else:
+            paths = resolve_recording_paths(recordings_dir=rec_dir, explicit_path=explicit)
     except FileNotFoundError:
         raise
     if not paths:
