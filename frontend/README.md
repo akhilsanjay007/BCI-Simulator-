@@ -20,7 +20,7 @@ React + TypeScript + Vite + Tailwind SPA for the **neuralink-bci-sim** backend: 
   VITE_BACKEND_URL=http://localhost:8000
   ```
 
-- **Production build:** `VITE_BACKEND_URL` is **required** (baked in at build time). Docker/Railway pass it as a build arg (see root `docker-compose.yml` and `frontend/Dockerfile`).
+- **Production runtime (Docker/Railway):** set `VITE_BACKEND_URL` as a service variable so `config.js` points the SPA to the backend URL at container start.
 
 Start the API before the UI: `uvicorn app.main:app --port 8000` from the repo root.
 

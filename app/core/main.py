@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import re
 import time
@@ -24,6 +25,7 @@ from app.core.simulator import generator
 
 ENV = os.getenv("ENV", "development").lower()
 IS_PRODUCTION = ENV == "production"
+logger = logging.getLogger("bci.backend")
 
 LOCAL_FRONTEND_ORIGINS = [
     "http://localhost:5173",
@@ -89,8 +91,25 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "Accept", "Origin", "User-Agent", "Cache-Control", "X-Requested-With"],
 )
 
+def _is_truthy(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+STRICT_STARTUP = _is_truthy(os.getenv("STRICT_STARTUP"))
+STRICT_MODEL_LOAD = _is_truthy(os.getenv("STRICT_MODEL_LOAD")) or _is_truthy(
+    os.getenv("REQUIRE_DECODER_MODEL")
+)
+
 # Optional Redis Streams client (enabled when REDIS_URL is set).
-redis_client = get_redis_client()
+try:
+    redis_client = get_redis_client()
+except Exception as e:
+    redis_client = None
+    if STRICT_STARTUP:
+        raise RuntimeError(f"Redis client initialization failed: {e}") from e
+    logger.exception("Redis client initialization failed; continuing with Redis disabled.")
 
 
 class DecoderWebSocketHub:
@@ -161,6 +180,7 @@ _decoder_train_n = int(os.getenv("DECODER_TRAIN_SAMPLES", "25000"))
 
 # Must match the Railway volume mount path (e.g. volume `decoder-model` → `/app/models`).
 RAILWAY_VOLUME_MODEL_PATH = Path("/app/models/velocity_decoder.pkl")
+startup_degraded_reasons: list[str] = []
 
 
 def _decoder_artifact_path_from_env() -> tuple[Path, bool]:
@@ -182,12 +202,20 @@ def _load_decoder_at_startup() -> None:
             load_decoder_artifact_into(decoder, artifact_path)
             load_decoder_artifact_into(manual_decoder, artifact_path)
             if artifact_path == RAILWAY_VOLUME_MODEL_PATH.resolve():
-                print(f"[ok] Successfully loaded model from Railway Volume: {artifact_path}")
+                logger.info("Loaded decoder model from Railway volume: %s", artifact_path)
             else:
-                print(f"[ok] Successfully loaded model: {artifact_path}")
+                logger.info("Loaded decoder model: %s", artifact_path)
             return
+        missing_help = velocity_decoder_missing_help(artifact_path)
         if IS_PRODUCTION or artifact_path_explicit:
-            raise FileNotFoundError(velocity_decoder_missing_help(artifact_path))
+            if STRICT_MODEL_LOAD:
+                raise FileNotFoundError(missing_help)
+            startup_degraded_reasons.append("decoder_model_missing")
+            logger.warning(
+                "Decoder model artifact missing. Starting in heuristic fallback mode. %s",
+                missing_help,
+            )
+            return
         try:
             X_train, y_train = generate_training_data(
                 fs=generator.fs,
@@ -198,17 +226,26 @@ def _load_decoder_at_startup() -> None:
             )
             decoder.train(X_train, y_train)
             manual_decoder.train(X_train, y_train)
-            print(f"Bootstrap-trained decoder on {len(X_train):,} synthetic windows")
+            logger.info("Bootstrap-trained decoder on %s synthetic windows", f"{len(X_train):,}")
         except Exception as e:
-            print(f"[warn] Decoder bootstrap training failed; using heuristic fallback. Error: {e}")
+            startup_degraded_reasons.append("decoder_bootstrap_train_failed")
+            logger.warning(
+                "Decoder bootstrap training failed; using heuristic fallback. error=%s", e
+            )
     except FileNotFoundError as e:
-        print(f"[error] Failed to load model: {e}")
-        raise
+        logger.error("Failed to load model: %s", e)
+        if STRICT_MODEL_LOAD:
+            raise
+        startup_degraded_reasons.append("decoder_model_load_failed")
+        logger.warning("Continuing with heuristic decoder fallback (STRICT_MODEL_LOAD not set).")
     except Exception as e:
-        print(f"[error] Failed to load model: {e}")
-        if IS_PRODUCTION:
+        logger.exception("Unexpected decoder startup error: %s", e)
+        startup_degraded_reasons.append("decoder_startup_exception")
+        if IS_PRODUCTION and STRICT_STARTUP:
             raise RuntimeError(f"Velocity decoder failed to load or train: {e}") from e
-        print("[warn] Decoder load/bootstrap failed; using heuristic fallback.")
+        logger.warning(
+            "Continuing with heuristic decoder fallback (STRICT_STARTUP is disabled)."
+        )
 
 
 _load_decoder_at_startup()
@@ -659,7 +696,24 @@ async def _shutdown() -> None:
         await redis_client.close()
 
 
+@app.on_event("startup")
+async def _startup() -> None:
+    logger.info(
+        "Backend startup complete env=%s port=%s decoder_trained=%s redis_enabled=%s degraded=%s",
+        ENV,
+        os.getenv("PORT", "8000"),
+        decoder.is_trained,
+        redis_client is not None,
+        bool(startup_degraded_reasons),
+    )
+
+
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        "app.main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        reload=not IS_PRODUCTION,
+    )

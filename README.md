@@ -228,8 +228,11 @@ frontend/src/
 
 ## Deployment Notes
 
+- Railway backend start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
 - Ensure `models/velocity_decoder.pkl` is available in production (image or mounted volume)
+- If model boot should be hard-fail, set `STRICT_MODEL_LOAD=1` (otherwise backend starts with heuristic fallback)
 - Set explicit CORS allow-list values for deployed frontend origins
+- Set `VITE_BACKEND_URL` on the frontend service to the backend public Railway URL (browser-reachable)
 - Keep Redis optional so core WebSocket behavior remains resilient during broker outages
 - Track p50/p95 latency before and after hot-path changes
 
