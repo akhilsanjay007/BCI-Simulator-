@@ -56,7 +56,7 @@ Pinned versions live in `requirements.txt` and `frontend/package.json`. Do not b
 1. **Smoothness** — cursor and ink should feel continuous at the UI frame budget; avoid per-packet React churn on hot surfaces (trackpad, raster).
 2. **Reliability** — long sessions without leaks; every long-lived buffer has a cap; WebSockets clean up on unmount / disconnect.
 3. **Clean code** — typed boundaries (Pydantic + TS mirrors), small modules, vectorized hot paths in Python, no blocking I/O in `async def`.
-4. **Observability** — `decode_latency_ms` (and `end_to_end_latency_ms` when relevant), accuracy rolls, connection state visible without DevTools; backend logs gated (e.g. every N batches on `/ws/decoder`).
+4. **Observability** — `decode_latency_ms` (and `end_to_end_latency_ms` when relevant), `redis_buffer_seconds` when Redis is enabled, accuracy rolls, connection state visible without DevTools; backend logs gated (e.g. every N batches on `/ws/decoder`).
 
 ---
 

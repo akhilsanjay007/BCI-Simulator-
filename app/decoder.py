@@ -90,6 +90,14 @@ class DecoderPacket(BaseModel):
         ge=0.0,
         description="Backend-side packet age in milliseconds from simulator packet timestamp to WS emit.",
     )
+    redis_buffer_seconds: float = Field(
+        0.0,
+        ge=0.0,
+        description=(
+            "Approximate buffered horizon available in Redis stream seconds "
+            "(newest timestamp - oldest timestamp)."
+        ),
+    )
     accuracy: float = Field(
         ...,
         ge=0.0,
@@ -785,6 +793,7 @@ class BciDecoder:
             confidence=float(np.clip(confidence, 0.0, 1.0)),
             decode_latency_ms=latency_ms,
             end_to_end_latency_ms=latency_ms,
+            redis_buffer_seconds=0.0,
             accuracy=accuracy,
             session_accuracy=session_accuracy,
             cursor_x=cx,

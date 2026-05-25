@@ -1,6 +1,7 @@
 interface DecoderMetricsPacket {
   decode_latency_ms: number;
   end_to_end_latency_ms: number;
+  redis_buffer_seconds: number;
   accuracy: number;
   session_accuracy: number;
 }
@@ -34,6 +35,19 @@ function signalStrengthLabel(signalPct: number): "Weak" | "Moderate" | "Strong" 
   return "Weak";
 }
 
+function bufferIndicatorClass(bufferSeconds: number | null): string {
+  if (bufferSeconds == null) {
+    return "border-neutral-700/70 bg-neutral-900/40 text-neutral-300";
+  }
+  if (bufferSeconds > 15) {
+    return "border-emerald-500/35 bg-emerald-500/10 text-emerald-300";
+  }
+  if (bufferSeconds >= 5) {
+    return "border-amber-500/35 bg-amber-500/10 text-amber-300";
+  }
+  return "border-red-500/35 bg-red-500/10 text-red-300";
+}
+
 export function DecoderMetrics({
   metricsVx,
   metricsVy,
@@ -52,6 +66,8 @@ export function DecoderMetrics({
   const confidencePct = Math.round(displayConfidence * 100);
   const decodeLatencyText = decoderData ? `${decoderData.decode_latency_ms.toFixed(0)} ms` : "—";
   const e2eLatencyText = decoderData ? `${decoderData.end_to_end_latency_ms.toFixed(0)} ms` : "—";
+  const bufferSeconds = decoderData ? decoderData.redis_buffer_seconds : null;
+  const bufferText = bufferSeconds == null ? "Buffer: —" : `Buffer: ${bufferSeconds.toFixed(1)}s`;
   const accuracyText = decoderData ? `${(decoderData.accuracy * 100).toFixed(1)}%` : "—";
   const sessionAccuracyText = decoderData ? `${(decoderData.session_accuracy * 100).toFixed(1)}%` : "—";
   const strengthLabel = signalStrengthLabel(signalPct);
@@ -64,6 +80,12 @@ export function DecoderMetrics({
         <h2 className="text-[10px] font-mono font-semibold uppercase tracking-[0.2em] text-neutral-400">
           Decoder metrics
         </h2>
+        <div
+          className={`rounded-md border px-2 py-1 text-[10px] font-mono font-semibold tabular-nums ${bufferIndicatorClass(bufferSeconds)}`}
+          title="Redis stream buffer horizon"
+        >
+          {bufferText}
+        </div>
       </div>
 
       <div className="space-y-1.5">

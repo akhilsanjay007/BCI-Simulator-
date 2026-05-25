@@ -32,6 +32,6 @@ RUN chmod +x /docker-entrypoint.sh
 EXPOSE 80
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD wget -qO- http://127.0.0.1/ >/dev/null || exit 1
+  CMD sh -c 'wget -qO- "http://127.0.0.1:${PORT:-80}/" >/dev/null || exit 1'
 
 ENTRYPOINT ["/docker-entrypoint.sh"]

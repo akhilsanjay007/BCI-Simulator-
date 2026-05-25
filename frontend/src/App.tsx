@@ -109,6 +109,7 @@ interface DecoderPacket {
   confidence: number;
   decode_latency_ms: number;
   end_to_end_latency_ms: number;
+  redis_buffer_seconds: number;
   accuracy: number;
   session_accuracy: number;
   cursor_x?: number;

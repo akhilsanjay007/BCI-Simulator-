@@ -30,6 +30,7 @@ def test_manual_decoder_predict_uses_real_decoder(monkeypatch) -> None:
             confidence=0.77,
             decode_latency_ms=4.3,
             end_to_end_latency_ms=4.3,
+            redis_buffer_seconds=12.5,
             accuracy=0.64,
             session_accuracy=0.66,
             cursor_x=0.42,
@@ -52,5 +53,6 @@ def test_manual_decoder_predict_uses_real_decoder(monkeypatch) -> None:
     assert predict_calls == [(0.35, -0.2, 20)]
     assert body["confidence"] == 0.77
     assert body["decode_latency_ms"] == 4.3
+    assert body["redis_buffer_seconds"] == 12.5
     assert body["accuracy"] == 0.64
     assert body["session_accuracy"] == 0.66

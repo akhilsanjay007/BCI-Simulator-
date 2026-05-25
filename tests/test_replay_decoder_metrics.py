@@ -31,6 +31,7 @@ def test_ws_decoder_replay_uses_predict_metrics(monkeypatch) -> None:
             confidence=0.41,
             decode_latency_ms=7.2,
             end_to_end_latency_ms=7.2,
+            redis_buffer_seconds=8.8,
             accuracy=0.58,
             session_accuracy=0.61,
             cursor_x=0.3,
@@ -67,5 +68,6 @@ def test_ws_decoder_replay_uses_predict_metrics(monkeypatch) -> None:
     assert latest["cursor_x"] == generator.replay_cursor_x
     assert latest["cursor_y"] == generator.replay_cursor_y
     assert latest["confidence"] == 0.41
+    assert "redis_buffer_seconds" in latest
     assert latest["accuracy"] == 0.58
     assert latest["session_accuracy"] == 0.61

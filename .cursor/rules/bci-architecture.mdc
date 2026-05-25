@@ -100,6 +100,7 @@ type DecoderPacket = {
   confidence: number;
   decode_latency_ms: number;
   end_to_end_latency_ms: number;
+  redis_buffer_seconds: number;
   accuracy: number;
   session_accuracy: number;
   cursor_x: number;
@@ -150,6 +151,7 @@ Report p50/p95 over ~30 s steady state for perf-sensitive PRs.
 
 ## 8. Changelog (contract / pipeline)
 
+- **2026-05-25** — `DecoderPacket` now includes `redis_buffer_seconds` (newest-oldest Redis stream horizon) so UI can show live buffer health (`Buffer: XX.Xs`).
 - **2026-05-24** — Manual mode metrics now run through real decoder inference: `POST /manual-decoder-predict` synthesizes velocity-driven spikes and returns `DecoderPacket` from `BciDecoder.predict` (confidence/latency/accuracy now authentic in Manual).
 - **2026-05-22** — `DecoderPacket` latency split into `decode_latency_ms` (model inference only) and `end_to_end_latency_ms` (backend packet age), replacing ambiguous `latency_ms`.
 - **2026-05-18** — Handwriting removed; pure Keyboard Mode UI (`keyboardLayout.ts`, `BCITrackpad`); `pen_down` = click/select; removed `mode` from `DecoderPacket` and `POST /decoder/mode`.
