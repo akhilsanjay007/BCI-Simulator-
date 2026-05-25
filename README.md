@@ -66,23 +66,6 @@ Backend logic is organized under `app/core/` and frontend logic under `frontend/
 
 ---
 
-## Demo Assets (Add Before Submission)
-
-Use this section as a recruiter-facing call to action. Replace placeholders with polished captures from your latest run.
-
-**Recommended media to include:**
-
-- `docs/media/automatic-mode.gif` - decoder-driven cursor and key selection
-- `docs/media/manual-mode.gif` - manual control with live decoder metrics
-- `docs/media/decoder-metrics.png` - confidence, latency, buffer, and accuracy strip
-- `docs/media/replay-selector.png` - replay workflow and timing controls
-
-Current placeholder:
-
-![Dashboard overview](frontend/public/bi-logo.png)
-
----
-
 ## Architecture Snapshot
 
 ```text
