@@ -93,7 +93,7 @@ The frontend image is built with `VITE_BACKEND_URL=http://localhost:8000` (see `
 
 Two-column layout: decoder metrics + neural charts (left), virtual-keyboard trackpad + **Thought → Text** (right).
 
-- **Manual** — pointer/keys on the canvas trackpad; optional `POST /manual-neural-burst` for synthetic spikes
+- **Manual** — pointer/keys on the canvas trackpad keep direct feel while `(vx, vy, pen_down)` is sent to `POST /manual-decoder-predict` so confidence/latency/accuracy are real decoder outputs
 - **Automatic** — live `/ws/decoder` drives cursor + `pen_down` (key select / click on the QWERTY keyboard)
 - **Recording replay** (Automatic only) — header dropdown picks any `recordings/*.json`; timing **Original** (recorded timestamps) or **Smooth 125 Hz** (8 ms resample)
 - **Thought → Text** — typed output from BCI cursor on the keyboard; **Clear** / **Reset cursor**
@@ -102,14 +102,23 @@ Two-column layout: decoder metrics + neural charts (left), virtual-keyboard trac
 
 ### Recording trackpad sessions (optional)
 
-Local Tk recorder (not required for the dashboard; gitignored under `tools/`):
+Record from the same `/ws/decoder` stream consumed by `frontend/src/App.tsx` so replay timing mirrors real app behavior:
 
 ```powershell
 $env:PYTHONPATH = "."
-python -m tools.record_trackpad
+python recordings/record_from_app.py --ws-url ws://localhost:8000/ws/decoder
 ```
 
-Save → `recordings/session_YYYYMMDD_HHMMSS.json` (normalized `x`, `y`, `timestamp_ms`, `clicked`). Shipped demos: `recordings/demo_1.json`, `demo_2.json`.
+This saves `recordings/session_YYYYMMDD_HHMMSS.json` with normalized `x`, `y`, `timestamp_ms`, and `clicked`.
+
+To re-record shipped demos:
+
+```powershell
+python recordings/record_from_app.py --output demo_1.json --session-id demo_1 --typed-text "YOUR DEMO 1 TEXT"
+python recordings/record_from_app.py --output demo_2.json --session-id demo_2 --typed-text "YOUR DEMO 2 TEXT"
+```
+
+The recorder enforces strictly increasing timestamps, which avoids fixed-step fallback and jitter during replay.
 
 ### API used by the UI
 
@@ -121,6 +130,7 @@ Save → `recordings/session_YYYYMMDD_HHMMSS.json` (normalized `x`, `y`, `timest
 | `GET /api/recordings` | List `recordings/*.json` metadata for the replay dropdown |
 | `POST /api/recordings/select` | `{ "recording_id", "timing": "original" \| "smooth_125hz" }` — switch replay + decoder reset |
 | `POST /decoder/reset` | Clears decoder + Redis stream; broadcasts reset to WS clients |
+| `POST /manual-decoder-predict` | `{ "vx", "vy", "pen_down", "batch_samples" }` — manual-mode decode tick returning real `DecoderPacket` metrics |
 | `POST /manual-neural-burst` | `{ "vx", "vy", "duration_ms" }` — manual-mode cortical burst |
 | `GET /health` | Liveness + decoder/simulator summary |
 | `GET /health/redis` | Redis ping or `disabled` |
@@ -212,7 +222,7 @@ JSON per batch: `timestamp_ms`, `fs`, `channels`, `lfp`, `spikes`.
 
 ### Decoder — `ws://host/ws/decoder`
 
-JSON per step: `timestamp_ms`, `vx`, `vy`, `pen_down`, `confidence`, `latency_ms`, `accuracy`, `session_accuracy`, `cursor_x`, `cursor_y`, `num_channels`.
+JSON per step: `timestamp_ms`, `vx`, `vy`, `pen_down`, `confidence`, `decode_latency_ms`, `end_to_end_latency_ms`, `accuracy`, `session_accuracy`, `cursor_x`, `cursor_y`, `num_channels`.
 
 When replay is active, the server overrides `vx`, `vy`, `pen_down`, `cursor_x`, and `cursor_y` from the selected recording so the UI matches saved cursor motion.
 

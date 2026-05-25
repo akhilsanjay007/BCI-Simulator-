@@ -17,7 +17,8 @@ const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n
 
 /**
  * Instantaneous neural signal quality [0, 1].
- * High when firing proxy + decoder confidence are strong; decays with pen-up idle.
+ * High when firing proxy + decoder confidence are strong.
+ * Movement and click/drag share the same scoring path; only true idle decays.
  */
 export function computeInstantSignalQuality(input: SignalQualityInput): number {
   const conf = clamp(input.confidence, 0, 1);
@@ -25,11 +26,10 @@ export function computeInstantSignalQuality(input: SignalQualityInput): number {
   const spike = clamp(input.spikeStrength, 0, 1);
 
   const velActivity = clamp(vel / 0.9, 0, 1);
-  const firingProxy = input.penDown
-    ? clamp(0.2 + velActivity * 0.45 + spike * 0.4, 0, 1)
-    : clamp(spike * 0.35, 0, 0.45);
+  const firingProxy = clamp(0.18 + velActivity * 0.52 + spike * 0.3, 0, 1);
 
-  const idleMul = input.penDown ? 1 : clamp(Math.exp(-input.penUpIdleSec / 2.4), 0.1, 1);
+  const isActive = velActivity > 0.03 || spike > 0.03;
+  const idleMul = isActive ? 1 : clamp(Math.exp(-input.penUpIdleSec / 2.4), 0.1, 1);
 
   const blend = conf * 0.5 + firingProxy * 0.5;
   return clamp(blend * idleMul, 0, 1);

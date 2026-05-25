@@ -150,6 +150,13 @@ decoder = BciDecoder(
     exploration_prob=0.0,
     regressor=_decoder_reg,
 )
+manual_decoder = BciDecoder(
+    fs=generator.fs,
+    channels=generator.num_channels,
+    window_ms=200,
+    exploration_prob=0.0,
+    regressor=_decoder_reg,
+)
 _decoder_train_n = int(os.getenv("DECODER_TRAIN_SAMPLES", "25000"))
 
 # Must match the Railway volume mount path (e.g. volume `decoder-model` → `/app/models`).
@@ -173,6 +180,7 @@ def _load_decoder_at_startup() -> None:
     try:
         if artifact_path.is_file():
             load_decoder_artifact_into(decoder, artifact_path)
+            load_decoder_artifact_into(manual_decoder, artifact_path)
             if artifact_path == RAILWAY_VOLUME_MODEL_PATH.resolve():
                 print(f"✅ Successfully loaded model from Railway Volume: {artifact_path}")
             else:
@@ -189,6 +197,7 @@ def _load_decoder_at_startup() -> None:
                 seed=42,
             )
             decoder.train(X_train, y_train)
+            manual_decoder.train(X_train, y_train)
             print(f"Bootstrap-trained decoder on {len(X_train):,} synthetic windows")
         except Exception as e:
             print(f"⚠️ Decoder bootstrap training failed; using heuristic fallback. Error: {e}")
@@ -211,6 +220,20 @@ class ManualBurstRequest(BaseModel):
     vx: float = Field(..., ge=-1.0, le=1.0, description="Horizontal velocity hint [-1, 1].")
     vy: float = Field(..., ge=-1.0, le=1.0, description="Vertical velocity hint [-1, 1] (+y down).")
     duration_ms: float = Field(450.0, ge=50.0, le=1200.0)
+
+
+class ManualDecodeRequest(BaseModel):
+    """Manual-mode decode tick driven by local pointer/keyboard velocity."""
+
+    vx: float = Field(..., ge=-1.0, le=1.0, description="Horizontal velocity command [-1, 1].")
+    vy: float = Field(..., ge=-1.0, le=1.0, description="Vertical velocity command [-1, 1] (+y down).")
+    pen_down: bool = Field(False, description="Whether manual click/select is currently active.")
+    batch_samples: int = Field(
+        default=20,
+        ge=1,
+        le=200,
+        description="Synthetic spike batch length used for this decoder predict tick.",
+    )
 
 
 @app.get("/health")
@@ -260,6 +283,28 @@ async def manual_neural_burst(body: ManualBurstRequest) -> dict[str, str]:
     return {"status": "ok", "vx": str(body.vx), "vy": str(body.vy)}
 
 
+@app.post("/manual-decoder-predict")
+async def manual_decoder_predict(body: ManualDecodeRequest) -> dict[str, object]:
+    """
+    Manual-mode decoder tick with authentic decoder metrics.
+
+    Frontend sends cursor-derived velocity, backend synthesizes one spike batch using
+    live generator dynamics, then runs the same ``BciDecoder.predict`` path as `/ws/decoder`.
+    """
+    spikes = generator.synthesize_spikes_for_velocity(
+        vx=body.vx,
+        vy=body.vy,
+        pen_down=body.pen_down,
+        batch_samples=body.batch_samples,
+    )
+    out = manual_decoder.predict(
+        spikes,
+        true_vx=body.vx,
+        true_vy=body.vy,
+    )
+    return out.model_dump()
+
+
 @app.post("/decoder/reset")
 async def reset_decoder() -> dict[str, object]:
     """
@@ -267,6 +312,7 @@ async def reset_decoder() -> dict[str, object]:
     """
     print("[decoder/reset] POST received — clearing decoder + notifying WebSocket clients")
     decoder.reset()
+    manual_decoder.reset()
     redis_cleared = False
     if redis_client is not None:
         redis_cleared = await redis_client.clear_signal_stream()
@@ -396,6 +442,7 @@ async def set_replay_playback(body: ReplayPlaybackCommand) -> dict[str, object]:
     elif body.action == "restart":
         generator.replay_restart()
         decoder.reset()
+        manual_decoder.reset()
         reset_event = decoder.build_reset_event(num_channels=generator.num_channels)
         await decoder_ws_hub.broadcast_json(reset_event.model_dump())
     elif body.action == "seek":
@@ -403,6 +450,7 @@ async def set_replay_playback(body: ReplayPlaybackCommand) -> dict[str, object]:
             return {"status": "error", "message": "progress is required for seek action."}
         generator.replay_seek(body.progress)
         decoder.reset()
+        manual_decoder.reset()
         reset_event = decoder.build_reset_event(num_channels=generator.num_channels)
         await decoder_ws_hub.broadcast_json(reset_event.model_dump())
     else:  # set_speed
@@ -435,6 +483,7 @@ async def select_recording(body: SelectRecordingRequest) -> dict[str, object]:
         return {"status": "error", "message": str(e)}
 
     decoder.reset()
+    manual_decoder.reset()
     redis_cleared = False
     if redis_client is not None:
         redis_cleared = await redis_client.clear_signal_stream()
@@ -499,33 +548,78 @@ async def decoder_stream(websocket: WebSocket):
     print("✅ Client connected — decoder stream live")
     await decoder_ws_hub.register(websocket)
     _log_i = 0
+    replay_predict_task: asyncio.Task[DecoderPacket] | None = None
+    replay_metrics_latest: DecoderPacket | None = None
     try:
         async for packet in generator.stream():
             if generator.playback_active:
+                # Keep replay cursor/pen from recording for responsiveness while computing
+                # real decoder metrics in the background from replay spikes.
+                if replay_predict_task is None:
+                    replay_predict_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            decoder.predict,
+                            packet["spikes"],
+                            true_vx=generator.current_target_vx,
+                            true_vy=generator.current_target_vy,
+                        )
+                    )
+                elif replay_predict_task.done():
+                    try:
+                        replay_metrics_latest = replay_predict_task.result()
+                    except Exception as pred_exc:
+                        print(f"[ws/decoder] replay predict task failed: {pred_exc}")
+                    replay_predict_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            decoder.predict,
+                            packet["spikes"],
+                            true_vx=generator.current_target_vx,
+                            true_vy=generator.current_target_vy,
+                        )
+                    )
+                source_timestamp_ms = float(packet.get("timestamp_ms", time.time() * 1000.0))
+                end_to_end_latency_ms = max(0.0, (time.time() * 1000.0) - source_timestamp_ms)
                 out = DecoderPacket(
-                    timestamp_ms=float(packet.get("timestamp_ms", time.time() * 1000.0)),
+                    timestamp_ms=source_timestamp_ms,
                     vx=generator.current_target_vx,
                     vy=generator.current_target_vy,
                     pen_down=generator.current_pen_down,
-                    confidence=0.96,
-                    latency_ms=0.2,
-                    accuracy=1.0,
-                    session_accuracy=1.0,
+                    confidence=replay_metrics_latest.confidence if replay_metrics_latest else 0.0,
+                    decode_latency_ms=(
+                        replay_metrics_latest.decode_latency_ms if replay_metrics_latest else 0.0
+                    ),
+                    end_to_end_latency_ms=end_to_end_latency_ms,
+                    accuracy=replay_metrics_latest.accuracy if replay_metrics_latest else 0.0,
+                    session_accuracy=(
+                        replay_metrics_latest.session_accuracy if replay_metrics_latest else 0.0
+                    ),
                     cursor_x=generator.replay_cursor_x,
                     cursor_y=generator.replay_cursor_y,
                     num_channels=generator.num_channels,
                 )
             else:
+                replay_predict_task = None
+                replay_metrics_latest = None
                 out = decoder.predict(
                     packet["spikes"],
                     true_vx=generator.current_target_vx,
                     true_vy=generator.current_target_vy,
                 )
+                source_timestamp_ms = float(packet.get("timestamp_ms", out.timestamp_ms))
+                out = out.model_copy(
+                    update={
+                        "timestamp_ms": source_timestamp_ms,
+                        "end_to_end_latency_ms": max(
+                            0.0, (time.time() * 1000.0) - source_timestamp_ms
+                        ),
+                    }
+                )
             _log_i += 1
             if _log_i % 50 == 0:
                 print(
                     f"[ws/decoder] v=({out.vx:+.2f},{out.vy:+.2f}) pen={out.pen_down} conf={out.confidence:.2f} "
-                    f"lat={out.latency_ms:.1f}ms roll20={out.accuracy:.2f} sess={out.session_accuracy:.2f} "
+                    f"lat_decode={out.decode_latency_ms:.1f}ms lat_e2e={out.end_to_end_latency_ms:.1f}ms "
+                    f"roll20={out.accuracy:.2f} sess={out.session_accuracy:.2f} "
                     f"true=({generator.current_target_vx:+.2f},{generator.current_target_vy:+.2f}) "
                     f"cursor=({out.cursor_x:.2f},{out.cursor_y:.2f})"
                 )
@@ -536,6 +630,12 @@ async def decoder_stream(websocket: WebSocket):
         print(f"Decoder error: {e}")
         await websocket.close()
     finally:
+        if replay_predict_task is not None and not replay_predict_task.done():
+            replay_predict_task.cancel()
+            try:
+                await replay_predict_task
+            except Exception:
+                pass
         await decoder_ws_hub.unregister(websocket)
 
 

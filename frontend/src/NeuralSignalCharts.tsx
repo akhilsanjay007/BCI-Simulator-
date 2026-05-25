@@ -19,8 +19,10 @@ const VEL_LINE = "#38bdf8";
 const VEL_LINE_DIM = "rgba(56, 189, 248, 0.45)";
 const BG = "#0a0a0a";
 const GRID = "rgba(64, 64, 64, 0.45)";
-/** Recent time window (ms) for stronger raster styling while pen is active. */
+/** Recent time window (ms) for stronger raster styling while control activity is present. */
 const PEN_HIGHLIGHT_MS = 1700;
+/** Speed threshold where movement should visibly count as active control. */
+const MOVEMENT_ACTIVITY_THRESHOLD = 0.08;
 
 export type ChartControlMode = "automatic" | "manual";
 
@@ -102,6 +104,7 @@ function buildColumnManual(
   nCh: number,
   ringChannels: number,
   penDown: boolean,
+  movementActive: boolean,
 ): boolean[] {
   let envelope = 0;
   let boosted = new Set<number>();
@@ -125,7 +128,7 @@ function buildColumnManual(
         p += envelope * 0.024;
       }
     }
-    if (penDown) {
+    if (penDown || movementActive) {
       p += 0.022 + (boosted.has(ch) ? 0.035 : 0.01) * (0.55 + 0.45 * Math.sin(nowMs / 140));
     }
     p = Math.min(0.88, p);
@@ -175,7 +178,7 @@ export function NeuralSignalCharts({
 
   /** Columns left→right = past→present; each column is boolean[displayCount]. */
   const columnsRef = useRef<boolean[][]>([]);
-  /** Per-column pen contact (aligned with columnsRef indices). */
+  /** Per-column control activity (pen contact or movement, aligned with columnsRef indices). */
   const penByColRef = useRef<boolean[]>(Array.from({ length: NUM_COLS }, () => false));
   /** Per-column velocity magnitude |v| when the column was recorded. */
   const velByColRef = useRef<number[]>(Array.from({ length: NUM_COLS }, () => 0));
@@ -271,14 +274,14 @@ export function NeuralSignalCharts({
         ctx.stroke();
       }
 
-      const penHist = penByColRef.current;
+      const activityHist = penByColRef.current;
       const highlightCols = Math.min(NUM_COLS, Math.max(1, Math.ceil(PEN_HIGHLIGHT_MS / BIN_MS)));
 
       for (let t = 0; t < NUM_COLS; t++) {
         const x = padL + t * colW + colW * 0.5;
         const recent = t >= NUM_COLS - highlightCols;
-        const penOn = penHist[t] === true;
-        const emphasize = penOn && recent;
+        const active = activityHist[t] === true;
+        const emphasize = active && recent;
         const tick = emphasize ? Math.min(tickHalf * 1.45, rowH * 0.42) : tickHalf;
         ctx.strokeStyle = emphasize ? ACCENT_PEN : ACCENT;
         ctx.lineWidth = emphasize ? 2.1 : 1.25;
@@ -326,7 +329,9 @@ export function NeuralSignalCharts({
     }
 
     const penLive = propsRef.current.penDown;
-    const velAlpha = penLive ? 0.52 : 0.28;
+    const movementLive = Math.hypot(propsRef.current.vx, propsRef.current.vy) >= MOVEMENT_ACTIVITY_THRESHOLD;
+    const activeLive = penLive || movementLive;
+    const velAlpha = activeLive ? 0.52 : 0.28;
     const velSmooth: number[] = [];
     let ve = velHist[0] ?? 0;
     for (let t = 0; t < NUM_COLS; t++) {
@@ -340,7 +345,7 @@ export function NeuralSignalCharts({
 
     const smooth: number[] = [];
     let ema = rates[0] ?? 0;
-    const rateAlpha = penLive ? 0.32 : 0.18;
+    const rateAlpha = activeLive ? 0.32 : 0.18;
     for (let t = 0; t < NUM_COLS; t++) {
       ema = rateAlpha * rates[t] + (1 - rateAlpha) * ema;
       smooth.push(ema);
@@ -382,9 +387,9 @@ export function NeuralSignalCharts({
     ctx.setLineDash([]);
 
     ctx.strokeStyle = VEL_LINE;
-    ctx.lineWidth = penLive ? 2.1 : 1.65;
+    ctx.lineWidth = activeLive ? 2.1 : 1.65;
     ctx.shadowColor = "rgba(56, 189, 248, 0.35)";
-    ctx.shadowBlur = penLive ? 8 : 4;
+    ctx.shadowBlur = activeLive ? 8 : 4;
     ctx.beginPath();
     for (let t = 0; t < NUM_COLS; t++) {
       const x = padL + (t / (NUM_COLS - 1)) * plotW;
@@ -396,9 +401,9 @@ export function NeuralSignalCharts({
     ctx.shadowBlur = 0;
 
     ctx.strokeStyle = ACCENT;
-    ctx.lineWidth = penLive ? 2.35 : 2;
+    ctx.lineWidth = activeLive ? 2.35 : 2;
     ctx.shadowColor = "rgba(52, 211, 153, 0.25)";
-    ctx.shadowBlur = penLive ? 6 : 3;
+    ctx.shadowBlur = activeLive ? 6 : 3;
     ctx.beginPath();
     for (let t = 0; t < NUM_COLS; t++) {
       const x = padL + (t / (NUM_COLS - 1)) * plotW;
@@ -485,13 +490,15 @@ export function NeuralSignalCharts({
           propsRef.current;
         const cols = columnsRef.current;
         const speed = Math.hypot(vx, vy);
+        const movementActive = speed >= MOVEMENT_ACTIVITY_THRESHOLD;
+        const controlActive = pd || movementActive;
         const col =
           mode === "manual"
-            ? buildColumnManual(Date.now(), burst, n, t, pd)
-            : buildColumnAutomatic(now / 1000, n, pd, speed);
+            ? buildColumnManual(Date.now(), burst, n, t, pd, movementActive)
+            : buildColumnAutomatic(now / 1000, n, controlActive, speed);
         cols.push(col);
         cols.shift();
-        penByColRef.current.push(pd);
+        penByColRef.current.push(controlActive);
         penByColRef.current.shift();
         velByColRef.current.push(Math.hypot(vx, vy));
         velByColRef.current.shift();
@@ -506,7 +513,7 @@ export function NeuralSignalCharts({
 
   useLayoutEffect(() => {
     resizeAndDraw();
-  }, [penDown, resizeAndDraw]);
+  }, [penDown, vx, vy, resizeAndDraw]);
 
   const onRasterMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = rasterRef.current;

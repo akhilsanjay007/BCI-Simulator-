@@ -75,10 +75,10 @@ class NeuralSignalGenerator:
         self._manual_burst_vx: float = 0.0
         self._manual_burst_vy: float = 0.0
 
-        self._replay: RecordingReplay | None = try_create_replay()
-        self._mode: SimulatorMode = "live"
+        self._replay: RecordingReplay | None = try_create_replay(timing="original")
+        self._mode: SimulatorMode = "playback" if self._replay is not None else "live"
         self._playback_buffer_ms = float(
-            np.clip(float(os.environ.get("PLAYBACK_LATENCY_BUFFER_MS", "120.0")), 40.0, 300.0)
+            np.clip(float(os.environ.get("PLAYBACK_LATENCY_BUFFER_MS", "45.0")), 40.0, 60.0)
         )
         self.replay_cursor_x = 0.5
         self.replay_cursor_y = 0.5
@@ -255,6 +255,36 @@ class NeuralSignalGenerator:
         extra = np.clip(env * 0.052 * np.maximum(m - 1.0, 0.0), 0.0, 0.06)
         return extra.astype(np.float32)
 
+    def synthesize_spikes_for_velocity(
+        self,
+        *,
+        vx: float,
+        vy: float,
+        pen_down: bool,
+        batch_samples: int,
+    ) -> list[list[int]]:
+        """
+        Generate one synthetic spike batch for an explicit velocity command.
+
+        This mirrors the live stream spike-generation path (directional multipliers +
+        speed gain) so manual-mode metrics can be computed by the same decoder path.
+        """
+        n = max(1, int(batch_samples))
+        vx_clamped = float(np.clip(vx, -1.0, 1.0))
+        vy_clamped = float(np.clip(vy, -1.0, 1.0))
+        base_prob = self.base_spike_rate * self.dt
+        multipliers = velocity_spike_multipliers(
+            vx_clamped,
+            vy_clamped,
+            bool(pen_down),
+            self.num_channels,
+        )
+        speed = float(np.hypot(vx_clamped, vy_clamped))
+        multipliers = multipliers * float(1.0 + 0.28 * min(speed, 1.0))
+        prob = np.clip(base_prob * multipliers, 0.0, 0.95)
+        spikes = (self.rng.random((n, self.num_channels)) < prob).astype(int)
+        return spikes.tolist()
+
     def _pick_new_velocity_endpoint(self) -> None:
         """Sample a new segment endpoint ``(_seg_end_vx, _seg_end_vy)``."""
         if self.rng.random() < 0.2:
@@ -300,6 +330,7 @@ class NeuralSignalGenerator:
         t = 0.0
         redis_client = get_redis_client()
         playback_emit_deadline_ms: float | None = None
+        replay_session_id_prev: str | None = None
 
         if self._replay is not None:
             print(
@@ -351,9 +382,14 @@ class NeuralSignalGenerator:
             )
 
             if self.playback_active:
+                current_session_id = self.replay_session_id
                 source_ts_ms = packet.timestamp_ms
                 now_ms = time.time() * 1000.0
-                if playback_emit_deadline_ms is None:
+                # On recording switch, emit immediately so demo changes feel instant.
+                if current_session_id is not None and current_session_id != replay_session_id_prev:
+                    replay_session_id_prev = current_session_id
+                    playback_emit_deadline_ms = now_ms
+                elif playback_emit_deadline_ms is None:
                     playback_emit_deadline_ms = now_ms + self._playback_buffer_ms
                 else:
                     playback_emit_deadline_ms += step_ms
@@ -366,6 +402,7 @@ class NeuralSignalGenerator:
                 packet.timestamp_ms = source_ts_ms
             else:
                 playback_emit_deadline_ms = None
+                replay_session_id_prev = None
 
             dumped = packet.model_dump()
             if redis_client is not None:
