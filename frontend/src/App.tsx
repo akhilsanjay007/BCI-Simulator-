@@ -53,6 +53,15 @@ function toWebSocketOrigin(httpOrigin: string): string {
 
 const BACKEND_HTTP_ORIGIN = resolveBackendUrl();
 const BACKEND_WS_ORIGIN = toWebSocketOrigin(BACKEND_HTTP_ORIGIN);
+const HAS_EXPLICIT_BACKEND_URL =
+  Boolean(normalizeBackendUrl(window.__APP_CONFIG__?.VITE_BACKEND_URL)) ||
+  Boolean(normalizeBackendUrl(import.meta.env.VITE_BACKEND_URL));
+
+if (import.meta.env.PROD && !HAS_EXPLICIT_BACKEND_URL) {
+  console.warn(
+    "[config] VITE_BACKEND_URL is not set; defaulting to same-origin backend URL.",
+  );
+}
 
 const BACKEND_ENDPOINTS = {
   manualDecoderPredict: `${BACKEND_HTTP_ORIGIN}/manual-decoder-predict`,

@@ -6,6 +6,8 @@ dockerfilePath = "Dockerfile"
 # `/app/models` with `velocity_decoder.pkl`, or set `MODEL_PATH` / `DECODER_MODEL_PATH`.
 
 [deploy]
+# Explicit Railway start command (bind to injected $PORT, no reload in production).
+startCommand = "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
 healthcheckPath = "/health"
 healthcheckTimeout = 60
 restartPolicyType = "ON_FAILURE"
@@ -31,5 +33,7 @@ restartPolicyType = "ON_FAILURE"
 #   5. Set RAILWAY_RUN_UID=0 on the backend (image runs as non-root user `app`; volumes mount root-owned)
 #   6. ENV=production, REDIS_URL, FRONTEND_URL as below
 #
-# Frontend service: separate Dockerfile at frontend/Dockerfile with build arg:
+# Frontend service: separate Dockerfile at frontend/Dockerfile with runtime variable:
 #   VITE_BACKEND_URL=https://<backend>.up.railway.app
+# Browser clients generally need the backend public Railway URL. Internal Railway
+# service DNS names are only suitable for server-to-server calls.

@@ -51,5 +51,6 @@ EXPOSE 8000
 
 # Run a single process in container runtimes (e.g. Railway). The decoder model
 # is loaded in-process, so multi-worker mode multiplies memory usage and can
-# trigger worker restart loops on small instances.
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# trigger worker restart loops on small instances. Reload stays disabled because
+# we do not pass --reload in production startup commands.
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips='*'"]
