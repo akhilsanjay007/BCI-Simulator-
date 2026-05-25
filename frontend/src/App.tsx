@@ -3,23 +3,23 @@ import {
   stepCursorMotion,
   seedCursorMotion,
   type CursorMotionState,
-} from "./cursorPhysics";
-import { BCITrackpad, type BCITrackpadHandle } from "./BCITrackpad";
-import { idleManualTrackpadDrive, type ManualTrackpadDrive } from "./manualTrackpad";
-import { NeuralSignalCharts, type ManualNeuralBurstPayload } from "./NeuralSignalCharts";
-import { DecoderMetrics } from "./DecoderMetrics";
-import { ThoughtToText } from "./ThoughtToText";
+} from "./utils/cursorPhysics";
+import { BCITrackpad, type BCITrackpadHandle } from "./components/BCITrackpad";
+import { idleManualTrackpadDrive, type ManualTrackpadDrive } from "./utils/manualTrackpad";
+import { NeuralSignalCharts, type ManualNeuralBurstPayload } from "./components/NeuralSignalCharts";
+import { DecoderMetrics } from "./components/DecoderMetrics";
+import { ThoughtToText } from "./components/ThoughtToText";
 import {
   computeInstantSignalQuality,
   signalTierStyles,
   stepSignalSmooth,
   type SignalQualityInput,
-} from "./signalQuality";
+} from "./utils/signalQuality";
 import {
   applyWordSuggestion,
   getWordSuggestions,
   predictSwipeWords,
-} from "./wordSuggestions";
+} from "./utils/wordSuggestions";
 
 function normalizeBackendUrl(value: string | undefined | null): string | null {
   const normalized = (value ?? "").trim().replace(/\/$/, "");

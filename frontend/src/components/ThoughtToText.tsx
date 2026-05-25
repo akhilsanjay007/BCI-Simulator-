@@ -1,5 +1,11 @@
 import { forwardRef, type ReactNode } from "react";
-import { DASHBOARD_BTN, DASHBOARD_DIVIDER, DASHBOARD_INNER_SURFACE, DASHBOARD_PANEL, DASHBOARD_PANEL_HEADER } from "./dashboardTheme";
+import {
+  DASHBOARD_BTN,
+  DASHBOARD_DIVIDER,
+  DASHBOARD_INNER_SURFACE,
+  DASHBOARD_PANEL,
+  DASHBOARD_PANEL_HEADER,
+} from "../utils/dashboardTheme";
 
 interface ThoughtToTextProps {
   fullText: string;

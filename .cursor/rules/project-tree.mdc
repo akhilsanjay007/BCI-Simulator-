@@ -21,11 +21,20 @@ neuralink-bci-sim/
 │       └── ci-cd.yml
 ├── app/
 │   ├── __init__.py
-│   ├── main.py                 # FastAPI, CORS, WS, health, decoder/simulator routes
-│   ├── simulator.py            # NeuralSignalGenerator + optional Redis publish
-│   ├── decoder.py              # BciDecoder, DecoderPacket, training / artifact load
-│   ├── redis_client.py         # Async Redis Streams buffer (REDIS_URL)
-│   └── offline_eval.py         # Offline metrics (no WebSocket)
+│   ├── main.py                 # compatibility entrypoint -> app/core/main.py
+│   ├── simulator.py            # compatibility export -> app/core/simulator.py
+│   ├── decoder.py              # compatibility export -> app/core/decoder.py
+│   ├── redis_client.py         # compatibility export -> app/core/redis_client.py
+│   ├── recording_replay.py     # compatibility export -> app/core/recording_replay.py
+│   ├── offline_eval.py         # compatibility export -> app/core/offline_eval.py
+│   └── core/
+│       ├── __init__.py
+│       ├── main.py             # FastAPI API surface + WebSocket streams
+│       ├── simulator.py        # NeuralSignalGenerator + optional Redis publish
+│       ├── decoder.py          # BciDecoder, DecoderPacket, training / artifact load
+│       ├── redis_client.py     # Async Redis Streams buffer (REDIS_URL)
+│       ├── recording_replay.py # replay selection + timing interpolation
+│       └── offline_eval.py     # offline metrics / retraining CLI
 ├── models/
 │   ├── .gitkeep
 │   └── velocity_decoder.pkl    # Default shipped weights (MODEL_PATH / DECODER_MODEL_PATH)
@@ -50,12 +59,24 @@ neuralink-bci-sim/
 │   └── src/
 │       ├── main.tsx
 │       ├── App.tsx             # layout, WS, manual/automatic, metrics strip
-│       ├── App.css
-│       ├── index.css
-│       ├── BCITrackpad.tsx     # canvas: virtual QWERTY keyboard + BCI cursor
-│       ├── keyboardLayout.ts   # QWERTY layout, hit-test, draw
-│       ├── NeuralSignalCharts.tsx
-│       ├── cursorPhysics.ts
+│       ├── components/
+│       │   ├── BCITrackpad.tsx # canvas: virtual QWERTY keyboard + BCI cursor
+│       │   ├── DecoderMetrics.tsx
+│       │   ├── NeuralSignalCharts.tsx
+│       │   ├── ThoughtToText.tsx
+│       │   ├── Keyboard.tsx
+│       │   ├── KeyboardKey.tsx
+│       │   └── SuggestionBar.tsx
+│       ├── utils/
+│       │   ├── keyboardLayout.ts # QWERTY layout, hit-test, draw
+│       │   ├── cursorPhysics.ts
+│       │   ├── manualTrackpad.ts
+│       │   ├── signalQuality.ts
+│       │   ├── wordSuggestions.ts
+│       │   └── dashboardTheme.ts
+│       ├── styles/
+│       │   ├── App.css
+│       │   └── index.css
 │       └── vite-env.d.ts
 ├── Dockerfile
 ├── docker-compose.yml          # backend + frontend + redis (REDIS_URL wired for backend)

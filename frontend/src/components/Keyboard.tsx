@@ -1,5 +1,5 @@
-import { DASHBOARD_THEME } from "./dashboardTheme";
-import { KEYBOARD_KEYS } from "./keyboardLayout";
+import { DASHBOARD_THEME } from "../utils/dashboardTheme";
+import { KEYBOARD_KEYS } from "../utils/keyboardLayout";
 import { drawKeyboardKey } from "./KeyboardKey";
 
 function displayLabel(keyId: string, label: string): string {
