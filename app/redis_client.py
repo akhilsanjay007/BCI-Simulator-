@@ -153,6 +153,40 @@ class BCIRedisClient:
             if self._should_log_error(now_ms=now_ms):
                 print(f"[redis] publish failed: {e}")
 
+    @staticmethod
+    def _stream_id_ms(entry_id: bytes | str) -> int | None:
+        text = entry_id.decode("ascii", errors="ignore") if isinstance(entry_id, bytes) else str(entry_id)
+        head = text.split("-", 1)[0]
+        if not head.isdigit():
+            return None
+        return int(head)
+
+    async def get_signal_buffer_seconds(self) -> float | None:
+        """
+        Return current Redis signal stream buffer horizon in seconds.
+
+        Computed as newest stream ID timestamp minus oldest stream ID timestamp.
+        Returns 0.0 for an empty stream, ``None`` on Redis errors.
+        """
+        now_ms = time.time() * 1000.0
+        try:
+            newest = await self._redis.xrevrange(self._cfg.stream_signals, count=1)
+            if not newest:
+                return 0.0
+            oldest = await self._redis.xrange(self._cfg.stream_signals, count=1)
+            if not oldest:
+                return 0.0
+
+            newest_ms = self._stream_id_ms(newest[0][0])
+            oldest_ms = self._stream_id_ms(oldest[0][0])
+            if newest_ms is None or oldest_ms is None:
+                return None
+            return max(0.0, (newest_ms - oldest_ms) / 1000.0)
+        except RedisError as e:
+            if self._should_log_error(now_ms=now_ms):
+                print(f"[redis] buffer horizon query failed: {e}")
+            return None
+
 
 _redis_singleton: Optional[BCIRedisClient] = None
 

@@ -550,8 +550,19 @@ async def decoder_stream(websocket: WebSocket):
     _log_i = 0
     replay_predict_task: asyncio.Task[DecoderPacket] | None = None
     replay_metrics_latest: DecoderPacket | None = None
+    redis_buffer_seconds = 0.0
+    redis_buffer_last_refresh_ms = 0.0
     try:
         async for packet in generator.stream():
+            now_ms = time.time() * 1000.0
+            if redis_client is None:
+                redis_buffer_seconds = 0.0
+            elif (now_ms - redis_buffer_last_refresh_ms) >= 250.0:
+                measured = await redis_client.get_signal_buffer_seconds()
+                if measured is not None:
+                    redis_buffer_seconds = measured
+                redis_buffer_last_refresh_ms = now_ms
+
             if generator.playback_active:
                 # Keep replay cursor/pen from recording for responsiveness while computing
                 # real decoder metrics in the background from replay spikes.
@@ -589,6 +600,7 @@ async def decoder_stream(websocket: WebSocket):
                         replay_metrics_latest.decode_latency_ms if replay_metrics_latest else 0.0
                     ),
                     end_to_end_latency_ms=end_to_end_latency_ms,
+                    redis_buffer_seconds=redis_buffer_seconds,
                     accuracy=replay_metrics_latest.accuracy if replay_metrics_latest else 0.0,
                     session_accuracy=(
                         replay_metrics_latest.session_accuracy if replay_metrics_latest else 0.0
@@ -612,6 +624,7 @@ async def decoder_stream(websocket: WebSocket):
                         "end_to_end_latency_ms": max(
                             0.0, (time.time() * 1000.0) - source_timestamp_ms
                         ),
+                        "redis_buffer_seconds": redis_buffer_seconds,
                     }
                 )
             _log_i += 1
@@ -619,6 +632,7 @@ async def decoder_stream(websocket: WebSocket):
                 print(
                     f"[ws/decoder] v=({out.vx:+.2f},{out.vy:+.2f}) pen={out.pen_down} conf={out.confidence:.2f} "
                     f"lat_decode={out.decode_latency_ms:.1f}ms lat_e2e={out.end_to_end_latency_ms:.1f}ms "
+                    f"buffer={out.redis_buffer_seconds:.1f}s "
                     f"roll20={out.accuracy:.2f} sess={out.session_accuracy:.2f} "
                     f"true=({generator.current_target_vx:+.2f},{generator.current_target_vy:+.2f}) "
                     f"cursor=({out.cursor_x:.2f},{out.cursor_y:.2f})"

@@ -222,7 +222,7 @@ JSON per batch: `timestamp_ms`, `fs`, `channels`, `lfp`, `spikes`.
 
 ### Decoder — `ws://host/ws/decoder`
 
-JSON per step: `timestamp_ms`, `vx`, `vy`, `pen_down`, `confidence`, `decode_latency_ms`, `end_to_end_latency_ms`, `accuracy`, `session_accuracy`, `cursor_x`, `cursor_y`, `num_channels`.
+JSON per step: `timestamp_ms`, `vx`, `vy`, `pen_down`, `confidence`, `decode_latency_ms`, `end_to_end_latency_ms`, `redis_buffer_seconds`, `accuracy`, `session_accuracy`, `cursor_x`, `cursor_y`, `num_channels`.
 
 When replay is active, the server overrides `vx`, `vy`, `pen_down`, `cursor_x`, and `cursor_y` from the selected recording so the UI matches saved cursor motion.
 

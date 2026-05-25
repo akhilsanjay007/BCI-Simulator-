@@ -15,6 +15,7 @@ def test_decoder_packet_has_no_mode_field() -> None:
     assert "mode" not in body
     assert "decode_latency_ms" in body
     assert "end_to_end_latency_ms" in body
+    assert "redis_buffer_seconds" in body
     assert "latency_ms" not in body
 
 
