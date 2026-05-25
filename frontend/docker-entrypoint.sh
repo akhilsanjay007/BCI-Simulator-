@@ -2,13 +2,12 @@
 set -eu
 
 # Railway injects PORT at runtime. Keep local default for docker run/dev.
-: "${PORT:=80}"
+PORT="${PORT:-80}"
 
 # Render nginx server listen port from runtime env.
-envsubst '${PORT}' \
-  < /etc/nginx/conf.d/default.conf \
-  > /etc/nginx/conf.d/default.conf.rendered
-mv /etc/nginx/conf.d/default.conf.rendered /etc/nginx/conf.d/default.conf
+# sed is used instead of envsubst to avoid silent failures when PORT is not
+# exported into the envsubst environment on some sh implementations.
+sed -i "s/\${PORT}/${PORT}/g" /etc/nginx/conf.d/default.conf
 
 # Runtime config allows Railway service variables to control backend origin
 # without requiring Docker build args.
