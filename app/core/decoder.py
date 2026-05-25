@@ -911,7 +911,7 @@ def make_bootstrap_training_set(
 
 
 def default_decoder_artifact_path() -> Path:
-    """Default pickle path at repo root (written by ``python -m app.offline_eval --retrain``)."""
+    """Default pickle path at repo root (written by ``python -m app.core.offline_eval --retrain``)."""
     return Path(__file__).resolve().parent.parent.parent / MODEL_PATH
 
 
@@ -928,7 +928,7 @@ def velocity_decoder_missing_help(path: Path) -> str:
         "Docker: mount `./models` to `/app/models` (see docker-compose.yml) or set "
         "`MODEL_PATH` / `DECODER_MODEL_PATH`. "
         "If the file is a Git LFS pointer: `git lfs pull` at repo root. "
-        "To train locally: `python -m app.offline_eval --retrain --artifact models/velocity_decoder.pkl`."
+        "To train locally: `python -m app.core.offline_eval --retrain --artifact models/velocity_decoder.pkl`."
     )
 
 

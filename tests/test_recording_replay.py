@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from app.recording_replay import (
+from app.core.recording_replay import (
     RecordingReplay,
     create_replay_for_demo,
     create_replay_for_recording,
@@ -169,7 +169,7 @@ def test_smooth_125hz_resample(tmp_path: Path) -> None:
 
 
 def test_resample_helper_uniform_step() -> None:
-    from app.recording_replay import _ReplayPoint
+    from app.core.recording_replay import _ReplayPoint
 
     pts = [
         _ReplayPoint(t_ms=0.0, x=0.0, y=0.5, clicked=False),

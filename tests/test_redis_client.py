@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock
 
-from app.redis_client import BCIRedisClient, RedisClientConfig
+from app.core.redis_client import BCIRedisClient, RedisClientConfig
 
 
 def test_publish_signal_packet_trims_by_time() -> None:
