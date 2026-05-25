@@ -1,40 +1,152 @@
-# neuralink-bci-sim
+# Neuralink BCI Simulator
 
-Synthetic neural-style signals over WebSocket (LFP traces + sparse spikes), a trained **velocity decoder**, and a **React** dashboard with a virtual-keyboard trackpad (Automatic decoder control + Manual pointer/keys)—without implant hardware.
+A real-time Brain-Computer Interface simulation stack that turns synthetic neural signals into continuous cursor intent and interactive keyboard control.
 
-| Component | Role |
-|-----------|------|
-| `app/simulator.py` | `NeuralSignalGenerator` — ground-truth velocity + channel spikes; optional recording replay |
-| `app/recording_replay.py` | Load `recordings/*.json` and drive cursor `(x, y)` + `clicked` → `pen_down` |
-| `app/decoder.py` | Sliding-window `BciDecoder` — `vx`/`vy`, pen-down, cursor integration |
-| `app/redis_client.py` | Optional Redis Streams buffer (`bci:signals`, ~20s retention) |
-| `app/main.py` | FastAPI — REST, `/ws/bci-stream`, `/ws/decoder`, recording APIs |
-| `frontend/` | Vite + React + Tailwind BCI dashboard (`BCITrackpad`, keyboard layout) |
-| `recordings/` | Saved trackpad sessions (`demo_*.json`, `session_*.json`) for Automatic replay |
+This project is built to answer one question: **what would production-quality neural interface software look like before hardware is in the loop?**
 
-## Requirements
+---
 
-- **Backend:** Python **3.11** (matches Docker/CI); **3.10+** usually works locally
-- **Dashboard (optional):** Node.js **20+** and npm
-- **Production weights:** Git **LFS** for `models/velocity_decoder.pkl` (~2 GB)
-- **Full stack (optional):** Docker Desktop for `docker compose`
+## Why This Matters for Neuralink
 
-## Quick start (local)
+I built this project around the same engineering tension that makes Neuralink compelling: neural systems are only as useful as the software that interprets them under real constraints.
+
+High-rate signal streams are noisy. User intent changes every few milliseconds. Latency compounds across every boundary: generation, transport, decode, render. In this environment, demos are easy; robust systems are hard.
+
+This repository focuses on that hard part:
+
+- Designing a pipeline where velocity decode feels continuous, not jumpy
+- Separating model latency from end-to-end latency so bottlenecks are explicit
+- Keeping buffers bounded and failure modes observable
+- Building a UI that stays responsive at stream cadence instead of re-rendering the world on every packet
+- Treating reliability and instrumentation as product requirements, not afterthoughts
+
+If your goal is assistive control that feels natural and trustworthy, these details are not optional. They are the product.
+
+---
+
+## What This Project Does
+
+- Streams synthetic multi-channel LFP and spike activity in real time
+- Runs a continuous decoder that emits `vx`, `vy`, `pen_down`, confidence, and accuracy metrics
+- Serves WebSocket + REST APIs for dashboard control, replay, health checks, and reset workflows
+- Supports optional Redis Streams buffering with retention and live buffer horizon visibility
+- Renders a keyboard-first dashboard for automatic (decoder-driven) and manual control modes
+- Replays recorded sessions with original timing or smoothed timing for deterministic demos
+
+---
+
+## Technical Highlights
+
+### 1) Latency is split by design
+
+The backend reports both:
+
+- `decode_latency_ms`: model inference cost
+- `end_to_end_latency_ms`: packet age at delivery
+
+That split avoids the common trap of one opaque latency number and makes optimization work actionable.
+
+### 2) Bounded systems over best-effort systems
+
+Across backend and frontend, long-lived buffers are capped:
+
+- Decoder rolling windows and accuracy deques are bounded
+- Redis stream retention is time-trimmed
+- Frontend signal views use fixed windows and controlled update loops
+
+This keeps long sessions predictable and memory behavior stable.
+
+### 3) Manual mode still uses real decode metrics
+
+Manual control is not a fake UI bypass. It routes velocity hints through decoder prediction endpoints so confidence, latency, and accuracy remain meaningful during interaction.
+
+### 4) Compatibility-preserving refactor for maintainability
+
+Backend logic is organized under `app/core/` and frontend logic under `frontend/src/components`, `frontend/src/utils`, and `frontend/src/styles`, while compatibility entrypoints keep existing commands and tests stable.
+
+---
+
+## Demo Assets (Add Before Submission)
+
+Use this section as a recruiter-facing call to action. Replace placeholders with polished captures from your latest run.
+
+**Recommended media to include:**
+
+- `docs/media/automatic-mode.gif` - decoder-driven cursor and key selection
+- `docs/media/manual-mode.gif` - manual control with live decoder metrics
+- `docs/media/decoder-metrics.png` - confidence, latency, buffer, and accuracy strip
+- `docs/media/replay-selector.png` - replay workflow and timing controls
+
+Current placeholder:
+
+![Dashboard overview](frontend/public/bi-logo.png)
+
+---
+
+## Architecture Snapshot
+
+```text
+NeuralSignalGenerator (app/core/simulator.py)
+    -> optional Redis Streams buffer (app/core/redis_client.py)
+    -> FastAPI WebSocket /ws/decoder (app/core/main.py)
+    -> BciDecoder.predict (app/core/decoder.py)
+    -> React dashboard (frontend/src/App.tsx + components/*)
+```
+
+### Key API Surface
+
+- `GET /health`
+- `GET /health/redis`
+- `GET /api/decoder/info`
+- `GET /simulator/config`
+- `GET /api/recordings`
+- `POST /api/recordings/select`
+- `POST /api/recordings/playback`
+- `POST /decoder/reset`
+- `POST /manual-decoder-predict`
+- `POST /manual-neural-burst`
+- `WS /ws/bci-stream`
+- `WS /ws/decoder`
+
+---
+
+## Tech Stack
+
+### Backend
+
+- Python 3.11
+- FastAPI + Pydantic v2
+- NumPy + scikit-learn
+- Redis (optional, Streams buffering)
+
+### Frontend
+
+- React 19 + TypeScript (strict)
+- Vite
+- Tailwind CSS
+- Canvas-based trackpad/keyboard rendering
+
+### DevOps
+
+- Docker + Docker Compose
+- GitHub Actions CI/CD
+- Railway-ready deployment config
+
+---
+
+## Quick Start (Local)
+
+### 1) Backend
 
 ```powershell
-cd neuralink-bci-sim
 python -m venv venv
 .\venv\Scripts\Activate.ps1
 pip install -r requirements-dev.txt
-git lfs install
-git lfs pull
 $env:PYTHONPATH = "."
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Open [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs).
-
-**Dashboard** (second terminal):
+### 2) Frontend
 
 ```powershell
 cd frontend
@@ -42,232 +154,104 @@ npm install
 npm run dev
 ```
 
-Open [http://127.0.0.1:5173](http://127.0.0.1:5173) with the API on port 8000.
+### 3) Open the app
 
-Copy [`.env.example`](.env.example) to `.env` if you need custom Redis or CORS origins.
+- Backend docs: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+- Frontend: [http://127.0.0.1:5173](http://127.0.0.1:5173)
 
-### Python dependencies
+---
 
-| File | Use |
-|------|-----|
-| [`requirements.txt`](requirements.txt) | Production runtime (Docker/Railway image) |
-| [`requirements-dev.txt`](requirements-dev.txt) | Local dev + CI (`pytest`, `pytest-cov`) |
+## Docker Compose
 
-## Git LFS (velocity decoder)
-
-Weights live at **`models/velocity_decoder.pkl`** and are tracked with Git LFS.
-
-```powershell
-git lfs install
-git lfs pull
-```
-
-**Retrain** (from repo root, venv active):
-
-```powershell
-$env:PYTHONPATH = "."
-python -m app.offline_eval --retrain --artifact models/velocity_decoder.pkl
-```
-
-Commit and push via LFS when updating production weights.
-
-## Docker (full stack)
-
-With Docker running, from the repo root (run **`git lfs pull`** first so `models/` is not a pointer stub):
+From repo root:
 
 ```powershell
 docker compose up --build
 ```
 
-| Service | URL | Notes |
-|---------|-----|--------|
-| Backend | [http://127.0.0.1:8000](http://127.0.0.1:8000) | FastAPI, 4 uvicorn workers |
-| Frontend | [http://127.0.0.1:3000](http://127.0.0.1:3000) | nginx static SPA |
-| Redis | `localhost:6379` | Streams buffer for raw packets |
+Expected services:
 
-`docker compose` bind-mounts `./recordings` → `/app/recordings` so demo/session JSON is available without rebuilding the backend image.
+- Backend: `http://127.0.0.1:8000`
+- Frontend: `http://127.0.0.1:3000`
+- Redis: `localhost:6379`
 
-The frontend image is built with `VITE_BACKEND_URL=http://localhost:8000` (see `docker-compose.yml` `frontend.build.args`). Change this when the browser must call a different API origin.
+If Docker is not running, start Docker Desktop first.
 
-## Dashboard
+---
 
-Two-column layout: decoder metrics + neural charts (left), virtual-keyboard trackpad + **Thought → Text** (right).
+## Environment Configuration
 
-- **Manual** — pointer/keys on the canvas trackpad keep direct feel while `(vx, vy, pen_down)` is sent to `POST /manual-decoder-predict` so confidence/latency/accuracy are real decoder outputs
-- **Automatic** — live `/ws/decoder` drives cursor + `pen_down` (key select / click on the QWERTY keyboard)
-- **Recording replay** (Automatic only) — header dropdown picks any `recordings/*.json`; timing **Original** (recorded timestamps) or **Smooth 125 Hz** (8 ms resample)
-- **Thought → Text** — typed output from BCI cursor on the keyboard; **Clear** / **Reset cursor**
-- **Decoder metrics** — confidence, latency, signal quality, velocity, session stats
-- **Neural signals** — multi-channel raster sized from `num_channels`
+Copy `.env.example` to `.env` and override only what you need.
 
-### Recording trackpad sessions (optional)
+Most important variables:
 
-Record from the same `/ws/decoder` stream consumed by `frontend/src/App.tsx` so replay timing mirrors real app behavior:
+- `ENV` (`development` or `production`)
+- `MODEL_PATH` / `DECODER_MODEL_PATH`
+- `DECODER_REGRESSOR` (`ensemble`, `rf`, `hgb`)
+- `REDIS_URL`
+- `REDIS_STREAM_SIGNALS`
+- `REDIS_STREAM_RETENTION_SECONDS`
+- `FRONTEND_URL` / `CORS_ALLOWED_ORIGINS`
+- `VITE_BACKEND_URL`
 
-```powershell
-$env:PYTHONPATH = "."
-python recordings/record_from_app.py --ws-url ws://localhost:8000/ws/decoder
-```
+---
 
-This saves `recordings/session_YYYYMMDD_HHMMSS.json` with normalized `x`, `y`, `timestamp_ms`, and `clicked`.
+## Validation Commands
 
-To re-record shipped demos:
+### Backend tests
 
 ```powershell
-python recordings/record_from_app.py --output demo_1.json --session-id demo_1 --typed-text "YOUR DEMO 1 TEXT"
-python recordings/record_from_app.py --output demo_2.json --session-id demo_2 --typed-text "YOUR DEMO 2 TEXT"
+python -m pytest tests -q
 ```
 
-The recorder enforces strictly increasing timestamps, which avoids fixed-step fallback and jitter during replay.
+### Frontend checks
 
-### API used by the UI
+```powershell
+cd frontend
+npm run lint
+npm run build
+```
 
-| Endpoint | Purpose |
-|----------|---------|
-| `ws://…/ws/decoder` | Live `DecoderPacket` JSON; `type: "decoder_reset"` on reset |
-| `GET /api/decoder/info` | Regressor, `fs_hz`, `n_features`, training status |
-| `GET /simulator/config` | `num_channels`, `fs`, `replay_active`, `selected_recording_id` |
-| `GET /api/recordings` | List `recordings/*.json` metadata for the replay dropdown |
-| `POST /api/recordings/select` | `{ "recording_id", "timing": "original" \| "smooth_125hz" }` — switch replay + decoder reset |
-| `POST /decoder/reset` | Clears decoder + Redis stream; broadcasts reset to WS clients |
-| `POST /manual-decoder-predict` | `{ "vx", "vy", "pen_down", "batch_samples" }` — manual-mode decode tick returning real `DecoderPacket` metrics |
-| `POST /manual-neural-burst` | `{ "vx", "vy", "duration_ms" }` — manual-mode cortical burst |
-| `GET /health` | Liveness + decoder/simulator summary |
-| `GET /health/redis` | Redis ping or `disabled` |
+---
 
-CORS allows local Vite (`5173`, `3000`) and origins from `FRONTEND_URL` / `CORS_ALLOWED_ORIGINS`, plus `*.up.railway.app` when `ENV=production`.
-
-Frontend build-time variable: **`VITE_BACKEND_URL`** (required for production builds outside dev proxy).
-
-## Deployment
-
-### Pre-flight checklist
-
-1. **`git lfs pull`** on the machine or CI checkout that builds the backend image.
-2. Confirm **`models/velocity_decoder.pkl`** is a real file (not an LFS pointer) in the build context.
-3. Set **`ENV=production`** on the backend so a missing model fails fast.
-4. Set **`VITE_BACKEND_URL`** to the public HTTPS API URL when building the frontend image.
-5. Set **`FRONTEND_URL`** (or `CORS_ALLOWED_ORIGINS`) on the backend to the public SPA origin(s).
-6. Provision **Redis** for production buffering (`REDIS_URL`) or accept disabled Redis (no stream buffer).
-
-### Backend (Docker / Railway)
-
-Root [`Dockerfile`](Dockerfile): Python 3.11, `pip install -r requirements.txt`, `git lfs pull` for `models/`, uvicorn with 4 workers.
-
-[`railway.toml`](railway.toml) uses that Dockerfile and **`GET /health`** for deploy checks.
-
-| Variable | Purpose |
-|----------|---------|
-| `ENV` | `production` — require trained artifact; no bootstrap fallback |
-| `MODEL_PATH` | Override pickle path (wins over `DECODER_MODEL_PATH`) |
-| `DECODER_MODEL_PATH` | Legacy alias for model path |
-| `DECODER_REGRESSOR` | `ensemble` (default), `rf`, or `hgb` — must match training |
-| `REDIS_URL` | e.g. `redis://…` — omit to disable Streams client |
-| `REDIS_STREAM_SIGNALS` | Stream name (default `bci:signals`) |
-| `REDIS_STREAM_RETENTION_SECONDS` | Trim window (default `20`) |
-| `FRONTEND_URL` / `CORS_ALLOWED_ORIGINS` | Allowed browser origins (comma-separated) |
-| `BCI_REPLAY` | Set `0` / `false` / `off` to disable startup replay (default: on when JSON exists) |
-| `BCI_RECORDINGS_DIR` | Directory for `*.json` sessions (default `recordings/` at repo root; Docker: `/app/recordings`) |
-| `BCI_RECORDING_PATH` | Force a single JSON file at startup (overrides directory scan) |
-
-### Frontend (Docker / Railway)
-
-[`frontend/Dockerfile`](frontend/Dockerfile): `npm ci` → `npm run build` → nginx on port 80.
-
-Build arg **`VITE_BACKEND_URL`** must be the browser-reachable API base (e.g. `https://your-api.up.railway.app`), **no** trailing slash.
-
-### Railway (two services + Redis)
-
-1. **Backend** — repo root, `Dockerfile`, variables above, health path `/health`.
-2. **Redis** — Railway Redis plugin or external URL → `REDIS_URL` on backend.
-3. **Frontend** — root `frontend/`, `frontend/Dockerfile`, build arg `VITE_BACKEND_URL` = backend public URL, set backend `FRONTEND_URL` to frontend public URL.
-
-#### Optional: volume for decoder weights (~2 GB)
-
-Use a Railway volume when you do **not** want the pickle baked into every image build (or to update weights without redeploying).
-
-| Setting | Value |
-|---------|--------|
-| Volume name | `decoder-model` (any name is fine) |
-| Mount path | **`/app/models`** |
-| Expected file | `/app/models/velocity_decoder.pkl` (default `MODEL_PATH`; no env change needed) |
-
-**Railway UI:** open the backend service → **Volumes** → create volume → mount at **`/app/models`**.
-
-Volumes are **not** configurable in `railway.toml` today; use the dashboard (or a template).
-
-After mount, copy `velocity_decoder.pkl` onto the volume (the mount **replaces** the image’s `models/` directory at runtime). Set **`RAILWAY_RUN_UID=0`** on the backend so the non-root `app` user can read the volume (Railway mounts volumes as root).
+## Project Structure
 
 ```text
-ENV=production
-RAILWAY_RUN_UID=0
+app/
+  core/
+    main.py
+    simulator.py
+    decoder.py
+    redis_client.py
+    recording_replay.py
+    offline_eval.py
+  main.py                (compat entrypoint)
+  simulator.py           (compat export)
+  decoder.py             (compat export)
+  redis_client.py        (compat export)
+  recording_replay.py    (compat export)
+  offline_eval.py        (compat export)
+
+frontend/src/
+  components/
+  hooks/
+  utils/
+  styles/
+  App.tsx
+  main.tsx
 ```
 
-`RAILWAY_VOLUME_MOUNT_PATH` is set automatically when a volume is attached; default artifact resolution still uses `models/velocity_decoder.pkl` under `/app`.
+---
 
-### GHCR images (CI)
+## Deployment Notes
 
-On push to **`main`**, [`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml) publishes:
+- Ensure `models/velocity_decoder.pkl` is available in production (image or mounted volume)
+- Set explicit CORS allow-list values for deployed frontend origins
+- Keep Redis optional so core WebSocket behavior remains resilient during broker outages
+- Track p50/p95 latency before and after hot-path changes
 
-- `ghcr.io/<owner>/<repo>/backend:latest` and `:<sha>`
-- `ghcr.io/<owner>/<repo>/frontend:latest` and `:<sha>`
+---
 
-Pull requests run pytest + frontend lint/build only (no image push).
+## License
 
-## WebSocket streams
-
-### Raw simulator — `ws://host/ws/bci-stream`
-
-JSON per batch: `timestamp_ms`, `fs`, `channels`, `lfp`, `spikes`.
-
-### Decoder — `ws://host/ws/decoder`
-
-JSON per step: `timestamp_ms`, `vx`, `vy`, `pen_down`, `confidence`, `decode_latency_ms`, `end_to_end_latency_ms`, `redis_buffer_seconds`, `accuracy`, `session_accuracy`, `cursor_x`, `cursor_y`, `num_channels`.
-
-When replay is active, the server overrides `vx`, `vy`, `pen_down`, `cursor_x`, and `cursor_y` from the selected recording so the UI matches saved cursor motion.
-
-Reset broadcast: `{ "type": "decoder_reset", "cursor_x", "cursor_y", "num_channels", … }`.
-
-## Velocity ground truth
-
-**Live (no recording):** the simulator holds piecewise-constant targets `(vx, vy)` for ~1 s segments; `pen_down` follows decode-style speed thresholds.
-
-**Recording replay:** ground truth comes from interpolated samples in `recordings/*.json` (`x`, `y`, `clicked` → velocity + `pen_down`). Channel firing uses `velocity_spike_multipliers` in `app/decoder.py`.
-
-## Tests and offline evaluation
-
-```powershell
-pip install -r requirements-dev.txt
-$env:PYTHONPATH = "."
-python -m pytest tests/ --cov=app --cov-report=term-missing
-```
-
-Retrain + evaluate: `python -m app.offline_eval --retrain --artifact models/velocity_decoder.pkl`
-
-Manual smoke scripts (not collected by pytest): `python tests/test_client.py`, `python tests/test_decoder_client.py`.
-
-## Project layout
-
-```
-neuralink-bci-sim/
-├── app/
-│   ├── main.py              # FastAPI app
-│   ├── simulator.py         # NeuralSignalGenerator
-│   ├── recording_replay.py  # recordings/*.json replay driver
-│   ├── decoder.py           # BciDecoder + artifacts
-│   ├── redis_client.py      # Redis Streams
-│   └── offline_eval.py      # Training / metrics
-├── recordings/              # demo_*.json, session_*.json (replay source)
-├── frontend/                # React dashboard
-├── models/                  # velocity_decoder.pkl (Git LFS)
-├── tests/
-├── Dockerfile               # Backend image
-├── docker-compose.yml       # backend + frontend + redis
-├── railway.toml
-├── requirements.txt         # Production Python deps
-├── requirements-dev.txt     # + pytest for dev/CI
-├── .env.example
-└── README.md
-```
-
-`venv/`, `frontend/node_modules/`, and `frontend/dist/` are gitignored.
+MIT (or your preferred license, if updated).

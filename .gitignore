@@ -41,6 +41,7 @@ Thumbs.db
 frontend/node_modules/
 frontend/dist/
 frontend/.vite/
+frontend/.cache/
 frontend/.env
 frontend/.env.*
 !frontend/.env.example
@@ -54,3 +55,9 @@ tools/
 # Trained decoder weights (retrain: python -m app.offline_eval --retrain)
 models/*.pkl
 *.pkl
+
+# Local runtime and generated artifacts
+app/__pycache__/
+tests/__pycache__/
+recordings/*.tmp
+recordings/*.bak

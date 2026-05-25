@@ -1,4 +1,4 @@
-import { DASHBOARD_THEME } from "./dashboardTheme";
+import { DASHBOARD_THEME } from "../utils/dashboardTheme";
 
 export interface KeyboardKeyRenderProps {
   ctx: CanvasRenderingContext2D;

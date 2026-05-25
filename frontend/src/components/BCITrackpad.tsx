@@ -16,11 +16,11 @@ import {
   hitKey,
   type KeyDef,
   type SwipeTrailPoint,
-} from "./keyboardLayout";
+} from "../utils/keyboardLayout";
 import { drawKeyboard } from "./Keyboard";
 import { drawSuggestionBar, hitSuggestion } from "./SuggestionBar";
-import { DASHBOARD_THEME } from "./dashboardTheme";
-import { idleManualTrackpadDrive, type ManualTrackpadDrive } from "./manualTrackpad";
+import { DASHBOARD_THEME } from "../utils/dashboardTheme";
+import { idleManualTrackpadDrive, type ManualTrackpadDrive } from "../utils/manualTrackpad";
 
 const T = DASHBOARD_THEME;
 

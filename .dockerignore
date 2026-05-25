@@ -30,9 +30,12 @@ htmlcov
 
 # Frontend belongs to its own image
 frontend/
+node_modules/
+dist/
 
 # Tests and CI-only files are not copied into the backend image
 tests
+terminals/
 
 # Editor / OS noise
 .idea
@@ -44,3 +47,4 @@ Thumbs.db
 
 # Documentation (smaller build context)
 *.md
+docs/

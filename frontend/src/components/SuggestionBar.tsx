@@ -1,5 +1,5 @@
-import { DASHBOARD_THEME } from "./dashboardTheme";
-import { SUGGESTIONS_PANEL } from "./keyboardLayout";
+import { DASHBOARD_THEME } from "../utils/dashboardTheme";
+import { SUGGESTIONS_PANEL } from "../utils/keyboardLayout";
 
 export type SuggestionChipRect = {
   word: string;
