@@ -2,7 +2,7 @@
 set -eu
 
 # Railway injects PORT at runtime. Keep local default for docker run/dev.
-: "${PORT:=80}"
+export PORT="${PORT:-80}"
 
 # Render nginx server listen port from runtime env.
 envsubst '${PORT}' \
