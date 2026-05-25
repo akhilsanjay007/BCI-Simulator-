@@ -6,9 +6,15 @@ dockerfilePath = "Dockerfile"
 # `/app/models` with `velocity_decoder.pkl`, or set `MODEL_PATH` / `DECODER_MODEL_PATH`.
 
 [deploy]
-# Explicit Railway start command (bind to injected $PORT, no reload in production).
-startCommand = "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
-healthcheckPath = "/health"
+# Do not set a global startCommand here: this monorepo has two services
+# (backend + frontend) with different container entrypoints.
+# Let each Dockerfile control startup:
+# - backend/Dockerfile CMD starts uvicorn with PORT fallback
+# - frontend/Dockerfile ENTRYPOINT starts nginx on PORT
+# Use "/" globally because this config is shared by both services.
+# backend also serves "/" (in addition to "/health"), while frontend
+# is a static SPA and does not expose "/health".
+healthcheckPath = "/"
 healthcheckTimeout = 60
 restartPolicyType = "ON_FAILURE"
 

@@ -228,7 +228,7 @@ frontend/src/
 
 ## Deployment Notes
 
-- Railway backend start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+- Railway start command: leave unset in Railway UI / config for this monorepo (backend and frontend have different Dockerfile entrypoints)
 - Ensure `models/velocity_decoder.pkl` is available in production (image or mounted volume)
 - If model boot should be hard-fail, set `STRICT_MODEL_LOAD=1` (otherwise backend starts with heuristic fallback)
 - Set explicit CORS allow-list values for deployed frontend origins
