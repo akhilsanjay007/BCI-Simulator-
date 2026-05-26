@@ -24,16 +24,13 @@ const GRID = "rgba(64, 64, 64, 0.45)";
 const RAW_TRACE_SAMPLES = 320;
 const RAW_INSERT_PER_STEP = 9;
 const RAW_SNR_DB = 4.2;
-const CLEANED_SPIKE = "#22c55e";
-const CLEANED_SPIKE_DIM = "rgba(34, 197, 94, 0.34)";
-const RAW_OVERLAY_ALPHA = 0.6;
 /** Recent time window (ms) for stronger raster styling while control activity is present. */
 const PEN_HIGHLIGHT_MS = 1700;
 /** Speed threshold where movement should visibly count as active control. */
 const MOVEMENT_ACTIVITY_THRESHOLD = 0.08;
 
 export type ChartControlMode = "automatic" | "manual";
-type RasterViewMode = "raw" | "cleaned" | "overlay";
+type MainChartView = "signals" | "activity";
 
 /** Channels whose preferred direction (ring layout) aligns with ``(vx, vy)`` — matches backend coding. */
 function velocityBoostChannelIndices(
@@ -194,6 +191,7 @@ export function NeuralSignalCharts({
   const wrapRef = useRef<HTMLDivElement>(null);
   /** Flex-sized viewport for the spike raster (dashboard fills this for max readability). */
   const rasterHostRef = useRef<HTMLDivElement>(null);
+  const rateHostRef = useRef<HTMLDivElement>(null);
   const rawVoltageRef = useRef<HTMLCanvasElement>(null);
   const rasterRef = useRef<HTMLCanvasElement>(null);
   const rateRef = useRef<HTMLCanvasElement>(null);
@@ -240,18 +238,13 @@ export function NeuralSignalCharts({
     clientY: number;
     channelIndex: number;
   } | null>(null);
-  const [rasterView, setRasterView] = useState<RasterViewMode>("raw");
-  const [showConfidenceBadge, setShowConfidenceBadge] = useState(false);
+  const [mainChartView, setMainChartView] = useState<MainChartView>("signals");
 
   useEffect(() => {
-    if (rasterView === "raw") {
-      setShowConfidenceBadge(false);
-      return;
+    if (mainChartView !== "signals") {
+      setTooltip(null);
     }
-    setShowConfidenceBadge(true);
-    const timer = window.setTimeout(() => setShowConfidenceBadge(false), 4000);
-    return () => window.clearTimeout(timer);
-  }, [rasterView]);
+  }, [mainChartView]);
 
   const initColumns = useCallback((nCh: number) => {
     const cols: boolean[][] = [];
@@ -266,21 +259,6 @@ export function NeuralSignalCharts({
   useEffect(() => {
     initColumns(displayCount);
   }, [displayCount, initColumns]);
-
-  const keepSpikeForCleanedRaster = useCallback((cols: boolean[][], t: number, ch: number, nCh: number) => {
-    if (!cols[t]?.[ch]) return false;
-    let neighbors = 0;
-    for (let dt = -1; dt <= 1; dt++) {
-      const tc = t + dt;
-      if (tc < 0 || tc >= NUM_COLS) continue;
-      for (let dc = -1; dc <= 1; dc++) {
-        const cc = ch + dc;
-        if (cc < 0 || cc >= nCh || (dt === 0 && dc === 0)) continue;
-        if (cols[tc]?.[cc]) neighbors += 1;
-      }
-    }
-    return neighbors >= 1;
-  }, []);
 
   const drawRaster = useCallback(
     (ctx: CanvasRenderingContext2D, w: number, h: number, nCh: number) => {
@@ -328,52 +306,24 @@ export function NeuralSignalCharts({
 
       const activityHist = penByColRef.current;
       const highlightCols = Math.min(NUM_COLS, Math.max(1, Math.ceil(PEN_HIGHLIGHT_MS / BIN_MS)));
-      const drawRaw = rasterView === "raw" || rasterView === "overlay";
-      const drawCleaned = rasterView === "cleaned" || rasterView === "overlay";
-
-      const renderLayer = (
-        kind: "raw" | "cleaned",
-        baseColor: string,
-        activeColor: string,
-        lineWidth: number,
-        baseAlpha: number,
-      ) => {
-        ctx.lineCap = kind === "cleaned" ? "round" : "butt";
-        for (let t = 0; t < NUM_COLS; t++) {
-          const x = padL + t * colW + colW * 0.5;
-          const recent = t >= NUM_COLS - highlightCols;
-          const active = activityHist[t] === true;
-          const emphasize = active && recent;
-          const tickBase = kind === "cleaned" ? tickHalf * 1.18 : tickHalf;
-          const tick = emphasize
-            ? Math.min(tickBase * (kind === "cleaned" ? 1.4 : 1.45), rowH * (kind === "cleaned" ? 0.46 : 0.42))
-            : tickBase;
-          ctx.strokeStyle = emphasize ? activeColor : baseColor;
-          ctx.lineWidth = emphasize ? lineWidth + 0.65 : lineWidth;
-          ctx.globalAlpha = emphasize ? 1 : baseAlpha;
-          for (let ch = 0; ch < nCh; ch++) {
-            const hasSpike =
-              kind === "raw"
-                ? cols[t]?.[ch] === true
-                : keepSpikeForCleanedRaster(cols, t, ch, nCh) ||
-                  ((activityHist[t] === true || t > NUM_COLS - Math.ceil(highlightCols * 0.5)) && cols[t]?.[ch] === true);
-            if (!hasSpike) continue;
-            const yMid = padT + ch * rowH + rowH * 0.5;
-            ctx.beginPath();
-            ctx.moveTo(x, yMid - tick);
-            ctx.lineTo(x, yMid + tick);
-            ctx.stroke();
-          }
+      for (let t = 0; t < NUM_COLS; t++) {
+        const x = padL + t * colW + colW * 0.5;
+        const recent = t >= NUM_COLS - highlightCols;
+        const active = activityHist[t] === true;
+        const emphasize = active && recent;
+        const tick = emphasize ? Math.min(tickHalf * 1.45, rowH * 0.42) : tickHalf;
+        ctx.strokeStyle = emphasize ? ACCENT_PEN : ACCENT;
+        ctx.lineWidth = emphasize ? 2.1 : 1.25;
+        ctx.globalAlpha = emphasize ? 1 : 0.92;
+        for (let ch = 0; ch < nCh; ch++) {
+          if (!cols[t]?.[ch]) continue;
+          const yMid = padT + ch * rowH + rowH * 0.5;
+          ctx.beginPath();
+          ctx.moveTo(x, yMid - tick);
+          ctx.lineTo(x, yMid + tick);
+          ctx.stroke();
         }
-      };
-
-      if (drawRaw) {
-        renderLayer("raw", ACCENT, ACCENT_PEN, 1.25, rasterView === "overlay" ? RAW_OVERLAY_ALPHA : 0.92);
       }
-      if (drawCleaned) {
-        renderLayer("cleaned", CLEANED_SPIKE_DIM, CLEANED_SPIKE, 1.8, rasterView === "overlay" ? 0.9 : 0.95);
-      }
-      ctx.lineCap = "butt";
       ctx.globalAlpha = 1;
 
       ctx.fillStyle = "rgba(163,163,163,0.9)";
@@ -384,7 +334,7 @@ export function NeuralSignalCharts({
         h - 5,
       );
     },
-    [keepSpikeForCleanedRaster, rasterView],
+    [],
   );
 
   const drawRate = useCallback((ctx: CanvasRenderingContext2D, w: number, h: number, nCh: number) => {
@@ -585,7 +535,7 @@ export function NeuralSignalCharts({
     const rawEl = rawVoltageRef.current;
     const rEl = rasterRef.current;
     const rateEl = rateRef.current;
-    if (!wrap || !rawEl || !rEl || !rateEl) return;
+    if (!wrap || !rawEl) return;
 
     const w = Math.max(320, wrap.clientWidth);
     const nCh = displayCountRef.current;
@@ -599,7 +549,14 @@ export function NeuralSignalCharts({
         rasterH = h;
       }
     }
-    const rateH = compact ? 96 : 120;
+    let rateH = compact ? 96 : 120;
+    const rateHost = rateHostRef.current;
+    if (compact && rateHost) {
+      const hostH = Math.floor(rateHost.clientHeight);
+      if (hostH >= 84) {
+        rateH = hostH;
+      }
+    }
     const rawH = compact ? 112 : 120;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
 
@@ -615,8 +572,8 @@ export function NeuralSignalCharts({
     };
 
     const rawCtx = setup(rawEl, rawH);
-    const rCtx = setup(rEl, rasterH);
-    const qCtx = setup(rateEl, rateH);
+    const rCtx = rEl ? setup(rEl, rasterH) : null;
+    const qCtx = rateEl ? setup(rateEl, rateH) : null;
     if (rawCtx) drawRawVoltage(rawCtx, w, rawH);
     if (rCtx) drawRaster(rCtx, w, rasterH, nCh);
     if (qCtx) drawRate(qCtx, w, rateH, nCh);
@@ -625,6 +582,10 @@ export function NeuralSignalCharts({
   useLayoutEffect(() => {
     resizeAndDraw();
   }, [compact, displayCount, resizeAndDraw]);
+
+  useLayoutEffect(() => {
+    resizeAndDraw();
+  }, [mainChartView, resizeAndDraw]);
 
   useEffect(() => {
     const wrap = wrapRef.current;
@@ -703,12 +664,12 @@ export function NeuralSignalCharts({
     <section
       className={`rounded-xl border border-neutral-800 bg-neutral-900/50 backdrop-blur-xl ${
         compact
-          ? "p-2 flex flex-col flex-1 min-h-0 min-w-0 overflow-hidden border-emerald-500/15 shadow-[0_0_32px_-12px_rgba(52,211,153,0.12)]"
+          ? "p-1.5 flex flex-col flex-1 min-h-0 min-w-0 overflow-hidden border-emerald-500/15 shadow-[0_0_32px_-12px_rgba(52,211,153,0.12)]"
           : "mt-10 rounded-3xl p-6 md:p-8"
       }`}
       aria-labelledby="raw-neural-signals-heading"
     >
-      <div className={compact ? "mb-1 shrink-0" : "mb-6"}>
+      <div className={compact ? "mb-0.5 shrink-0" : "mb-6"}>
         <div className="flex items-baseline justify-between gap-2 flex-wrap">
           <h2
             id="raw-neural-signals-heading"
@@ -752,7 +713,7 @@ export function NeuralSignalCharts({
         )}
       </div>
 
-      <div ref={wrapRef} className={compact ? "gap-1.5 min-h-0 flex-1 flex flex-col" : "space-y-6"}>
+      <div ref={wrapRef} className={compact ? "gap-1 min-h-0 flex-1 flex flex-col" : "space-y-6"}>
         <div className={compact ? "shrink-0" : ""}>
           <div className="mb-1.5 flex items-baseline justify-between gap-3 flex-wrap">
             <h3
@@ -782,9 +743,7 @@ export function NeuralSignalCharts({
           </div>
           <p
             className={`font-mono text-neutral-500 ${
-              compact
-                ? "mt-1 text-[9px] tracking-[0.08em] truncate"
-                : "mt-2 text-[10px] uppercase tracking-[0.14em]"
+              compact ? "mt-0.5 text-[9px] tracking-[0.08em] truncate" : "mt-2 text-[10px] uppercase tracking-[0.14em]"
             }`}
             title="Raw Voltage → Spike Detection → Firing Rate"
           >
@@ -793,101 +752,91 @@ export function NeuralSignalCharts({
         </div>
 
         <div className={compact ? "shrink-0" : ""}>
-          <div className="inline-flex w-full rounded-lg border border-neutral-700/85 bg-neutral-950/65 p-1">
+          <div className="inline-flex w-full rounded-full border border-neutral-700/80 bg-neutral-950/55 p-0.5">
             <button
               type="button"
-              onClick={() => setRasterView("raw")}
-              className={`flex-1 rounded-md px-2 py-1 text-[10px] font-mono uppercase tracking-wider transition-colors ${
-                rasterView === "raw"
-                  ? "border border-teal-400/50 bg-teal-500/15 text-teal-300 shadow-[0_0_18px_-9px_rgba(45,212,191,0.75)]"
+              onClick={() => setMainChartView("signals")}
+              className={`flex-1 rounded-full px-2 py-0.5 text-[8px] font-mono font-semibold uppercase tracking-[0.1em] transition-colors ${
+                mainChartView === "signals"
+                  ? "border border-neutral-500/60 bg-neutral-800/85 text-neutral-100"
                   : "text-neutral-400 hover:text-neutral-200"
               }`}
-              aria-pressed={rasterView === "raw"}
+              aria-pressed={mainChartView === "signals"}
             >
-              Raw Spikes
+              RAW SIGNALS
             </button>
             <button
               type="button"
-              onClick={() => setRasterView("cleaned")}
-              className={`flex-1 rounded-md px-2 py-1 text-[10px] font-mono uppercase tracking-wider transition-colors ${
-                rasterView === "cleaned"
-                  ? "border border-emerald-400/55 bg-emerald-500/15 text-emerald-300 shadow-[0_0_18px_-9px_rgba(52,211,153,0.75)]"
+              onClick={() => setMainChartView("activity")}
+              className={`flex-1 rounded-full px-2 py-0.5 text-[8px] font-mono font-semibold uppercase tracking-[0.1em] transition-colors ${
+                mainChartView === "activity"
+                  ? "border border-neutral-500/60 bg-neutral-800/85 text-neutral-100"
                   : "text-neutral-400 hover:text-neutral-200"
               }`}
-              aria-pressed={rasterView === "cleaned"}
+              aria-pressed={mainChartView === "activity"}
             >
-              Cleaned Spikes
-            </button>
-            <button
-              type="button"
-              onClick={() => setRasterView("overlay")}
-              className={`flex-1 rounded-md px-2 py-1 text-[10px] font-mono uppercase tracking-wider transition-colors ${
-                rasterView === "overlay"
-                  ? "border border-cyan-400/50 bg-cyan-500/12 text-cyan-200 shadow-[0_0_18px_-9px_rgba(56,189,248,0.7)]"
-                  : "text-neutral-400 hover:text-neutral-200"
-              }`}
-              aria-pressed={rasterView === "overlay"}
-            >
-              Overlay Both
+              ACTIVITY VS MOVEMENT
             </button>
           </div>
         </div>
 
-        <div className={compact ? "min-h-[220px] min-w-0 flex-1 flex flex-col" : ""}>
-          {!compact && (
-            <div className="flex items-baseline justify-between gap-3 mb-2 flex-wrap">
-              <h3 className="text-sm font-medium text-neutral-300">Spike raster</h3>
-              <span className="text-[10px] font-mono text-neutral-500 uppercase tracking-wider">
-                {displayCount} channels · scrolling
-              </span>
-            </div>
-          )}
-          <div
-            ref={rasterHostRef}
-            className={`relative rounded-lg border border-neutral-800/90 overflow-hidden bg-black ${
-              compact ? "min-h-0 flex-1 w-full" : ""
-            }`}
-          >
-            {showConfidenceBadge && (
-              <div className="absolute right-2 top-2 z-20 inline-flex items-center gap-2 rounded-md border border-emerald-500/45 bg-neutral-950/85 px-2 py-1 text-[10px] font-mono text-emerald-300 shadow-lg backdrop-blur-sm">
-                <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                Decoder confidence: 71% → 94%
+        {mainChartView === "signals" ? (
+          <div className={compact ? "min-h-0 min-w-0 flex-1 flex flex-col gap-1 transition-opacity duration-200" : "transition-opacity duration-200"}>
+            {!compact && (
+              <div className="flex items-baseline justify-between gap-3 mb-2 flex-wrap">
+                <h3 className="text-sm font-medium text-neutral-300">Raw neural signals</h3>
+                <span className="text-[10px] font-mono text-neutral-500 uppercase tracking-wider">
+                  {displayCount} channels · scrolling
+                </span>
               </div>
             )}
-            <canvas
-              ref={rasterRef}
-              className="block w-full cursor-crosshair touch-none align-top"
-              onMouseMove={onRasterMove}
-              onMouseLeave={onRasterLeave}
-              aria-label="Spike raster plot: hover rows for channel info"
-            />
+            <div
+              ref={rasterHostRef}
+              className={`relative rounded-lg border border-neutral-800/90 overflow-hidden bg-black ${
+                compact ? "min-h-[154px] min-w-0 flex-1 w-full" : ""
+              }`}
+            >
+              <canvas
+                ref={rasterRef}
+                className="block w-full cursor-crosshair touch-none align-top"
+                onMouseMove={onRasterMove}
+                onMouseLeave={onRasterLeave}
+                aria-label="Spike raster plot: hover rows for channel info"
+              />
+            </div>
           </div>
-        </div>
-
-        <div className={compact ? "min-h-0 shrink-0 pt-0.5" : ""}>
-          <h3
-            className={`font-medium text-neutral-300 ${
-              compact ? "text-[10px] mb-0.5 text-neutral-400 uppercase tracking-wider" : "text-sm mb-2"
-            }`}
-          >
-            Neural activity vs movement
-          </h3>
-          <div className="relative rounded-lg border border-neutral-800 overflow-hidden bg-black">
-            <canvas
-              ref={rateRef}
-              className="block w-full"
-              aria-label="Neural activity and velocity magnitude"
-            />
+        ) : (
+          <div className={compact ? "min-h-0 min-w-0 flex-1 flex flex-col transition-opacity duration-200" : "transition-opacity duration-200"}>
+            <h3
+              className={`font-medium text-neutral-300 ${
+                compact ? "text-[10px] mb-0.5 text-neutral-400 uppercase tracking-wider" : "text-sm mb-2"
+              }`}
+            >
+              Neural activity vs movement
+            </h3>
+            <div
+              ref={rateHostRef}
+              className={`relative rounded-lg border border-neutral-800 overflow-hidden bg-black ${
+                compact ? "min-h-[154px] min-w-0 flex-1" : ""
+              }`}
+            >
+              <canvas
+                ref={rateRef}
+                className="block w-full"
+                aria-label="Neural activity and velocity magnitude"
+              />
+            </div>
+            {!compact && (
+              <p className="mt-2 text-xs text-neutral-500 font-mono">
+                Emerald = population mean firing (smoothed). Cyan = command speed |v| on a matched scale while
+                drawing.
+              </p>
+            )}
           </div>
-          {!compact && (
-            <p className="mt-2 text-xs text-neutral-500 font-mono">
-              Emerald = population mean firing (smoothed). Cyan = command speed |v| on a matched scale while drawing.
-            </p>
-          )}
-        </div>
+        )}
       </div>
 
-      {tooltip && (
+      {tooltip && mainChartView === "signals" && (
         <div
           className="fixed z-50 pointer-events-none max-w-[min(18rem,calc(100vw-2rem))] rounded-lg border border-emerald-500/35 bg-neutral-950/95 px-3 py-2 text-xs text-neutral-200 shadow-xl backdrop-blur-md"
           style={{

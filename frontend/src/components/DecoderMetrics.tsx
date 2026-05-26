@@ -75,31 +75,40 @@ export function DecoderMetrics({
   const clickClass = clickActive ? "text-emerald-300" : "text-neutral-400";
 
   return (
-    <section className="shrink-0 basis-[44%] min-h-0 rounded-xl border border-neutral-800/90 bg-gradient-to-b from-neutral-900/85 to-black/65 px-3 py-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
-      <div className="mb-1.5 flex items-center justify-between gap-2">
+    <section className="shrink-0 basis-[38%] min-h-0 rounded-xl border border-neutral-800/90 bg-gradient-to-b from-neutral-900/85 to-black/65 px-2.5 py-2 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
+      <div className="mb-1 flex items-center justify-between gap-2">
         <h2 className="text-[10px] font-mono font-semibold uppercase tracking-[0.2em] text-neutral-400">
           Decoder metrics
         </h2>
-        <div
-          className={`rounded-md border px-2 py-1 text-[10px] font-mono font-semibold tabular-nums ${bufferIndicatorClass(bufferSeconds)}`}
-          title="Redis stream buffer horizon"
-        >
-          {bufferText}
+        <div className="flex items-center gap-1.5">
+          <div
+            className={`rounded-md border px-2 py-1 text-[10px] font-mono font-semibold tabular-nums ${bufferIndicatorClass(bufferSeconds)}`}
+            title="Redis stream buffer horizon"
+          >
+            {bufferText}
+          </div>
+          <button
+            type="button"
+            onClick={onResetDecoder}
+            className="rounded-md border border-neutral-600/80 px-2 py-1 text-[9px] font-semibold uppercase tracking-[0.12em] text-neutral-200 transition-colors hover:bg-neutral-800/80"
+          >
+            Reset
+          </button>
         </div>
       </div>
 
-      <div className="space-y-1.5">
-        <div className="rounded-lg border border-neutral-800/90 bg-black/35 px-2.5 py-1.5">
+      <div className="space-y-1">
+        <div className="rounded-lg border border-neutral-800/90 bg-black/35 px-2 py-1.5">
           <p className="text-[9px] font-mono uppercase tracking-[0.14em] text-neutral-500">vx / vy / |v|</p>
-          <p className="mt-0.5 text-[12px] font-mono font-semibold tracking-tight text-cyan-300 tabular-nums">
+          <p className="mt-0.5 text-[11px] font-mono font-semibold tracking-tight text-cyan-300 tabular-nums">
             {velocityText}
           </p>
         </div>
 
-        <div className="grid grid-cols-3 gap-1.5">
+        <div className="grid grid-cols-3 gap-1">
           <div className="rounded-lg border border-neutral-800/90 bg-black/35 px-2 py-1.5">
             <p className="text-[8px] font-mono uppercase tracking-[0.14em] text-neutral-500">Confidence</p>
-            <p className="mt-0.5 text-[22px] font-semibold leading-none tracking-tight text-emerald-300 tabular-nums">
+            <p className="mt-0.5 text-[19px] font-semibold leading-none tracking-tight text-emerald-300 tabular-nums">
               {confidencePct}%
             </p>
           </div>
@@ -116,9 +125,9 @@ export function DecoderMetrics({
           </div>
         </div>
 
-        <div className="rounded-lg border border-neutral-800/90 bg-black/30 px-2 py-1.5">
+        <div className="rounded-lg border border-neutral-800/90 bg-black/30 px-2 py-1">
           <p className="text-[9px] font-mono uppercase tracking-[0.14em] text-neutral-500">Latencies</p>
-          <div className="mt-1 grid grid-cols-3 gap-1 text-[10px] font-mono tabular-nums">
+          <div className="mt-1 grid grid-cols-3 gap-1 text-[9px] font-mono tabular-nums">
             <div className="rounded border border-neutral-800/70 bg-black/30 px-1.5 py-1">
               <p className="text-neutral-500">Decode</p>
               <p className="text-neutral-200">{decodeLatencyText}</p>
@@ -175,15 +184,6 @@ export function DecoderMetrics({
           <p className="mt-0.5 text-[9px] font-mono font-semibold text-neutral-300">{strengthLabel}</p>
         </div>
 
-        <div className="pt-0.5">
-          <button
-            type="button"
-            onClick={onResetDecoder}
-            className="w-full rounded-lg border border-neutral-600/80 py-1 text-[9px] font-semibold uppercase tracking-[0.14em] text-neutral-200 transition-colors hover:bg-neutral-800/80"
-          >
-            Reset decoder
-          </button>
-        </div>
       </div>
     </section>
   );
