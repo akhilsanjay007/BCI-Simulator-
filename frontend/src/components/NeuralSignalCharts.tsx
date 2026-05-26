@@ -240,11 +240,12 @@ export function NeuralSignalCharts({
   } | null>(null);
   const [mainChartView, setMainChartView] = useState<MainChartView>("signals");
 
-  useEffect(() => {
-    if (mainChartView !== "signals") {
+  const handleMainChartViewChange = useCallback((nextView: MainChartView) => {
+    if (nextView !== "signals") {
       setTooltip(null);
     }
-  }, [mainChartView]);
+    setMainChartView(nextView);
+  }, []);
 
   const initColumns = useCallback((nCh: number) => {
     const cols: boolean[][] = [];
@@ -755,7 +756,7 @@ export function NeuralSignalCharts({
           <div className="inline-flex w-full rounded-full border border-neutral-700/80 bg-neutral-950/55 p-0.5">
             <button
               type="button"
-              onClick={() => setMainChartView("signals")}
+              onClick={() => handleMainChartViewChange("signals")}
               className={`flex-1 rounded-full px-2 py-0.5 text-[8px] font-mono font-semibold uppercase tracking-[0.1em] transition-colors ${
                 mainChartView === "signals"
                   ? "border border-neutral-500/60 bg-neutral-800/85 text-neutral-100"
@@ -767,7 +768,7 @@ export function NeuralSignalCharts({
             </button>
             <button
               type="button"
-              onClick={() => setMainChartView("activity")}
+              onClick={() => handleMainChartViewChange("activity")}
               className={`flex-1 rounded-full px-2 py-0.5 text-[8px] font-mono font-semibold uppercase tracking-[0.1em] transition-colors ${
                 mainChartView === "activity"
                   ? "border border-neutral-500/60 bg-neutral-800/85 text-neutral-100"
