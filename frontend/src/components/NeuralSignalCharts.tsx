@@ -17,14 +17,20 @@ const ACCENT_DIM = "rgba(52, 211, 153, 0.35)";
 const ACCENT_PEN = "rgba(110, 231, 183, 0.95)";
 const VEL_LINE = "#38bdf8";
 const VEL_LINE_DIM = "rgba(56, 189, 248, 0.45)";
+const RAW_TRACE = "#f59e0b";
+const RAW_TRACE_DIM = "rgba(245, 158, 11, 0.35)";
 const BG = "#0a0a0a";
 const GRID = "rgba(64, 64, 64, 0.45)";
+const RAW_TRACE_SAMPLES = 320;
+const RAW_INSERT_PER_STEP = 9;
+const RAW_SNR_DB = 4.2;
 /** Recent time window (ms) for stronger raster styling while control activity is present. */
 const PEN_HIGHLIGHT_MS = 1700;
 /** Speed threshold where movement should visibly count as active control. */
 const MOVEMENT_ACTIVITY_THRESHOLD = 0.08;
 
 export type ChartControlMode = "automatic" | "manual";
+type MainChartView = "signals" | "activity";
 
 /** Channels whose preferred direction (ring layout) aligns with ``(vx, vy)`` — matches backend coding. */
 function velocityBoostChannelIndices(
@@ -58,6 +64,18 @@ function velocityBoostChannelIndices(
 
 function clamp(n: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, n));
+}
+
+function createInitialRawVoltageBuffer(sampleCount: number): number[] {
+  let slowNoise = 0;
+  let phase = 0;
+  return Array.from({ length: sampleCount }, () => {
+    phase += 0.28;
+    slowNoise = 0.95 * slowNoise + (Math.random() * 2 - 1) * 0.055;
+    const oscillatory = 0.2 * Math.sin(phase) + 0.12 * Math.sin(phase * 2.8 + 0.7);
+    const broadband = (Math.random() * 2 - 1) * 0.5;
+    return clamp(oscillatory + slowNoise + broadband, -1.45, 1.45);
+  });
 }
 
 export interface ManualNeuralBurstPayload {
@@ -149,9 +167,9 @@ function computeRasterCanvasHeight(nCh: number, compact: boolean): number {
     const plot = Math.min(maxTotal - pad, Math.max(minPlot, nCh * pxPerRow));
     return Math.round(Math.min(maxTotal, pad + plot));
   }
-  const pxPerRow = nCh <= 36 ? 9 : Math.max(4.5, Math.min(9, 320 / Math.max(1, nCh)));
-  const plot = Math.min(326, Math.max(220, nCh * pxPerRow));
-  return Math.round(Math.min(350, Math.max(280, pad + plot)));
+  const pxPerRow = nCh <= 36 ? 6.8 : Math.max(3.9, Math.min(6.8, 250 / Math.max(1, nCh)));
+  const plot = Math.min(252, Math.max(178, nCh * pxPerRow));
+  return Math.round(Math.min(286, Math.max(228, pad + plot)));
 }
 
 /**
@@ -173,8 +191,13 @@ export function NeuralSignalCharts({
   const wrapRef = useRef<HTMLDivElement>(null);
   /** Flex-sized viewport for the spike raster (dashboard fills this for max readability). */
   const rasterHostRef = useRef<HTMLDivElement>(null);
+  const rateHostRef = useRef<HTMLDivElement>(null);
+  const rawVoltageRef = useRef<HTMLCanvasElement>(null);
   const rasterRef = useRef<HTMLCanvasElement>(null);
   const rateRef = useRef<HTMLCanvasElement>(null);
+  const rawTraceSeriesRef = useRef<number[]>(createInitialRawVoltageBuffer(RAW_TRACE_SAMPLES));
+  const rawTracePhaseRef = useRef(0);
+  const rawTraceNoiseRef = useRef(0);
 
   /** Columns left→right = past→present; each column is boolean[displayCount]. */
   const columnsRef = useRef<boolean[][]>([]);
@@ -215,6 +238,13 @@ export function NeuralSignalCharts({
     clientY: number;
     channelIndex: number;
   } | null>(null);
+  const [mainChartView, setMainChartView] = useState<MainChartView>("signals");
+
+  useEffect(() => {
+    if (mainChartView !== "signals") {
+      setTooltip(null);
+    }
+  }, [mainChartView]);
 
   const initColumns = useCallback((nCh: number) => {
     const cols: boolean[][] = [];
@@ -276,7 +306,6 @@ export function NeuralSignalCharts({
 
       const activityHist = penByColRef.current;
       const highlightCols = Math.min(NUM_COLS, Math.max(1, Math.ceil(PEN_HIGHLIGHT_MS / BIN_MS)));
-
       for (let t = 0; t < NUM_COLS; t++) {
         const x = padL + t * colW + colW * 0.5;
         const recent = t >= NUM_COLS - highlightCols;
@@ -429,11 +458,84 @@ export function NeuralSignalCharts({
     ctx.fillText(compact ? "|v| scaled" : "|v| movement (scaled)", leg2 + 14, legY);
   }, [compact]);
 
+  const drawRawVoltage = useCallback((ctx: CanvasRenderingContext2D, w: number, h: number) => {
+    const trace = rawTraceSeriesRef.current;
+    const padL = 16;
+    const padR = 12;
+    const padT = 10;
+    const padB = 16;
+    const plotW = w - padL - padR;
+    const plotH = h - padT - padB;
+    const midY = padT + plotH * 0.5;
+    const ampScale = plotH * 0.42;
+    const n = trace.length;
+
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, w, h);
+
+    ctx.strokeStyle = GRID;
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const y = padT + (plotH * i) / 4;
+      ctx.beginPath();
+      ctx.moveTo(padL, y);
+      ctx.lineTo(padL + plotW, y);
+      ctx.stroke();
+    }
+    ctx.strokeStyle = RAW_TRACE_DIM;
+    ctx.beginPath();
+    ctx.moveTo(padL, midY);
+    ctx.lineTo(padL + plotW, midY);
+    ctx.stroke();
+
+    ctx.strokeStyle = RAW_TRACE;
+    ctx.lineWidth = 1.6;
+    ctx.shadowColor = "rgba(245, 158, 11, 0.35)";
+    ctx.shadowBlur = 7;
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) {
+      const x = padL + (i / Math.max(1, n - 1)) * plotW;
+      const y = midY - trace[i] * ampScale;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+
+    ctx.font = "9px ui-monospace, monospace";
+    ctx.fillStyle = "rgba(163,163,163,0.9)";
+    ctx.fillText("~1.6 s window", padL, h - 5);
+  }, []);
+
+  const appendRawVoltageSamples = useCallback((speed: number, controlActive: boolean) => {
+    const trace = rawTraceSeriesRef.current;
+    let phase = rawTracePhaseRef.current;
+    let slowNoise = rawTraceNoiseRef.current;
+    const speedDrive = clamp(speed, 0, 1.4);
+    // Low-SNR synthetic neural trace: weak oscillatory signal + stronger broadband noise.
+    for (let i = 0; i < RAW_INSERT_PER_STEP; i++) {
+      phase += 0.3 + speedDrive * 0.05;
+      slowNoise = 0.94 * slowNoise + (Math.random() * 2 - 1) * 0.058;
+      const oscillatory =
+        0.2 * Math.sin(phase + i * 0.07) +
+        0.09 * Math.sin(phase * 2.7 + 0.9 + i * 0.05) +
+        0.05 * Math.sin(phase * 6.1);
+      const broadband = (Math.random() * 2 - 1) * (controlActive ? 0.58 : 0.5);
+      trace.push(clamp(oscillatory + slowNoise + broadband, -1.45, 1.45));
+    }
+    if (trace.length > RAW_TRACE_SAMPLES) {
+      trace.splice(0, trace.length - RAW_TRACE_SAMPLES);
+    }
+    rawTracePhaseRef.current = phase;
+    rawTraceNoiseRef.current = slowNoise;
+  }, []);
+
   const resizeAndDraw = useCallback(() => {
     const wrap = wrapRef.current;
+    const rawEl = rawVoltageRef.current;
     const rEl = rasterRef.current;
     const rateEl = rateRef.current;
-    if (!wrap || !rEl || !rateEl) return;
+    if (!wrap || !rawEl) return;
 
     const w = Math.max(320, wrap.clientWidth);
     const nCh = displayCountRef.current;
@@ -447,7 +549,15 @@ export function NeuralSignalCharts({
         rasterH = h;
       }
     }
-    const rateH = compact ? 96 : 120;
+    let rateH = compact ? 96 : 120;
+    const rateHost = rateHostRef.current;
+    if (compact && rateHost) {
+      const hostH = Math.floor(rateHost.clientHeight);
+      if (hostH >= 84) {
+        rateH = hostH;
+      }
+    }
+    const rawH = compact ? 112 : 120;
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
 
     const setup = (canvas: HTMLCanvasElement, h: number) => {
@@ -461,15 +571,21 @@ export function NeuralSignalCharts({
       return ctx;
     };
 
-    const rCtx = setup(rEl, rasterH);
-    const qCtx = setup(rateEl, rateH);
+    const rawCtx = setup(rawEl, rawH);
+    const rCtx = rEl ? setup(rEl, rasterH) : null;
+    const qCtx = rateEl ? setup(rateEl, rateH) : null;
+    if (rawCtx) drawRawVoltage(rawCtx, w, rawH);
     if (rCtx) drawRaster(rCtx, w, rasterH, nCh);
     if (qCtx) drawRate(qCtx, w, rateH, nCh);
-  }, [compact, drawRaster, drawRate]);
+  }, [compact, drawRaster, drawRate, drawRawVoltage]);
 
   useLayoutEffect(() => {
     resizeAndDraw();
   }, [compact, displayCount, resizeAndDraw]);
+
+  useLayoutEffect(() => {
+    resizeAndDraw();
+  }, [mainChartView, resizeAndDraw]);
 
   useEffect(() => {
     const wrap = wrapRef.current;
@@ -492,6 +608,7 @@ export function NeuralSignalCharts({
         const speed = Math.hypot(vx, vy);
         const movementActive = speed >= MOVEMENT_ACTIVITY_THRESHOLD;
         const controlActive = pd || movementActive;
+        appendRawVoltageSamples(speed, controlActive);
         const col =
           mode === "manual"
             ? buildColumnManual(Date.now(), burst, n, t, pd, movementActive)
@@ -509,7 +626,7 @@ export function NeuralSignalCharts({
     };
     raf = requestAnimationFrame(step);
     return () => cancelAnimationFrame(raf);
-  }, [resizeAndDraw]);
+  }, [appendRawVoltageSamples, resizeAndDraw]);
 
   useLayoutEffect(() => {
     resizeAndDraw();
@@ -547,12 +664,12 @@ export function NeuralSignalCharts({
     <section
       className={`rounded-xl border border-neutral-800 bg-neutral-900/50 backdrop-blur-xl ${
         compact
-          ? "p-2 flex flex-col flex-1 min-h-0 min-w-0 overflow-hidden border-emerald-500/15 shadow-[0_0_32px_-12px_rgba(52,211,153,0.12)]"
+          ? "p-1.5 flex flex-col flex-1 min-h-0 min-w-0 overflow-hidden border-emerald-500/15 shadow-[0_0_32px_-12px_rgba(52,211,153,0.12)]"
           : "mt-10 rounded-3xl p-6 md:p-8"
       }`}
       aria-labelledby="raw-neural-signals-heading"
     >
-      <div className={compact ? "mb-1 shrink-0" : "mb-6"}>
+      <div className={compact ? "mb-0.5 shrink-0" : "mb-6"}>
         <div className="flex items-baseline justify-between gap-2 flex-wrap">
           <h2
             id="raw-neural-signals-heading"
@@ -596,56 +713,130 @@ export function NeuralSignalCharts({
         )}
       </div>
 
-      <div ref={wrapRef} className={compact ? "gap-1.5 min-h-0 flex-1 flex flex-col" : "space-y-6"}>
-        <div className={compact ? "min-h-[280px] min-w-0 flex-1 flex flex-col" : ""}>
-          {!compact && (
-            <div className="flex items-baseline justify-between gap-3 mb-2 flex-wrap">
-              <h3 className="text-sm font-medium text-neutral-300">Spike raster</h3>
-              <span className="text-[10px] font-mono text-neutral-500 uppercase tracking-wider">
-                {displayCount} channels · scrolling
+      <div ref={wrapRef} className={compact ? "gap-1 min-h-0 flex-1 flex flex-col" : "space-y-6"}>
+        <div className={compact ? "shrink-0" : ""}>
+          <div className="mb-1.5 flex items-baseline justify-between gap-3 flex-wrap">
+            <h3
+              className={`font-medium ${
+                compact ? "text-[10px] uppercase tracking-wider text-amber-300/95" : "text-sm text-amber-300/95"
+              }`}
+            >
+              Raw voltage trace (Noisy)
+            </h3>
+            <div className="flex items-center gap-2">
+              {!compact && (
+                <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[10px] font-mono uppercase tracking-wider text-amber-300/90">
+                  Ch 7
+                </span>
+              )}
+              <span className="text-[10px] font-mono uppercase tracking-wider text-amber-200/90">
+                SNR: {RAW_SNR_DB.toFixed(1)} dB
               </span>
             </div>
-          )}
-          <div
-            ref={rasterHostRef}
-            className={`relative rounded-lg border border-neutral-800/90 overflow-hidden bg-black ${
-              compact ? "min-h-0 flex-1 w-full" : ""
-            }`}
-          >
+          </div>
+          <div className="relative rounded-lg border border-amber-500/25 overflow-hidden bg-black">
             <canvas
-              ref={rasterRef}
-              className="block w-full cursor-crosshair touch-none align-top"
-              onMouseMove={onRasterMove}
-              onMouseLeave={onRasterLeave}
-              aria-label="Spike raster plot: hover rows for channel info"
+              ref={rawVoltageRef}
+              className="block w-full h-[112px] sm:h-[120px]"
+              aria-label="Raw continuous voltage trace with low signal-to-noise ratio"
             />
+          </div>
+          <p
+            className={`font-mono text-neutral-500 ${
+              compact ? "mt-0.5 text-[9px] tracking-[0.08em] truncate" : "mt-2 text-[10px] uppercase tracking-[0.14em]"
+            }`}
+            title="Raw Voltage → Spike Detection → Firing Rate"
+          >
+            Raw Voltage → Spike Detection → Firing Rate
+          </p>
+        </div>
+
+        <div className={compact ? "shrink-0" : ""}>
+          <div className="inline-flex w-full rounded-full border border-neutral-700/80 bg-neutral-950/55 p-0.5">
+            <button
+              type="button"
+              onClick={() => setMainChartView("signals")}
+              className={`flex-1 rounded-full px-2 py-0.5 text-[8px] font-mono font-semibold uppercase tracking-[0.1em] transition-colors ${
+                mainChartView === "signals"
+                  ? "border border-neutral-500/60 bg-neutral-800/85 text-neutral-100"
+                  : "text-neutral-400 hover:text-neutral-200"
+              }`}
+              aria-pressed={mainChartView === "signals"}
+            >
+              RAW SIGNALS
+            </button>
+            <button
+              type="button"
+              onClick={() => setMainChartView("activity")}
+              className={`flex-1 rounded-full px-2 py-0.5 text-[8px] font-mono font-semibold uppercase tracking-[0.1em] transition-colors ${
+                mainChartView === "activity"
+                  ? "border border-neutral-500/60 bg-neutral-800/85 text-neutral-100"
+                  : "text-neutral-400 hover:text-neutral-200"
+              }`}
+              aria-pressed={mainChartView === "activity"}
+            >
+              ACTIVITY VS MOVEMENT
+            </button>
           </div>
         </div>
 
-        <div className={compact ? "min-h-0 shrink-0 pt-0.5" : ""}>
-          <h3
-            className={`font-medium text-neutral-300 ${
-              compact ? "text-[10px] mb-0.5 text-neutral-400 uppercase tracking-wider" : "text-sm mb-2"
-            }`}
-          >
-            Neural activity vs movement
-          </h3>
-          <div className="relative rounded-lg border border-neutral-800 overflow-hidden bg-black">
-            <canvas
-              ref={rateRef}
-              className="block w-full"
-              aria-label="Neural activity and velocity magnitude"
-            />
+        {mainChartView === "signals" ? (
+          <div className={compact ? "min-h-0 min-w-0 flex-1 flex flex-col gap-1 transition-opacity duration-200" : "transition-opacity duration-200"}>
+            {!compact && (
+              <div className="flex items-baseline justify-between gap-3 mb-2 flex-wrap">
+                <h3 className="text-sm font-medium text-neutral-300">Raw neural signals</h3>
+                <span className="text-[10px] font-mono text-neutral-500 uppercase tracking-wider">
+                  {displayCount} channels · scrolling
+                </span>
+              </div>
+            )}
+            <div
+              ref={rasterHostRef}
+              className={`relative rounded-lg border border-neutral-800/90 overflow-hidden bg-black ${
+                compact ? "min-h-[154px] min-w-0 flex-1 w-full" : ""
+              }`}
+            >
+              <canvas
+                ref={rasterRef}
+                className="block w-full cursor-crosshair touch-none align-top"
+                onMouseMove={onRasterMove}
+                onMouseLeave={onRasterLeave}
+                aria-label="Spike raster plot: hover rows for channel info"
+              />
+            </div>
           </div>
-          {!compact && (
-            <p className="mt-2 text-xs text-neutral-500 font-mono">
-              Emerald = population mean firing (smoothed). Cyan = command speed |v| on a matched scale while drawing.
-            </p>
-          )}
-        </div>
+        ) : (
+          <div className={compact ? "min-h-0 min-w-0 flex-1 flex flex-col transition-opacity duration-200" : "transition-opacity duration-200"}>
+            <h3
+              className={`font-medium text-neutral-300 ${
+                compact ? "text-[10px] mb-0.5 text-neutral-400 uppercase tracking-wider" : "text-sm mb-2"
+              }`}
+            >
+              Neural activity vs movement
+            </h3>
+            <div
+              ref={rateHostRef}
+              className={`relative rounded-lg border border-neutral-800 overflow-hidden bg-black ${
+                compact ? "min-h-[154px] min-w-0 flex-1" : ""
+              }`}
+            >
+              <canvas
+                ref={rateRef}
+                className="block w-full"
+                aria-label="Neural activity and velocity magnitude"
+              />
+            </div>
+            {!compact && (
+              <p className="mt-2 text-xs text-neutral-500 font-mono">
+                Emerald = population mean firing (smoothed). Cyan = command speed |v| on a matched scale while
+                drawing.
+              </p>
+            )}
+          </div>
+        )}
       </div>
 
-      {tooltip && (
+      {tooltip && mainChartView === "signals" && (
         <div
           className="fixed z-50 pointer-events-none max-w-[min(18rem,calc(100vw-2rem))] rounded-lg border border-emerald-500/35 bg-neutral-950/95 px-3 py-2 text-xs text-neutral-200 shadow-xl backdrop-blur-md"
           style={{
